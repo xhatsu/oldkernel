@@ -67,17 +67,26 @@ def build_bpf(ports):
     RET_K = 0x06
 
     prog = []
-    reject_idx = 5 + 2 * len(ports)
+    # accept if (dport in ports) OR (sport in ports) — responses needed for
+    # status/duration correlation. Two port blocks, either hits ACCEPT.
+    reject_idx = 5 + 4 * len(ports)
     accept_idx = reject_idx + 1
     prog.append((LDH_ABS, 0, 0, 12))            # ethertype
     prog.append((JEQ_K, 0, reject_idx - 2, 0x0800))   # == IP -> fall thru
     prog.append((LDB_ABS, 0, 0, 23))            # ip proto byte (fixed off)
     prog.append((JEQ_K, 0, reject_idx - 4, 6))        # == TCP -> fall thru
     prog.append((LDX_MSH, 0, 0, 14))            # X = ihl*4
+    # block A: dport at ip_start + X + 16
     for i, p in enumerate(sorted(ports)):
         b = 5 + 2 * i
-        # dst port at ip_start + X + 16
         prog.append((LDH_IND, 0, 0, 16))
+        prog.append((JEQ_K, accept_idx - (b + 2), 1 if i < len(ports) - 1
+                     else reject_idx - (b + 2), p))
+    # block B: sport at ip_start + X + 14 — jump target after last B check
+    base_b = 5 + 2 * len(ports)
+    for i, p in enumerate(sorted(ports)):
+        b = base_b + 2 * i
+        prog.append((LDH_IND, 0, 0, 14))
         prog.append((JEQ_K, accept_idx - (b + 2), 1 if i < len(ports) - 1
                      else reject_idx - (b + 2), p))
     prog.append((RET_K, 0, 0, 0))               # reject
@@ -106,8 +115,13 @@ def build_bpf(ports):
 
 
 def apply_perf_opts(sock, ports):
-    """Best-effort kernel assist: BPF port filter + big rcvbuf."""
-    built = build_bpf(ports)
+    """Best-effort kernel assist: BPF port filter + big rcvbuf.
+    NT_SNIFF_NO_BPF=1 disables the filter (debugging)."""
+    built = None
+    if os.environ.get("NT_SNIFF_NO_BPF") == "1":
+        log("NT_SNIFF_NO_BPF set — skipping kernel filter")
+    else:
+        built = build_bpf(ports)
     if built is not None:
         try:
             import ctypes
@@ -186,6 +200,58 @@ class Flow(object):
         self.touched = time.time()
 
 
+# ------------------------------------------------- response correlation ----
+PENDING_TTL = 5.0        # flush unmatched requests after this many seconds
+PENDING_MAX = 8192       # hard cap; overflow flushes oldest first
+
+# pending[(src_ip, sport, dst_ip, dport)]  -- key is the RESPONSE tuple:
+# server->client. Value: [event, req_ts]. A list per key handles HTTP
+# keep-alive pipelining (several requests before responses arrive).
+pending = {}
+
+
+def pending_del(rk):
+    pending.pop(rk, None)
+
+
+def pending_pop(rk, out):
+    """Flush the oldest pending event for this response tuple (FIN/RST or
+    overflow path). Emits whatever the event has — status stays null."""
+    lst = pending.get(rk)
+    if not lst:
+        return None
+    ev, _ = lst.pop(0)
+    if not lst:
+        pending_del(rk)
+    out.append(ev)
+    return ev
+
+
+def parse_response_head(payload):
+    """First line 'HTTP/1.x NNN ...' -> (status_int|None, content_len|None).
+    Only looks at what's in this segment; headers fit one segment for all
+    realistic API responses."""
+    try:
+        head = payload.split(b"\r\n\r\n", 1)[0]
+        lines = head.replace(b"\r\n", b"\n").split(b"\n")
+        first = lines[0].split()
+        if len(first) < 2 or not first[0].startswith(b"HTTP/"):
+            return None, None
+        st = int(first[1])
+    except (ValueError, IndexError):
+        return None, None
+    clen = None
+    for ln in lines[1:]:
+        low = ln.lower()
+        if low.startswith(b"content-length:"):
+            try:
+                clen = int(ln.split(b":", 1)[1].strip())
+            except ValueError:
+                pass
+            break
+    return st, clen
+
+
 def basic_user(value):
     """Authorization header value -> (user|None, scheme|None). Basic only."""
     parts = value.strip().split(None, 1)
@@ -262,10 +328,14 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     return ev if (dport in ports or h.get("_method")) else None
 
 
-def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out):
+def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
+                   pending_tbl=None, now=None):
     """Feed one direction's payload; emit finished events to out(list).
 
-    HEADER-ONLY capture: the event is emitted the moment \r\n\r\n is seen.
+    HEADER-ONLY capture: the request event is built the moment \\r\\n\\r\\n is
+    seen. With response correlation enabled (pending_tbl), the finished
+    event goes into the pending table instead of out — it is emitted when
+    the matching response head arrives, or on TTL/teardown fallback.
     Request bodies are NOT buffered — Basic auth (all we mine) rides headers,
     so body bytes cost memory and delay events for zero information. A later
     segment on the same connection simply fails the request-line check and
@@ -307,8 +377,20 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out):
     ev = finish_event(fl, key, dst_ip, dport, src_ip, sport,
                       ports, node_host)
     del flows[key]
-    if ev:
-        out.append(ev)
+    if not ev:
+        return
+    ev["req_bytes"] = idx + 4          # captured request head + terminator
+    if pending_tbl is None:
+        out.append(ev)                 # correlation disabled (legacy path)
+        return
+    # queue for response correlation; key is the RESPONSE tuple
+    rk = (dst_ip, dport, src_ip, sport)
+    ent = pending_tbl.get(rk)
+    if ent is None:
+        if len(pending_tbl) >= PENDING_MAX:
+            _flush_oldest_pending(pending_tbl, out)
+        ent = pending_tbl[rk] = []
+    ent.append([ev, now if now is not None else time.time()])
 
 
 def sweep_idle(flows, now):
@@ -318,6 +400,27 @@ def sweep_idle(flows, now):
             stale.append(k)
     for k in stale:
         del flows[k]
+
+
+def _flush_oldest_pending(pending_tbl, out):
+    """Overflow guard: emit the single oldest pending event as-is."""
+    oldest_key, oldest_ts = None, None
+    for rk, lst in pending_tbl.items():
+        ts = lst[0][1]
+        if oldest_ts is None or ts < oldest_ts:
+            oldest_key, oldest_ts = rk, ts
+    if oldest_key is not None:
+        pending_pop(oldest_key, out)
+
+
+def sweep_pending(pending_tbl, now, out):
+    """TTL flush: emit requests whose responses never showed up."""
+    stale = []
+    for rk, lst in pending_tbl.items():
+        if now - lst[0][1] > PENDING_TTL:
+            stale.append(rk)
+    for rk in stale:
+        pending_pop(rk, out)
 
 
 def enforce_limit(flows, now):
@@ -396,6 +499,12 @@ def main():
             now = time.time()
             if now - last_sweep > 30:
                 sweep_idle(flows, now)
+                out_s = []
+                sweep_pending(pending, now, out_s)
+                for ev in out_s:
+                    sys.stdout.write(json.dumps(ev) + "\n")
+                if out_s:
+                    sys.stdout.flush()
                 last_sweep = now
             continue
         except socket.error as e:
@@ -405,6 +514,7 @@ def main():
         n = len(pkt)
         if n < 34:
             continue
+        out = []
         off = 14                      # ethernet header
         etype = u16(pkt, 12)[0]
         if etype == ETH_P_VLAN:
@@ -423,21 +533,42 @@ def main():
         dst_ip = ntoa(pkt[off + 16:off + 20])
         tcp_off = off + ihl
         sport, dport = uh(pkt, tcp_off)
-        # HEADER-ONLY capture: request direction drives events; response
-        # packets are useless to us now, so only dport packets carry payload
-        if dport not in ports:
-            continue
         doff_flags = ub(pkt, tcp_off + 12)
         doff = (doff_flags[0] >> 4) * 4
         pay_start = tcp_off + doff
         if n <= pay_start:
             continue                              # no payload in segment
-        payload = pkt[pay_start:]                 # single copy per event seg
-        key = (src_ip, sport, dst_ip, dport)
-        out = []
-        handle_payload(flows, key, None, payload,
-                       (dst_ip, dport, src_ip, sport),
-                       ports, node_host, out)
+        payload = pkt[pay_start:]
+        flags = doff_flags[1]
+        now = time.time()
+
+        # ---------------- RESPONSE direction (server -> client) ----------
+        if sport in ports and dport not in ports:
+            # pending key was stored as (server_ip, server_port, client_ip,
+            # client_port) == (src, sport, dst, dport) OF THIS response pkt
+            rk = (src_ip, sport, dst_ip, dport)
+            if flags & 0x05:                      # FIN|RST: flush unmatched
+                ev = pending_pop(rk, out)
+            elif payload[:5] == b"HTTP/":
+                st, clen = parse_response_head(payload)
+                ent = pending.get(rk)
+                if ent is not None:
+                    ev = ent[0][0]
+                    ev["status"] = st
+                    ev["duration_ms"] = int((now - ent[0][1]) * 1000)
+                    if clen is not None:
+                        ev["resp_bytes"] = clen
+                    pending_del(rk)
+                    out.append(ev)
+        # ---------------- REQUEST direction (client -> server) -----------
+        elif dport in ports:
+            if flags & 0x05:                      # teardown w/o response seen
+                rk = (dst_ip, dport, src_ip, sport)
+                pending_pop(rk, out)
+            key = (src_ip, sport, dst_ip, dport)
+            handle_payload(flows, key, None, payload,
+                           (dst_ip, dport, src_ip, sport),
+                           ports, node_host, out, pending, now)
         if out:
             w = sys.stdout.write
             for ev in out:
