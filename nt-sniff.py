@@ -20,7 +20,7 @@ Stdout: one JSON event per line -> pipe into nt-ship.py.
 """
 from __future__ import print_function
 
-import base64, errno, json, os, signal, socket, struct, sys, time
+import base64, binascii, errno, json, os, signal, socket, struct, sys, time
 
 ETH_P_IP = 0x0800
 ETH_P_VLAN = 0x8100
@@ -214,6 +214,25 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     authz = h.get("authorization")
     if authz:
         user, scheme = basic_user(authz)
+    # W3C trace context: honor incoming traceparent, else generate one so
+    # every transaction carries a trace_id for hub-side correlation.
+    # NOTE py2.6: bytes has no .hex() — use binascii.hexlify.
+    tp = h.get("traceparent")
+    trace_id = None
+    if tp:
+        parts = tp.split("-")
+        if len(parts) == 4 and len(parts[1]) == 32:
+            trace_id = parts[1].lower()
+    if not trace_id:
+        try:
+            rnd = binascii.hexlify(os.urandom(16))
+            rnd = rnd.decode("ascii") if hasattr(rnd, "decode") else rnd
+        except Exception:
+            rnd = ("%032x" % (int(time.time() * 1000)))[-32:]
+        pid8 = binascii.hexlify(os.urandom(8))
+        pid8 = pid8.decode("ascii") if hasattr(pid8, "decode") else pid8
+        tp = "00-%s-%s-01" % (rnd, pid8)
+        trace_id = rnd
     ev = {
         "ts": int(time.time()),
         "host": node_host,
@@ -232,6 +251,13 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
         "caller_port": sport,
         "dst_ip": dst_ip,
         "dst_port": dport,
+        # ---- monitoring schema (ops API-log format) ----
+        # status/duration_ms/resp_bytes are response-side: passive request-only
+        # capture cannot see them; left null for the hub to enrich or leave.
+        "traceparent": tp[:80],
+        "trace_id": trace_id,
+        "service_id": None,          # hub maps port->service via policy later
+        "module_id": "pcap-http",
     }
     return ev if (dport in ports or h.get("_method")) else None
 
