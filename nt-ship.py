@@ -11,7 +11,8 @@ Usage:
 """
 from __future__ import print_function
 
-import base64, json, os, signal, socket, sys, time, urllib2
+import base64, json, os, Queue, signal, socket, sys
+import threading, time, urllib2
 
 MAX_BATCH = 400
 FLUSH_SEC = 5.0
@@ -90,10 +91,36 @@ def main():
             log("ship failed: %s" % e)
             return False
 
+    # ---- concurrent shipping -------------------------------------------
+    # hub ingest latency (~300-500ms per 400-event POST over WAN) makes
+    # sequential posting a ~1000 ev/s ceiling; N poster threads posting
+    # independent batches multiply that by NT_SHIP_THREADS
+    q = Queue.Queue(maxsize=128)
+    spool_lock = threading.Lock()
+    nthreads = int(os.environ.get("NT_SHIP_THREADS", "4"))
+
+    def poster():
+        while True:
+            batch = q.get()
+            if batch is None:
+                q.task_done()
+                return
+            if flush(batch):
+                backoff_box[0] = 1
+            else:
+                with spool_lock:
+                    _spool_append(spool, batch)
+            q.task_done()
+
+    backoff_box = [1]
+    for _ in range(nthreads):
+        t = threading.Thread(target=poster)
+        t.daemon = True
+        t.start()
+
     buf = list(pending)
     last_flush = time.time()
     last_spool_try = time.time()
-    backoff = 1
 
     def fold_spool():
         """Re-queue spooled events (mid-run retry); returns count folded."""
@@ -129,41 +156,37 @@ def main():
         if isinstance(ev, dict):
             buf.append(ev)
         now = time.time()
-        if len(buf) >= MAX_BATCH or now - last_flush >= FLUSH_SEC:
+        while len(buf) >= MAX_BATCH or (buf and now - last_flush >= FLUSH_SEC):
             last_flush = now
-            # retry spooled events ahead of fresh ones (~once a minute),
-            # keeping total batch within MAX_BATCH
+            # retry spooled events ahead of fresh ones (~once a minute)
             if now - last_spool_try >= 60 and os.path.exists(spool):
                 last_spool_try = now
                 fold_spool()
-            if flush(buf[:MAX_BATCH]):
-                del buf[:MAX_BATCH]       # MUST clear on success — re-posting
-                backoff = 1               # the same buffer caused 20x dups and
-            else:                         # a full pipeline stall under load
-                _spool_append(spool, buf[:MAX_BATCH])
-                del buf[:MAX_BATCH]
-                # brief pause ONLY — long backoff sleeps stop us draining
-                # stdin, which blocks the sniffer on the pipe and makes the
-                # kernel drop captured packets (proven under 20k-req load)
-                time.sleep(0.5)
+            q.put(buf[:MAX_BATCH])        # blocks when posters fall behind —
+            del buf[:MAX_BATCH]           # that IS our backpressure signal
 
-    # stdin closed (sniffer stopped) — drain buffer, then keep retrying
+    # stdin closed (sniffer stopped) — drain queue, then keep retrying
     # anything spooled until it lands or RETRY_MAX elapses
     deadline = time.time() + RETRY_MAX
-    while running[0] and time.time() < deadline:
-        if buf:
-            if flush(buf):
-                del buf[:]
-            else:
+    q.join()
+    while running[0] and time.time() < deadline and os.path.exists(spool):
+        fold_spool()
+        if not buf:
+            break
+        if flush(buf):
+            del buf[:]
+        else:
+            with spool_lock:
                 _spool_append(spool, buf)
                 del buf[:]
+        time.sleep(min(backoff_box[0], 60))
+        backoff_box[0] *= 2
         if os.path.exists(spool):
             fold_spool()
         if not buf and not os.path.exists(spool):
             break
-        if buf or os.path.exists(spool):
-            time.sleep(min(backoff, 60))
-            backoff *= 2
+    log("stopped (%d events pending on exit)" % len(buf))
+
     log("stopped (%d events pending on exit)" % len(buf))
 
 

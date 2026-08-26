@@ -27,6 +27,8 @@ MODE=install
 ENDPOINT=""
 IFACE="${NT_IFACE:-}"
 PORTS="${NT_PORTS:-80,8003,8005,8007,8009,8010,8011}"
+WORKERS="${NT_WORKERS:-1}"   # PACKET_FANOUT workers (needs kernel>=3.1)
+SHIPPERS="${NT_SHIP_THREADS:-8}"  # concurrent hub POST threads
 KIT_URLS="${NT_HUB:-}"
 
 log()  { echo "[nt-legacy] $*"; }
@@ -213,9 +215,9 @@ fi
 # sniffer stdout must FEED the shipper's stdin; starting them separately
 # leaves events stranded in sniff.log (proven on el6). Build one pipeline.
 if [ "$SNIFF_AS" != root ]; then
-    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw $PREFIX/nt-sniff.py -i $IFACE -p $PORTS'"
+    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS'"
 else
-    SNIFF_CMD="exec python $PREFIX/nt-sniff.py -i $IFACE -p $PORTS"
+    SNIFF_CMD="exec python $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS"
 fi
 
 cat > "$INIT" <<EOF
@@ -226,6 +228,7 @@ cat > "$INIT" <<EOF
 
 PREFIX=$PREFIX
 SNIFF_USER=$SNIFF_AS
+export NT_SHIP_THREADS=$SHIPPERS
 PIDFILE=/var/run/networktracing-legacy.pid
 
 case "\$1" in

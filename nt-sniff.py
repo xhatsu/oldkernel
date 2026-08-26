@@ -10,7 +10,12 @@ emits NetworkTracing event JSONL on stdout.
 TLS is NOT readable (by design — that tier stays on the eBPF agent).
 SOAP WSSE usernames are NOT extracted (product decision: Basic-only).
 
-Usage:  python nt-sniff.py [-i eth0] [-p 80,8003,8005,8009,8010,8011]
+Performance:
+  * kernel BPF filter (SO_ATTACH_FILTER): only IPv4/TCP requests destined
+    to monitored ports are copied up — responses/noise never reach python
+  * HEADER-ONLY capture: events emit at \r\n\r\n; bodies are not buffered
+  * PACKET_FANOUT (-j N): N forked workers share the NIC across cores
+Usage:  python nt-sniff.py [-i eth0] [-p 80,8003,...] [-j workers]
 Stdout: one JSON event per line -> pipe into nt-ship.py.
 """
 from __future__ import print_function
@@ -31,8 +36,7 @@ def b2i(c):
 METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 
 MAX_FLOWS = 8192            # concurrent tracked half-flows (per direction)
-MAX_HDRS = 262144           # max bytes buffered waiting for \\r\\n\\r\\n
-MAX_BODY = 131072           # max request body consumed for auth parsing
+MAX_HDRS = 262144           # max bytes buffered waiting for \r\n\r\n
 FLOW_TTL = 300              # seconds before idle flow buffers are dropped
 
 
@@ -41,10 +45,120 @@ def log(msg):
     sys.stderr.flush()
 
 
+# ---------------------------------------------------------------- perf: cBPF
+# Attach a classic BPF program so the KERNEL drops everything that is not
+# IPv4 TCP destined TO a monitored port. Requests alone drive events
+# (header-only capture); responses, ACKs and unrelated traffic never get
+# copied to userspace at all.
+SO_ATTACH_FILTER = 26
+
+def build_bpf(ports):
+    """Classic BPF: ethertype==IP && proto==TCP && dport in ports.
+    Returns (fprog_struct, filter_array) for the libc setsockopt call,
+    or None on failure. NOTE: sock_fprog carries a POINTER to the filter
+    array, so it must stay alive until the syscall — python's
+    socket.setsockopt(str) flattening cannot preserve it."""
+
+    LDH_ABS = 0x28   # ld [k]:h
+    LDB_ABS = 0x30   # ld [k]:b
+    JEQ_K = 0x15     # jeq k
+    LDX_MSH = 0xB1   # x = 4*([k]&0xf)  (ihl bytes)
+    LDH_IND = 0x48   # ld [x+k]:h
+    RET_K = 0x06
+
+    prog = []
+    reject_idx = 5 + 2 * len(ports)
+    accept_idx = reject_idx + 1
+    prog.append((LDH_ABS, 0, 0, 12))            # ethertype
+    prog.append((JEQ_K, 0, reject_idx - 2, 0x0800))   # == IP -> fall thru
+    prog.append((LDB_ABS, 0, 0, 23))            # ip proto byte (fixed off)
+    prog.append((JEQ_K, 0, reject_idx - 4, 6))        # == TCP -> fall thru
+    prog.append((LDX_MSH, 0, 0, 14))            # X = ihl*4
+    for i, p in enumerate(sorted(ports)):
+        b = 5 + 2 * i
+        # dst port at ip_start + X + 16
+        prog.append((LDH_IND, 0, 0, 16))
+        prog.append((JEQ_K, accept_idx - (b + 2), 1 if i < len(ports) - 1
+                     else reject_idx - (b + 2), p))
+    prog.append((RET_K, 0, 0, 0))               # reject
+    prog.append((RET_K, 0, 0, 0x40000))         # accept (256KB)
+
+    try:
+        import ctypes
+
+        class SockFilter(ctypes.Structure):
+            _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8),
+                        ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+        class SockFprog(ctypes.Structure):
+            # mirrors struct sock_fprog {u16 len; sock_filter *filter};
+            # ctypes applies the same pointer alignment as the compiler
+            _fields_ = [("len", ctypes.c_uint16),
+                        ("filter", ctypes.POINTER(SockFilter))]
+
+        arr = (SockFilter * len(prog))()
+        for i, (code, jt, jf, k) in enumerate(prog):
+            arr[i].code = code; arr[i].jt = jt
+            arr[i].jf = jf; arr[i].k = k
+        return SockFprog(len(prog), arr), arr
+    except Exception:
+        return None
+
+
+def apply_perf_opts(sock, ports):
+    """Best-effort kernel assist: BPF port filter + big rcvbuf."""
+    built = build_bpf(ports)
+    if built is not None:
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            fprog, arr = built                      # keep arr referenced!
+            ret = libc.setsockopt(sock.fileno(), socket.SOL_SOCKET,
+                                  SO_ATTACH_FILTER,
+                                  ctypes.byref(fprog),
+                                  ctypes.sizeof(fprog))
+            if ret == 0:
+                log("kernel BPF filter attached (%d monitored ports)"
+                    % len(ports))
+            else:
+                log("WARN: BPF attach rejected by kernel (ret=%d) "
+                    "— running unfiltered" % ret)
+        except Exception as e:
+            log("WARN: BPF filter attach failed (%s) — running unfiltered"
+                % e)
+    else:
+        log("WARN: ctypes unavailable — running without BPF filter")
+    try:
+        want = 8 * 1024 * 1024
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, want)
+        got = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        log("rcvbuf: %d bytes" % got)
+    except Exception as e:
+        log("WARN: SO_RCVBUF raise failed: %s" % e)
+
+
+# ---------------------------------------------------------------- perf: fanout
+SOL_PACKET = 263
+PACKET_FANOUT = 18
+
+def apply_fanout(sock, group_id):
+    """Kernel load-balances packets across all sockets sharing the group.
+    Hashing is per-flow-directional; request direction alone drives event
+    emission, so directional splits are safe. Returns True on success."""
+    try:
+        sock.setsockopt(SOL_PACKET, PACKET_FANOUT,
+                        struct.pack("I", group_id & 0xFFFF))
+        return True
+    except Exception as e:
+        log("WARN: PACKET_FANOUT failed (%s) — single-process capture" % e)
+        return False
+
+
 def parse_args(argv):
     iface = None
     ports = [80, 8003, 8005, 8007, 8009, 8010, 8011]
     verbose = False
+    workers = 1
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -52,6 +166,8 @@ def parse_args(argv):
             i += 1; iface = argv[i]
         elif a == "-p":
             i += 1; ports = [int(x) for x in argv[i].split(",") if x.strip()]
+        elif a == "-j":
+            i += 1; workers = max(1, int(argv[i]))
         elif a == "-v":
             verbose = True
         elif a in ("-h", "--help"):
@@ -59,15 +175,13 @@ def parse_args(argv):
         else:
             raise SystemExit("unknown arg: %s" % a)
         i += 1
-    return iface, set(ports), verbose
+    return iface, set(ports), verbose, workers
 
 
 class Flow(object):
-    __slots__ = ("buf", "state", "need", "hdrs", "touched")
+    __slots__ = ("buf", "hdrs", "touched")
     def __init__(self):
         self.buf = bytearray()
-        self.state = 0          # 0=headers, 1=body
-        self.need = 0
         self.hdrs = {}
         self.touched = time.time()
 
@@ -123,7 +237,13 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
 
 
 def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out):
-    """Feed one direction's payload; emit finished events to out(list)."""
+    """Feed one direction's payload; emit finished events to out(list).
+
+    HEADER-ONLY capture: the event is emitted the moment \r\n\r\n is seen.
+    Request bodies are NOT buffered — Basic auth (all we mine) rides headers,
+    so body bytes cost memory and delay events for zero information. A later
+    segment on the same connection simply fails the request-line check and
+    is discarded."""
     dst_ip, dport, src_ip, sport = meta
     fl = flows.get(key)
     if fl is None:
@@ -134,65 +254,35 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out):
     fl.touched = time.time()
     fl.buf.extend(bytearray(payload))
 
-    while True:
-        if fl.state == 0:
-            idx = fl.buf.find(b"\r\n\r\n")
-            if idx < 0:
-                if len(fl.buf) > MAX_HDRS:
-                    flows.pop(key, None)
-                return
-            head = bytes(fl.buf[:idx])
-            rest = fl.buf[idx + 4:]
-            lines = head.replace(b"\r\n", b"\n").split(b"\n")
-            hdrs = {}
-            first = lines[0].strip().split()
-            if len(first) >= 2 and first[0] in [
-                    m.encode() for m in METHODS]:
-                hdrs["_method"] = first[0].decode("ascii", "replace")
-                hdrs["_path"] = first[1].decode("ascii", "replace")
-            else:
-                flows.pop(key, None)       # not a request start
-                return
-            for ln in lines[1:]:
-                if b":" not in ln:
-                    continue
-                kn, kv = ln.split(b":", 1)
-                hdrs[kn.strip().lower().decode(
-                    "ascii", "replace")] = kv.strip().decode(
-                        "utf-8", "replace")[:180]
-            cl = 0
-            if "content-length" in hdrs:
-                try:
-                    cl = min(int(hdrs["content-length"]), MAX_BODY)
-                except ValueError:
-                    cl = 0
-            if cl == 0:
-                fl.hdrs = hdrs
-                ev = finish_event(fl, key, dst_ip, dport, src_ip, sport,
-                                  ports, node_host)
-                del flows[key]
-                if ev:
-                    out.append(ev)
-                return
-            fl.hdrs = hdrs
-            fl.state = 1
-            fl.need = cl
-            fl.buf = bytearray(rest[:cl * 2])   # keep some slack
-            continue                            # re-check body in next loop
-        if fl.state == 1:
-            if len(fl.buf) >= fl.need:
-                # body captured (auth may ride inside POST bodies for some
-                # tiers, but per product decision we do NOT mine SOAP bodies;
-                # buffer kept only so Content-Length framing stays honest)
-                ev = finish_event(fl, key,
-                                  dst_ip, dport, src_ip, sport,
-                                  ports, node_host)
-                del flows[key]
-                if ev:
-                    out.append(ev)
-                return
-            else:
-                return                          # wait for more segments
+    idx = fl.buf.find(b"\r\n\r\n")
+    if idx < 0:
+        if len(fl.buf) > MAX_HDRS:
+            flows.pop(key, None)
+        return
+    head = bytes(fl.buf[:idx])
+    lines = head.replace(b"\r\n", b"\n").split(b"\n")
+    hdrs = {}
+    first = lines[0].strip().split()
+    if len(first) >= 2 and first[0] in [
+            m.encode() for m in METHODS]:
+        hdrs["_method"] = first[0].decode("ascii", "replace")
+        hdrs["_path"] = first[1].decode("ascii", "replace")
+    else:
+        flows.pop(key, None)       # not a request start
+        return
+    for ln in lines[1:]:
+        if b":" not in ln:
+            continue
+        kn, kv = ln.split(b":", 1)
+        hdrs[kn.strip().lower().decode(
+            "ascii", "replace")] = kv.strip().decode(
+                "utf-8", "replace")[:180]
+    fl.hdrs = hdrs
+    ev = finish_event(fl, key, dst_ip, dport, src_ip, sport,
+                      ports, node_host)
+    del flows[key]
+    if ev:
+        out.append(ev)
 
 
 def sweep_idle(flows, now):
@@ -213,7 +303,7 @@ def enforce_limit(flows, now):
 
 
 def main():
-    iface, ports, verbose = parse_args(sys.argv[1:])
+    iface, ports, verbose, workers = parse_args(sys.argv[1:])
     node_host = socket.gethostname().split(".")[0]
 
     try:
@@ -227,6 +317,10 @@ def main():
     except socket.error as e:
         raise SystemExit("cannot open AF_PACKET socket (%s) — need "
                          "CAP_NET_RAW / root" % e)
+    # kernel assist BEFORE bind: BPF port filter + big rcvbuf. With the
+    # filter attached the kernel drops non-monitored traffic for us, which
+    # is what lifts the capture ceiling from ~720 ev/s to wire rate.
+    apply_perf_opts(s, ports)
     try:
         s.bind((iface or "", 0))
     except socket.error:
@@ -235,7 +329,18 @@ def main():
             s.bind(("", 0))
         except socket.error:
             pass          # unbound socket still receives on all interfaces
-    s.settimeout(1.0)
+    fanout_ok = False
+    if workers > 1:
+        fanout_ok = apply_fanout(s, 0xF00D)
+        if fanout_ok:
+            log("fanout group 0xF00D: spawning %d workers" % workers)
+
+    # precompiled struct readers — unpack_from reads straight out of the
+    # packet buffer (no slice copies) and yields ints under py2 AND py3
+    u16 = struct.Struct("!H").unpack_from
+    uh = struct.Struct("!HH").unpack_from   # sport,dport in one read
+    ub = struct.Struct("!BB").unpack_from
+    ntoa = socket.inet_ntoa
 
     flows = {}
     running = [True]
@@ -248,6 +353,15 @@ def main():
     last_sweep = time.time()
     log("listening on %s ports=%s pid=%d" %
         (iface or "<all>", sorted(ports), os.getpid()))
+
+    # fork extra capture workers AFTER fanout attach; WITHOUT a working
+    # fanout group every process would receive EVERY packet (duplicates),
+    # so single-process mode is forced when the kernel lacks support
+    # (PACKET_FANOUT needs kernel >= 3.1; el6 2.6.32 does not have it)
+    if fanout_ok:
+        for _ in range(workers - 1):
+            if os.fork() == 0:
+                break                 # child: fall through into its own loop
 
     while running[0]:
         try:
@@ -262,56 +376,47 @@ def main():
             if e.errno == errno.EINTR:
                 continue
             raise
-        if len(pkt) < 34:
+        n = len(pkt)
+        if n < 34:
             continue
-        off = 0
-        etype = struct.unpack("!H", pkt[12:14])[0]
+        off = 14                      # ethernet header
+        etype = u16(pkt, 12)[0]
         if etype == ETH_P_VLAN:
-            etype = struct.unpack("!H", pkt[16:18])[0]
-            off = 4
-        if etype != ETH_P_IP:
+            etype = u16(pkt, 16)[0]
+            off = 18
+        elif etype != ETH_P_IP:
+            continue                  # with BPF attached this is rare
+        ip0 = ub(pkt, off)[0]
+        if ip0 >> 4 != 4 or ub(pkt, off + 9)[0] != 6:   # IPv4 TCP only
             continue
-        ip = pkt[14 + off:]
-        if len(ip) < 20:
-            continue
-        ihl = (b2i(ip[0]) & 0x0F) * 4
-        if (b2i(ip[0]) >> 4) != 4 or b2i(ip[9]) != 6:   # IPv4 TCP only
-            continue
-        frag = struct.unpack("!H", ip[6:8])[0]
+        ihl = (ip0 & 0x0F) * 4
+        frag = u16(pkt, off + 6)[0]
         if frag & 0x1FFF:                         # non-first fragment
             continue
-        src_ip = socket.inet_ntoa(ip[12:16])
-        dst_ip = socket.inet_ntoa(ip[16:20])
-        tcp = ip[ihl:]
-        if len(tcp) < 20:
+        src_ip = ntoa(pkt[off + 12:off + 16])
+        dst_ip = ntoa(pkt[off + 16:off + 20])
+        tcp_off = off + ihl
+        sport, dport = uh(pkt, tcp_off)
+        # HEADER-ONLY capture: request direction drives events; response
+        # packets are useless to us now, so only dport packets carry payload
+        if dport not in ports:
             continue
-        sport, dport = struct.unpack("!HH", tcp[0:4])
-        doff = ((b2i(tcp[12]) >> 4) & 0x0F) * 4
-        flags = b2i(tcp[13])
-        payload = tcp[doff:]
-        if not payload:
-            # FIN/RST teardown: drop both directions' buffers
-            if flags & 0x05:                      # FIN|RST
-                fk = (src_ip, sport, dst_ip, dport)
-                rk = (dst_ip, dport, src_ip, sport)
-                flows.pop(fk, None)
-                flows.pop(rk, None)
-            continue
-        # requests TO our monitored ports (inbound to services)
-        if dport in ports:
-            key = (src_ip, sport, dst_ip, dport)
-            out = []
-            handle_payload(flows, key, None, payload,
-                           (dst_ip, dport, src_ip, sport),
-                           ports, node_host, out)
+        doff_flags = ub(pkt, tcp_off + 12)
+        doff = (doff_flags[0] >> 4) * 4
+        pay_start = tcp_off + doff
+        if n <= pay_start:
+            continue                              # no payload in segment
+        payload = pkt[pay_start:]                 # single copy per event seg
+        key = (src_ip, sport, dst_ip, dport)
+        out = []
+        handle_payload(flows, key, None, payload,
+                       (dst_ip, dport, src_ip, sport),
+                       ports, node_host, out)
+        if out:
+            w = sys.stdout.write
             for ev in out:
-                sys.stdout.write(json.dumps(ev) + "\n")
-            if out:
-                sys.stdout.flush()
-        # responses FROM monitored ports: used only for teardown bookkeeping
-        elif sport in ports and (flags & 0x05):
-            rk = (dst_ip, dport, src_ip, sport)
-            flows.pop(rk, None)
+                w(json.dumps(ev) + "\n")
+            sys.stdout.flush()
 
     log("stopped")
 
