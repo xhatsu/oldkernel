@@ -101,6 +101,11 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         || die "nt-sniff.py does not compile under node python"
     python -m py_compile "$WORKDIR/nt-ship.py" 2>/dev/null \
         || die "nt-ship.py does not compile under node python"
+    # version sentinel: reject stale pre-py2.6-fix kits (they py_compile fine
+    # but crash on first packet — silent capture loss)
+    grep -q "def b2i" "$WORKDIR/nt-sniff.py" \
+        || die "stale kit from mirror (missing py2.6 fix). Use the two-step form so the embedded payload is used:
+  curl -sSf \$URL -o /tmp/nt-install.sh && sh /tmp/nt-install.sh --endpoint $ENDPOINT"
     SCRIPT_DIR="$WORKDIR"
     log "kit ready in $SCRIPT_DIR"
 fi
