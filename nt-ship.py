@@ -11,8 +11,17 @@ Usage:
 """
 from __future__ import print_function
 
-import base64, json, os, Queue, signal, socket, sys
-import threading, time, urllib2
+import base64, json, os, signal, socket, sys
+
+# py2.6/el6 names first; py3 fallbacks for dev-box testing. The urllib2
+# str-vs-bytes encode guard in flush() stays — do not remove.
+try:
+    import Queue                      # py2: Queue module, class Queue.Queue
+    import urllib2
+except ImportError:                   # py3
+    import queue as Queue
+    import urllib.request as urllib2
+import threading, time
 
 MAX_BATCH = 400
 FLUSH_SEC = 5.0

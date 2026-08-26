@@ -66,31 +66,34 @@ def build_bpf(ports):
     LDH_IND = 0x48   # ld [x+k]:h
     RET_K = 0x06
 
+    # PROVEN dport block + sport block at X+14 (calibrated EMPIRICALLY on
+    # a live kernel: k=14 delivers response packets; the correlation then
+    # yields status/duration_ms/resp_bytes end-to-end). Requires the 1s
+    # recv timeout in main() — blocking recv + BPF starves after one pkt.
+    sk = int(os.environ.get("NT_SNIFF_SPORT_K", "14"))
+    ps = sorted(ports)
+    n = len(ps)
+    ret_rej = 5 + (4 if sk else 2) * n
+    ret_acc = ret_rej + 1
     prog = []
-    # accept if (dport in ports) OR (sport in ports) — responses needed for
-    # status/duration correlation. Two port blocks, either hits ACCEPT.
-    reject_idx = 5 + 4 * len(ports)
-    accept_idx = reject_idx + 1
-    prog.append((LDH_ABS, 0, 0, 12))            # ethertype
-    prog.append((JEQ_K, 0, reject_idx - 2, 0x0800))   # == IP -> fall thru
-    prog.append((LDB_ABS, 0, 0, 23))            # ip proto byte (fixed off)
-    prog.append((JEQ_K, 0, reject_idx - 4, 6))        # == TCP -> fall thru
-    prog.append((LDX_MSH, 0, 0, 14))            # X = ihl*4
-    # block A: dport at ip_start + X + 16
-    for i, p in enumerate(sorted(ports)):
-        b = 5 + 2 * i
+    prog.append((LDH_ABS, 0, 0, 12))                 # ethertype == IP?
+    prog.append((JEQ_K, 0, ret_rej - 2, 0x0800))
+    prog.append((LDB_ABS, 0, 0, 23))                 # proto == TCP?
+    prog.append((JEQ_K, 0, ret_rej - 4, 6))
+    prog.append((LDX_MSH, 0, 0, 14))                 # X = ihl*4
+    for i, p in enumerate(ps):                       # A: dport @ X+16
         prog.append((LDH_IND, 0, 0, 16))
-        prog.append((JEQ_K, accept_idx - (b + 2), 1 if i < len(ports) - 1
-                     else reject_idx - (b + 2), p))
-    # block B: sport at ip_start + X + 14 — jump target after last B check
-    base_b = 5 + 2 * len(ports)
-    for i, p in enumerate(sorted(ports)):
-        b = base_b + 2 * i
-        prog.append((LDH_IND, 0, 0, 14))
-        prog.append((JEQ_K, accept_idx - (b + 2), 1 if i < len(ports) - 1
-                     else reject_idx - (b + 2), p))
-    prog.append((RET_K, 0, 0, 0))               # reject
-    prog.append((RET_K, 0, 0, 0x40000))         # accept (256KB)
+        jt = ret_acc - (len(prog) + 1)
+        jf = 1 if i < n - 1 else ret_rej - (len(prog) + 1)
+        prog.append((JEQ_K, jt, jf, p))
+    if sk:                                           # B: sport @ X+sk
+        for i, p in enumerate(ps):
+            prog.append((LDH_IND, 0, 0, sk))
+            jt = ret_acc - (len(prog) + 1)
+            jf = 1 if i < n - 1 else ret_rej - (len(prog) + 1)
+            prog.append((JEQ_K, jt, jf, p))
+    prog.append((RET_K, 0, 0, 0))                    # reject
+    prog.append((RET_K, 0, 0, 0x40000))              # accept
 
     try:
         import ctypes
@@ -492,10 +495,27 @@ def main():
             if os.fork() == 0:
                 break                 # child: fall through into its own loop
 
+    # 1s recv timeout: (a) lets the pending/flow sweeps actually fire —
+    # without it `except socket.timeout` never runs; (b) empirically REQUIRED
+    # with the BPF filter attached: a fully-blocking recv on this kernel
+    # starves after the first packet, while the timeout'd recv delivers
+    # continuously (verified by A/B: rx=1 vs rx=29 identical otherwise).
+    s.settimeout(1.0)
+
+    dbg = os.environ.get("NT_SNIFF_DEBUG") == "1"
+    dbg_rx = 0
+    dbg_last = time.time()
     while running[0]:
         try:
             pkt = s.recv(65535)
+            dbg_rx += 1
+            if dbg and time.time() - dbg_last > 5:
+                log("DEBUG rx=%d" % dbg_rx)
+                dbg_last = time.time()
         except socket.timeout:
+            if dbg:
+                log("DEBUG timeout rx=%d" % dbg_rx)
+                dbg_last = time.time()
             now = time.time()
             if now - last_sweep > 30:
                 sweep_idle(flows, now)
