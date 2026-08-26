@@ -6,10 +6,18 @@
 # via file capability (cap_net_raw on a private interpreter copy); falls
 # back to root only if setcap is unavailable or SELinux refuses.
 #
-# Usage:
+# FIRST RUN — works standalone on a bare node; missing kit files are
+# fetched automatically from the hub bootstrap server:
+#
+#   curl -sSf http://HUB:30105/oldkernel/install-oldkernel.sh | sh -s -- \
+#        --endpoint http://HUB:31115
+#
+# Local bundle usage:
 #   sh install-oldkernel.sh --endpoint http://hub:31115
 #   sh install-oldkernel.sh --check [--endpoint ...]
 #   sh install-oldkernel.sh --uninstall
+#
+# Env overrides: NT_IFACE=eth1  NT_PORTS=80,...  NT_HUB=http://HUB:30105/oldkernel
 set -u
 
 PREFIX=/opt/networktracing-legacy
@@ -19,6 +27,7 @@ MODE=install
 ENDPOINT=""
 IFACE="${NT_IFACE:-}"
 PORTS="${NT_PORTS:-80,8003,8005,8007,8009,8010,8011}"
+KIT_URLS="${NT_HUB:-}"
 
 log()  { echo "[nt-legacy] $*"; }
 die()  { echo "[nt-legacy] FAIL: $*"; exit 1; }
@@ -27,13 +36,74 @@ have() { command -v "$1" >/dev/null 2>&1; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --endpoint) ENDPOINT="$2"; shift 2 ;;
+        --hub)      KIT_URLS="$2"; shift 2 ;;
         --check)    MODE=check; shift ;;
         --uninstall) MODE=uninstall; shift ;;
         *) die "unknown arg: $1" ;;
     esac
 done
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SCRIPT_DIR=""
+
+have_root() { [ "$(id -u)" = "0" ]; }
+
+fetch() { # fetch <url> <dest>
+    if have curl; then curl -sSf --max-time 30 "$1" -o "$2"
+    elif have wget; then wget -q -T 30 "$1" -O "$2"
+    else return 127; fi
+}
+
+# ------------------------------------------------------- first-run kit pull
+# A bare node may receive ONLY this script (piped over ssh/curl). Kit files
+# are resolved in order:
+#   1. already next to the script (local bundle)
+#   2. embedded base64 payload inside this file (single-file build — no
+#      network needed; preferred because hub mirrors can lag behind fixes)
+#   3. fetched from the hub bootstrap server (--hub / derived from endpoint)
+# Uninstall never needs the kit.
+need_kit=0
+for f in nt-sniff.py nt-ship.py; do
+    [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$f" ] || need_kit=1
+done
+
+if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
+    WORKDIR=/tmp/ntkit
+    mkdir -p "$WORKDIR" || die "cannot create $WORKDIR"
+
+    # --- source 2: embedded payload -------------------------------------
+    SELF="$0"
+    [ -f "$SELF" ] || SELF=""
+    if [ -n "$SELF" ] && grep -q '^#__SNIFF_B64__$' "$SELF" 2>/dev/null; then
+        log "first run: extracting embedded kit -> $WORKDIR"
+        sed -n '/^#__SNIFF_B64__$/,/^#__END_SNIFF__$/p' "$SELF" | sed '1d;$d' \
+            | base64 -d > "$WORKDIR/nt-sniff.py" 2>/dev/null
+        sed -n '/^#__SHIP_B64__$/,/^#__END_SHIP__$/p' "$SELF" | sed '1d;$d' \
+            | base64 -d > "$WORKDIR/nt-ship.py" 2>/dev/null
+    fi
+
+    # --- source 3: hub bootstrap server ---------------------------------
+    if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ]; then
+        if [ -z "$KIT_URLS" ] && [ -n "$ENDPOINT" ]; then
+            HUBHOST=$(printf %s "$ENDPOINT" | sed -n 's#^\(https\?://[^/:]*\).*$#\1#p')
+            [ -n "$HUBHOST" ] && KIT_URLS="$HUBHOST:30105/oldkernel"
+        fi
+        [ -n "$KIT_URLS" ] || die "kit files missing, no embedded payload, cannot derive hub URL — pass --hub http://HUB:30105/oldkernel"
+        log "first run: fetching kit from $KIT_URLS -> $WORKDIR"
+        have curl || have wget || die "neither curl nor wget present and no embedded payload"
+        for f in nt-sniff.py nt-ship.py el68-smoke.sh README.md DEBUG-NOTES.md; do
+            fetch "$KIT_URLS/$f" "$WORKDIR/$f.new" || die "cannot download $f from $KIT_URLS"
+            mv "$WORKDIR/$f.new" "$WORKDIR/$f"
+        done
+    fi
+
+    chmod 755 "$WORKDIR"/nt-*.py 2>/dev/null || true
+    python -m py_compile "$WORKDIR/nt-sniff.py" 2>/dev/null \
+        || die "nt-sniff.py does not compile under node python"
+    python -m py_compile "$WORKDIR/nt-ship.py" 2>/dev/null \
+        || die "nt-ship.py does not compile under node python"
+    SCRIPT_DIR="$WORKDIR"
+    log "kit ready in $SCRIPT_DIR"
+fi
 
 # ---------------------------------------------------------------- uninstall
 if [ "$MODE" = "uninstall" ]; then
@@ -88,6 +158,8 @@ if [ "$MODE" = "check" ]; then
     log "preflight OK ($IFACE, $(uname -r), endpoint=$ENDPOINT) — no changes made"
     exit 0
 fi
+
+have_root || die "must run as root (try: sudo sh $0 ...)"
 
 # ---------------------------------------------------------------- install
 mkdir -p "$PREFIX" || die "mkdir $PREFIX failed"
