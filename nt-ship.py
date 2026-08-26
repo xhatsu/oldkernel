@@ -83,6 +83,8 @@ def main():
             ok = (resp.getcode() == 200)
             resp.read()
             resp.close()
+            if ok:
+                log("flushed %d events" % len(batch))
             return ok
         except Exception as e:
             log("ship failed: %s" % e)
@@ -90,7 +92,29 @@ def main():
 
     buf = list(pending)
     last_flush = time.time()
+    last_spool_try = time.time()
     backoff = 1
+
+    def fold_spool():
+        """Re-queue spooled events (mid-run retry); returns count folded."""
+        n = 0
+        try:
+            with open(spool) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(ev, dict):
+                        buf.append(ev)
+                        n += 1
+            os.remove(spool)
+        except (IOError, OSError):
+            pass
+        return n
 
     for raw in iter(sys.stdin.readline, ""):
         if not running[0]:
@@ -107,19 +131,40 @@ def main():
         now = time.time()
         if len(buf) >= MAX_BATCH or now - last_flush >= FLUSH_SEC:
             last_flush = now
-            if not flush(buf):
-                _spool_append(spool, buf)
-                buf = []
-                time.sleep(min(backoff, 60))
-                backoff *= 2
-            else:
-                backoff = 1
+            # retry spooled events ahead of fresh ones (~once a minute),
+            # keeping total batch within MAX_BATCH
+            if now - last_spool_try >= 60 and os.path.exists(spool):
+                last_spool_try = now
+                fold_spool()
+            if flush(buf[:MAX_BATCH]):
+                del buf[:MAX_BATCH]       # MUST clear on success — re-posting
+                backoff = 1               # the same buffer caused 20x dups and
+            else:                         # a full pipeline stall under load
+                _spool_append(spool, buf[:MAX_BATCH])
+                del buf[:MAX_BATCH]
+                # brief pause ONLY — long backoff sleeps stop us draining
+                # stdin, which blocks the sniffer on the pipe and makes the
+                # kernel drop captured packets (proven under 20k-req load)
+                time.sleep(0.5)
 
-    # stdin closed (sniffer stopped) — final flush
-    if buf and not flush(buf):
-        _spool_append(spool, buf)
-    log("stopped (%d events pending on exit)" %
-        len(buf) if not buf else "stopped clean")
+    # stdin closed (sniffer stopped) — drain buffer, then keep retrying
+    # anything spooled until it lands or RETRY_MAX elapses
+    deadline = time.time() + RETRY_MAX
+    while running[0] and time.time() < deadline:
+        if buf:
+            if flush(buf):
+                del buf[:]
+            else:
+                _spool_append(spool, buf)
+                del buf[:]
+        if os.path.exists(spool):
+            fold_spool()
+        if not buf and not os.path.exists(spool):
+            break
+        if buf or os.path.exists(spool):
+            time.sleep(min(backoff, 60))
+            backoff *= 2
+    log("stopped (%d events pending on exit)" % len(buf))
 
 
 def _spool_append(path, batch):
