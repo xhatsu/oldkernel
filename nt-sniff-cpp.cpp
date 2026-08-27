@@ -224,6 +224,16 @@ static void sweep(std::map<std::string, Flow> &flows, std::map<PacketKey, std::v
     p = pn;
   }
 }
+static size_t find_http_start(const std::string &s) {
+  const char *m[] = { "GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS " };
+  size_t best = std::string::npos;
+  for (size_t i = 0; i < 7; ++i) {
+    size_t pos = s.find(m[i]);
+    if (pos != std::string::npos && (best == std::string::npos || pos < best)) best = pos;
+  }
+  return best;
+}
+
 static bool handle_packet(const unsigned char *buf, size_t n, const std::string &node, const std::vector<unsigned> &ports,
                           std::map<std::string, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending) {
   if (n < 34) return false;
@@ -242,22 +252,26 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     if (dport == ports[j]) dst_mon = true;
     if (sport == ports[j]) src_mon = true;
   }
-  if (src_mon && !dst_mon && plen >= 5 && memcmp(payload, "HTTP/", 5) == 0) {
-    PacketKey k;
-    k.src = a; k.sport = sport; k.dst = b; k.dport = dport;
-    std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(k);
-    if (p != pending.end() && !p->second.empty()) {
-      int st; unsigned cl;
-      if (parse_response(std::string(payload, plen), &st, &cl)) {
-        Event e = p->second[0].ev;
-        e.status = st; e.has_status = true;
-        e.duration_ms = (long)(now_ms() - p->second[0].started_ms);
-        if (e.duration_ms < 0) e.duration_ms = 0;
-        e.has_duration = true;
-        if (cl) { e.resp_bytes = cl; e.has_resp = true; }
-        emit_event(e);
-        p->second.erase(p->second.begin());
-        if (p->second.empty()) pending.erase(p);
+  if (src_mon && !dst_mon && plen >= 5) {
+    std::string s_pay(payload, plen);
+    size_t hpos = s_pay.find("HTTP/");
+    if (hpos != std::string::npos) {
+      PacketKey k;
+      k.src = a; k.sport = sport; k.dst = b; k.dport = dport;
+      std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(k);
+      if (p != pending.end() && !p->second.empty()) {
+        int st; unsigned cl;
+        if (parse_response(s_pay.substr(hpos), &st, &cl)) {
+          Event e = p->second[0].ev;
+          e.status = st; e.has_status = true;
+          e.duration_ms = (long)(now_ms() - p->second[0].started_ms);
+          if (e.duration_ms < 0) e.duration_ms = 0;
+          e.has_duration = true;
+          if (cl) { e.resp_bytes = cl; e.has_resp = true; }
+          emit_event(e);
+          p->second.erase(p->second.begin());
+          if (p->second.empty()) pending.erase(p);
+        }
       }
     }
     return true;
@@ -265,10 +279,20 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   if (!dst_mon) return false;
   std::string fk = key_string(a, sport, b, dport); Flow &fl = flows[fk]; fl.touched = now; fl.buf.append(payload, plen);
   if (fl.buf.size() > MAX_HEADER) { flows.erase(fk); return false; }
-  size_t end = fl.buf.find("\r\n\r\n"); if (end == std::string::npos) return false;
-  Event e; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = a; e.caller_port = sport; e.dst_ip = b; e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
-  if (!parse_request(fl.buf.substr(0, end), &e)) { flows.erase(fk); return false; } flows.erase(fk);
-  PacketKey rk; rk.src = b; rk.sport = dport; rk.dst = a; rk.dport = sport; if (pending.size() >= MAX_PENDING) flush_oldest(pending); pending[rk].push_back(Pending(e, now_ms())); return true;
+  while (true) {
+    size_t start = find_http_start(fl.buf);
+    if (start == std::string::npos) { fl.buf.clear(); break; }
+    if (start > 0) fl.buf.erase(0, start);
+    size_t end = fl.buf.find("\r\n\r\n");
+    if (end == std::string::npos) break;
+    Event e; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = a; e.caller_port = sport; e.dst_ip = b; e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
+    if (!parse_request(fl.buf.substr(0, end), &e)) { fl.buf.erase(0, end + 4); continue; }
+    fl.buf.erase(0, end + 4);
+    PacketKey rk; rk.src = b; rk.sport = dport; rk.dst = a; rk.dport = sport;
+    if (pending.size() >= MAX_PENDING) flush_oldest(pending);
+    pending[rk].push_back(Pending(e, now_ms()));
+  }
+  return true;
 }
 
 static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
