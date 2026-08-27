@@ -64,7 +64,7 @@ fetch() { # fetch <url> <dest>
 #   3. fetched from the hub bootstrap server (--hub / derived from endpoint)
 # Uninstall never needs the kit.
 need_kit=0
-for f in nt-sniff.py nt-ship.py; do
+for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh; do
     [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$f" ] || need_kit=1
 done
 
@@ -81,10 +81,15 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
             | base64 -d > "$WORKDIR/nt-sniff.py" 2>/dev/null
         sed -n '/^#__SHIP_B64__$/,/^#__END_SHIP__$/p' "$SELF" | sed '1d;$d' \
             | base64 -d > "$WORKDIR/nt-ship.py" 2>/dev/null
+        sed -n '/^#__CPP_SHIP_B64__$/,/^#__END_CPP_SHIP__$/p' "$SELF" | sed '1d;$d' \
+            | base64 -d > "$WORKDIR/nt-ship-cpp.cpp" 2>/dev/null
+        sed -n '/^#__CPP_B64__$/,/^#__END_CPP__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-sniff-cpp.cpp" 2>/dev/null
+        sed -n '/^#__CPP_MAKE_B64__$/,/^#__END_CPP_MAKE__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/Makefile" 2>/dev/null
+        sed -n '/^#__CPP_RUN_B64__$/,/^#__END_CPP_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-run-cpp.sh" 2>/dev/null
     fi
 
     # --- source 3: hub bootstrap server ---------------------------------
-    if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ]; then
+    if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ] || [ ! -s "$WORKDIR/nt-sniff-cpp.cpp" ] || [ ! -s "$WORKDIR/Makefile" ]; then
         if [ -z "$KIT_URLS" ] && [ -n "$ENDPOINT" ]; then
             HUBHOST=$(printf %s "$ENDPOINT" | sed -n 's#^\(https\?://[^/:]*\).*$#\1#p')
             [ -n "$HUBHOST" ] && KIT_URLS="$HUBHOST:30105/oldkernel"
@@ -92,13 +97,13 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         [ -n "$KIT_URLS" ] || die "kit files missing, no embedded payload, cannot derive hub URL — pass --hub http://HUB:30105/oldkernel"
         log "first run: fetching kit from $KIT_URLS -> $WORKDIR"
         have curl || have wget || die "neither curl nor wget present and no embedded payload"
-        for f in nt-sniff.py nt-ship.py el68-smoke.sh README.md DEBUG-NOTES.md; do
+        for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
             fetch "$KIT_URLS/$f" "$WORKDIR/$f.new" || die "cannot download $f from $KIT_URLS"
             mv "$WORKDIR/$f.new" "$WORKDIR/$f"
         done
     fi
 
-    chmod 755 "$WORKDIR"/nt-*.py 2>/dev/null || true
+    chmod 755 "$WORKDIR"/nt-*.py "$WORKDIR"/nt-run-cpp.sh 2>/dev/null || true
     python -m py_compile "$WORKDIR/nt-sniff.py" 2>/dev/null \
         || die "nt-sniff.py does not compile under node python"
     python -m py_compile "$WORKDIR/nt-ship.py" 2>/dev/null \
@@ -115,14 +120,19 @@ fi
 # ---------------------------------------------------------------- uninstall
 if [ "$MODE" = "uninstall" ]; then
     log "stopping service..."
-    [ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1
+    [ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1 || true
     if have chkconfig; then chkconfig networktracing-legacy off >/dev/null 2>&1 || true; fi
     rm -f "$INIT"
-    pkill -f "$PREFIX/nt-sniff.py" 2>/dev/null || true
-    pkill -f "$PREFIX/nt-ship.py" 2>/dev/null || true
+    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py"; do
+        for p in $(pgrep -f "$pattern" 2>/dev/null || true); do
+            [ "$p" = "$$" ] || kill "$p" 2>/dev/null || true
+        done
+    done
     rm -rf "$PREFIX"
     RESIDUE=""
-    pgrep -f "$PREFIX/" >/dev/null 2>&1 && RESIDUE="$RESIDUE procs-alive"
+    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py"; do
+        pgrep -f "$pattern" >/dev/null 2>&1 && RESIDUE="$RESIDUE procs-alive"
+    done
     [ -e "$INIT" ] && RESIDUE="$RESIDUE init-script-present"
     [ -d "$PREFIX" ] && RESIDUE="$RESIDUE install-dir-present"
     if [ -n "$RESIDUE" ]; then
@@ -139,9 +149,15 @@ case "$(uname -r)" in
     *) log "WARN: kernel $(uname -r) — kit targets 2.6.32; may still work" ;;
 esac
 
-have python || die "python (2.6/2.7) required on the node"
-python -c 'import sys; assert sys.version_info >= (2,6) and sys.version_info < (3,)' \
-    || die "python 2.6/2.7 required"
+# C++ native mode uses the shipped binary; do not require Python 2.6.
+if [ "${NT_CAPTURE_MODE:-python}" = "cpp" ]; then
+    have g++ || die "NT_CAPTURE_MODE=cpp requires g++ on target"
+    have python || die "python shipper required on target"
+else
+    have python || die "python (2.6/2.7) required on the node"
+    python -c 'import sys; assert sys.version_info >= (2,6) and sys.version_info < (3,)' \
+        || die "python 2.6/2.7 required"
+fi
 
 [ -n "$ENDPOINT" ] || die "--endpoint http://hub:port required"
 
@@ -170,12 +186,16 @@ have_root || die "must run as root (try: sudo sh $0 ...)"
 
 # ---------------------------------------------------------------- install
 mkdir -p "$PREFIX" || die "mkdir $PREFIX failed"
-for f in nt-sniff.py nt-ship.py; do
+for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh; do
     [ -f "$SCRIPT_DIR/$f" ] || die "bundle incomplete: missing $f"
 done
 cp "$SCRIPT_DIR"/nt-sniff.py "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-ship.py  "$PREFIX/"
-chmod 755 "$PREFIX"/nt-*.py
+cp "$SCRIPT_DIR"/nt-ship-cpp.cpp "$PREFIX/"
+cp "$SCRIPT_DIR"/nt-sniff-cpp.cpp "$PREFIX/"
+cp "$SCRIPT_DIR"/Makefile "$PREFIX/"
+cp "$SCRIPT_DIR"/nt-run-cpp.sh "$PREFIX/"
+chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-run-cpp.sh
 
 # privilege model: copy the interpreter, grant IT cap_net_raw, run sniffer
 # as a locked account. Falls back to root when setcap/SELinux refuses.
@@ -214,10 +234,22 @@ fi
 
 # sniffer stdout must FEED the shipper's stdin; starting them separately
 # leaves events stranded in sniff.log (proven on el6). Build one pipeline.
-if [ "$SNIFF_AS" != root ]; then
-    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS'"
+# Choose native C++ only when explicitly requested; Python remains default.
+CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
+# Native C++ builds from the copied source and uses the native C++ shipper.
+# The default capture mode remains Python for compatibility.
+if [ "$CAPTURE_MODE" = "cpp" ]; then
+    (cd "$PREFIX" && g++ -O2 -Wall -Wextra -std=gnu++03 nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra -std=gnu++03 nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
+    SNIFF_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS"
+    SHIP_CMD="exec $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl"
+    log "native C++ capture + shipper selected"
 else
-    SNIFF_CMD="exec python $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS"
+    if [ "$SNIFF_AS" != root ]; then
+        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS'"
+    else
+        SNIFF_CMD="exec python $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS"
+    fi
+    SHIP_CMD="exec python $PREFIX/nt-ship.py --endpoint $ENDPOINT"
 fi
 
 cat > "$INIT" <<EOF
@@ -233,23 +265,27 @@ PIDFILE=/var/run/networktracing-legacy.pid
 
 case "\$1" in
     start)
-        if pgrep -f "\\\$PREFIX/nt-sniff.py" >/dev/null; then
+        if pgrep -f "\\\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\\\$PREFIX/nt-sniff-cpp" >/dev/null; then
             echo "already running"; exit 0
         fi
-        nohup sh -c "$SNIFF_CMD 2>>\$PREFIX/sniff.log | python \$PREFIX/nt-ship.py --endpoint $ENDPOINT >>\$PREFIX/ship.log 2>&1" >/dev/null 2>&1 &
+        nohup sh -c "$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1" >/dev/null 2>&1 &
+        echo \$! > "\$PIDFILE"
         sleep 1
-        pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || { echo "sniffer failed to start"; exit 1; }
+        pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null || { echo "sniffer failed to start"; exit 1; }
         echo "networktracing-legacy started"
         ;;
     stop)
-        pkill -f "\$PREFIX/nt-sniff.py" 2>/dev/null
-        pkill -f "\$PREFIX/nt-ship.py" 2>/dev/null
+        for pattern in "\$PREFIX/nt-sniff.py" "\$PREFIX/nt-sniff-cpp" "\$PREFIX/nt-ship.py"; do
+            for p in \$(pgrep -f "\$pattern" 2>/dev/null || true); do
+                [ "\$p" = "\$\$" ] || kill "\$p" 2>/dev/null || true
+            done
+        done
         rm -f "\$PIDFILE"
         echo "networktracing-legacy stopped"
         ;;
     status)
-        if pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null; then
-            echo "running (pid \$(pgrep -f "\$PREFIX/nt-sniff.py"))"; exit 0
+        if pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null; then
+            echo "running"; exit 0
         fi
         echo "stopped"; exit 3
         ;;
@@ -271,7 +307,7 @@ fi
 
 "$INIT" start || die "service failed to start"
 sleep 3
-pgrep -f "$PREFIX/nt-sniff.py" >/dev/null || die "sniffer not running after start"
+pgrep -f "$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "$PREFIX/nt-sniff-cpp" >/dev/null || die "sniffer not running after start"
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
 log "Logs: $PREFIX/sniff.log $PREFIX/ship.log"

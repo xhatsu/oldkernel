@@ -1,5 +1,21 @@
 # oldkernel/ — NetworkTracing kit for CentOS 6.x / kernel 2.6.32
 
+## Native C++ capture mock
+
+`nt-sniff-cpp.cpp` is a native C++03-compatible replacement path for the
+Python hot loop. It uses AF_PACKET, classic BPF, bounded HTTP flow/pending
+maps, response-head correlation, TTL eviction, signal handling, and emits the
+same JSONL event contract. It is built with `make -C oldkernel` and can be
+checked without CAP_NET_RAW using:
+
+```sh
+make -C oldkernel fixture
+```
+
+The production runtime is intentionally not switched by the installer yet;
+run the fixture and live loopback E2E before replacing the Python command on
+an EL6 node.
+
 Passive HTTP/SOAP capture for nodes that **cannot run kyanos/ecapture**
 (no eBPF, no systemd, python 2.6 only). Rootless after install via file
 capability; falls back to root capture if SELinux refuses.
@@ -71,15 +87,20 @@ Impact   : passive listen-only; zero app changes; no kernel modules
 | `nt-ship.py` | batching shipper → `/api/ingest`, disk spool + backoff retry |
 | `install-oldkernel.sh` | SysV installer: `--check` / install / `--uninstall` |
 | `el68-smoke.sh` | run FIRST — proves kernel/python/setcap/AF_PACKET/SELinux |
+| `CENTOS-6.7-TEST.md` | detailed real-node CentOS 6.7 / kernel 2.6.32 test runbook |
+| `verify-centos-runbook.sh` | local static/build verification for the runbook |
 
 ## Usage
 
 ### 0. Pull the kit onto the node
 
+For the complete CentOS 6.7 real-node procedure, use [`CENTOS-6.7-TEST.md`](CENTOS-6.7-TEST.md).
+
 ```sh
 HUB=10.0.0.35                       # your NetworkTracing hub
 mkdir -p /tmp/ntkit && cd /tmp/ntkit
-for f in el68-smoke.sh nt-sniff.py nt-ship.py install-oldkernel.sh; do
+for f in el68-smoke.sh nt-sniff.py nt-ship.py nt-ship-cpp.cpp \
+         nt-sniff-cpp.cpp Makefile nt-run-cpp.sh install-oldkernel.sh; do
   curl -sSf http://$HUB:30105/oldkernel/$f -o $f || wget http://$HUB:30105/oldkernel/$f -O $f
 done
 chmod +x *.sh *.py

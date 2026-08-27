@@ -180,11 +180,27 @@ def parse_args(argv):
     while i < len(argv):
         a = argv[i]
         if a == "-i":
+            if i + 1 >= len(argv):
+                raise SystemExit("-i requires an interface")
             i += 1; iface = argv[i]
         elif a == "-p":
-            i += 1; ports = [int(x) for x in argv[i].split(",") if x.strip()]
+            if i + 1 >= len(argv):
+                raise SystemExit("-p requires a comma-separated port list")
+            i += 1
+            try:
+                ports = [int(x) for x in argv[i].split(",") if x.strip()]
+            except ValueError:
+                raise SystemExit("invalid port list")
+            if not ports or any(not valid_port(x) for x in ports):
+                raise SystemExit("ports must be in range 1..65535")
         elif a == "-j":
-            i += 1; workers = max(1, int(argv[i]))
+            if i + 1 >= len(argv):
+                raise SystemExit("-j requires a worker count")
+            i += 1
+            try:
+                workers = max(1, int(argv[i]))
+            except ValueError:
+                raise SystemExit("invalid worker count")
         elif a == "-v":
             verbose = True
         elif a in ("-h", "--help"):
@@ -255,6 +271,13 @@ def parse_response_head(payload):
     return st, clen
 
 
+def valid_port(p):
+    try:
+        return 1 <= int(p) <= 65535
+    except (TypeError, ValueError):
+        return False
+
+
 def basic_user(value):
     """Authorization header value -> (user|None, scheme|None). Basic only."""
     parts = value.strip().split(None, 1)
@@ -264,16 +287,19 @@ def basic_user(value):
     if scheme == "basic":
         try:
             pad = parts[1].strip()
+            if len(pad) > 1024:
+                return None, None
             pad += "=" * (-len(pad) % 4)
             raw = base64.b64decode(pad)
+            if len(raw) > 512:
+                return None, None
             if b":" in raw:
                 user = raw.split(b":", 1)[0]
-                # never return the password; user only
                 return user.decode("utf-8", "replace")[:64], "basic"
         except Exception:
             return None, None
     elif scheme == "bearer":
-        return None, "bearer"       # token opaque; user mapping is hub-side
+        return None, "bearer"
     return None, None
 
 
@@ -328,6 +354,9 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
         "service_id": None,          # hub maps port->service via policy later
         "module_id": "pcap-http",
     }
+    # Preserve response correlation only for monitored destinations. The
+    # response-side filter may still admit a client ephemeral sport equal to a
+    # monitored port; this is harmless because parse_response_head rejects it.
     return ev if (dport in ports or h.get("_method")) else None
 
 
@@ -344,6 +373,8 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
     segment on the same connection simply fails the request-line check and
     is discarded."""
     dst_ip, dport, src_ip, sport = meta
+    if not valid_port(dport) or not valid_port(sport):
+        return
     fl = flows.get(key)
     if fl is None:
         fl = Flow()
