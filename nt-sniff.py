@@ -594,9 +594,7 @@ def main():
             # pending key was stored as (server_ip, server_port, client_ip,
             # client_port) == (src, sport, dst, dport) OF THIS response pkt
             rk = (src_ip, sport, dst_ip, dport)
-            if flags & 0x05:                      # FIN|RST: flush unmatched
-                ev = pending_pop(rk, out)
-            elif payload[:5] == b"HTTP/":
+            if payload[:5] == b"HTTP/":
                 st, clen = parse_response_head(payload)
                 ent = pending.get(rk)
                 if ent is not None:
@@ -607,6 +605,8 @@ def main():
                         ev["resp_bytes"] = clen
                     pending_del(rk)
                     out.append(ev)
+            elif flags & 0x05:                      # FIN|RST: flush unmatched
+                ev = pending_pop(rk, out)
         # ---------------- REQUEST direction (client -> server) -----------
         elif dport in ports:
             if flags & 0x05:                      # teardown w/o response seen
