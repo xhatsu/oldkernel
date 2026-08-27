@@ -22,6 +22,7 @@ from __future__ import print_function
 
 import base64, binascii, errno, json, os, signal, socket, struct, sys, time
 
+ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 ETH_P_VLAN = 0x8100
 
@@ -470,28 +471,23 @@ def main():
     node_host = socket.gethostname().split(".")[0]
 
     try:
-        # protocol MUST be htons(ETH_P_IP): a 0-protocol socket receives
-        # NOTHING (kernel delivers only matching ethertype; 0 matches none).
-        # socket.htons is correct on every platform — do NOT use ntohs here.
+        # protocol MUST be htons(ETH_P_ALL) to receive both INGRESS (req) and
+        # EGRESS (resp) packets on Linux kernel packet sockets.
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
-                          socket.htons(ETH_P_IP))
+                          socket.htons(ETH_P_ALL))
     except AttributeError:
         raise SystemExit("AF_PACKET unavailable on this platform")
     except socket.error as e:
         raise SystemExit("cannot open AF_PACKET socket (%s) — need "
                          "CAP_NET_RAW / root" % e)
-    # kernel assist BEFORE bind: BPF port filter + big rcvbuf. With the
-    # filter attached the kernel drops non-monitored traffic for us, which
-    # is what lifts the capture ceiling from ~720 ev/s to wire rate.
     apply_perf_opts(s, ports)
     try:
-        s.bind((iface or "", 0))
+        s.bind((iface or "", socket.htons(ETH_P_ALL)))
     except socket.error:
-        # binding to a specific iface failed — fall back to all interfaces
         try:
-            s.bind(("", 0))
+            s.bind(("", socket.htons(ETH_P_ALL)))
         except socket.error:
-            pass          # unbound socket still receives on all interfaces
+            pass
     fanout_ok = False
     if workers > 1:
         fanout_ok = apply_fanout(s, 0xF00D)
