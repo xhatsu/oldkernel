@@ -283,8 +283,18 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
   ADD(BPF_LD|BPF_H|BPF_ABS,0,0,12); ADD(BPF_JMP|BPF_JEQ|BPF_K,0,reject-2,ETH_P_IP_HOST);
   ADD(BPF_LD|BPF_B|BPF_ABS,0,0,23); ADD(BPF_JMP|BPF_JEQ|BPF_K,0,reject-4,IPPROTO_TCP);
   ADD(BPF_LD|BPF_B|BPF_MSH,0,0,14);
-  for (i = 0; i < ports.size(); ++i) { ADD(BPF_LD|BPF_H|BPF_IND,0,0,16); ADD(BPF_JMP|BPF_JEQ|BPF_K,accept-(unsigned)f.size()-1,1,ports[i]); }
-  for (i = 0; i < ports.size(); ++i) { ADD(BPF_LD|BPF_H|BPF_IND,0,0,14); ADD(BPF_JMP|BPF_JEQ|BPF_K,accept-(unsigned)f.size()-1,1,ports[i]); }
+  for (i = 0; i < ports.size(); ++i) {
+    ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 16);
+    unsigned jt = accept - (unsigned)f.size() - 1;
+    unsigned jf = 0;
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
+  }
+  for (i = 0; i < ports.size(); ++i) {
+    ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 14);
+    unsigned jt = accept - (unsigned)f.size() - 1;
+    unsigned jf = (i < ports.size() - 1) ? 0 : (reject - (unsigned)f.size() - 1);
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
+  }
   ADD(BPF_RET|BPF_K,0,0,0); ADD(BPF_RET|BPF_K,0,0,ACCEPT);
 #undef ADD
   if (f.size() > 4096) return false;

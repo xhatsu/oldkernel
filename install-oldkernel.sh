@@ -75,6 +75,13 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
     # --- source 2: embedded payload -------------------------------------
     SELF="$0"
     [ -f "$SELF" ] || SELF=""
+    if [ -z "$SELF" ] && [ -z "$KIT_URLS" ] && [ -n "$ENDPOINT" ]; then
+        HUBHOST=$(printf %s "$ENDPOINT" | sed -n 's#^\(https\?://[^/:]*\).*$#\1#p')
+        [ -n "$HUBHOST" ] && KIT_URLS="$HUBHOST:30105/oldkernel"
+    fi
+    if [ -z "$SELF" ] && [ -n "$KIT_URLS" ]; then
+        fetch "$KIT_URLS/install-firstrun-el68.sh" "$WORKDIR/nt-self.sh" 2>/dev/null && SELF="$WORKDIR/nt-self.sh"
+    fi
     if [ -n "$SELF" ] && grep -q '^#__SNIFF_B64__$' "$SELF" 2>/dev/null; then
         log "first run: extracting embedded kit -> $WORKDIR"
         sed -n '/^#__SNIFF_B64__$/,/^#__END_SNIFF__$/p' "$SELF" | sed '1d;$d' \
@@ -239,7 +246,8 @@ CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
 # Native C++ builds from the copied source and uses the native C++ shipper.
 # The default capture mode remains Python for compatibility.
 if [ "$CAPTURE_MODE" = "cpp" ]; then
-    (cd "$PREFIX" && g++ -O2 -Wall -Wextra -std=gnu++03 nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra -std=gnu++03 nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
+    CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
+    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
     SNIFF_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS"
     SHIP_CMD="exec $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl"
     log "native C++ capture + shipper selected"

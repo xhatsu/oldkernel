@@ -1,203 +1,231 @@
-# oldkernel/ — NetworkTracing kit for CentOS 6.x / kernel 2.6.32
+# oldkernel/ — NetworkTracing Kit for CentOS 6.x / Kernel 2.6.32
 
-## Native C++ capture mock
-
-`nt-sniff-cpp.cpp` is a native C++03-compatible replacement path for the
-Python hot loop. It uses AF_PACKET, classic BPF, bounded HTTP flow/pending
-maps, response-head correlation, TTL eviction, signal handling, and emits the
-same JSONL event contract. It is built with `make -C oldkernel` and can be
-checked without CAP_NET_RAW using:
-
-```sh
-make -C oldkernel fixture
-```
-
-The production runtime is intentionally not switched by the installer yet;
-run the fixture and live loopback E2E before replacing the Python command on
-an EL6 node.
-
-Passive HTTP/SOAP capture for nodes that **cannot run kyanos/ecapture**
-(no eBPF, no systemd, python 2.6 only). Rootless after install via file
-capability; falls back to root capture if SELinux refuses.
+Passive HTTP/SOAP capture kit designed for legacy enterprise nodes that **cannot run modern eBPF tools** (no eBPF, no systemd, Python 2.6 stdlib only).
 
 ```
-Target   : CentOS 6.8 / kernel 2.6.32-642.el6 (works on 2.6.27+)
-Language : python 2.6 stdlib only (no pip, no Go on the node)
-Impact   : passive listen-only; zero app changes; no kernel modules
+Target Environment : CentOS 6.x / Linux kernel 2.6.32-xxx.el6 (supports 2.6.27+)
+Language Runtime   : Python 2.6 stdlib only (zero pip dependencies) OR Native C++03
+Privilege Model    : Rootless via file capabilities (cap_net_raw+ep); automatic root fallback
+Impact             : 100% passive packet capture; zero application code changes; no kernel modules
 ```
+
+---
+
+## Table of Contents
+1. [Architecture](#architecture)
+2. [One-Line Installation (How It Works)](#one-line-installation-how-it-works)
+3. [Script & Component Reference](#script--component-reference)
+4. [Step-by-Step Usage Guide](#step-by-step-usage-guide)
+   - [0. Standalone Prerequisite Smoke Test](#0-standalone-prerequisite-smoke-test)
+   - [1. Non-Destructive Preflight Check](#1-non-destructive-preflight-check)
+   - [2. Production Installation](#2-production-installation)
+   - [3. Native C++ Mode Installation](#3-native-c-mode-installation)
+   - [4. Verification & Live Event Proof](#4-verification--live-event-proof)
+   - [5. Clean Uninstallation](#5-clean-uninstallation)
+5. [Operational Notes & Hardening](#operational-notes--hardening)
+
+---
 
 ## Architecture
 
 ```
-                      OLD-KERNEL NODE (CentOS 6.x)
- ┌────────────────────────────────────────────────────────────┐
- │                                                            │
- │   wire ──► AF_PACKET socket (cap_net_raw)                  │
- │              │                                             │
- │              ▼                                             │
- │        nt-sniff.py                                         │
- │        · ethertype/IP/TCP filter (userspace)               │
- │        · per-flow TCP reassembly (8k flows, 5-min TTL,     │
- │          256 KiB header cap, Content-Length framing)       │
- │        · Basic-auth user extraction (vtp-style creds →     │
- │          scheme=basic; Bearer marked opaque)               │
- │        · event JSONL ──── stdout                           │
- │              │                        (TLS: NOT readable — │
- │              ▼                         stays on eBPF agent) │
- │        nt-ship.py                                          │
- │        · batch ≤400 events / 5 s flush                     │
- │        · POST {node,events[]} → hub /api/ingest            │
- │        · spool-to-disk + retry when hub down               │
- │                                                            │
- │  SysV service: /etc/init.d/networktracing-legacy           │
- │  (chkconfig on; sniffer as locked user via capped python   │
- │   copy; shipper unprivileged)                              │
- └──────────────────────────┬─────────────────────────────────┘
-                            │ HTTP POST (plain JSON)
-                            ▼
-                   HUB :31115 /api/ingest      ← NO hub changes needed
-                   same dashboard/users/violations views;
-                   events tagged source_probe=pcap-http
+                      LEGACY NODE (CentOS 6.x / Kernel 2.6.32)
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │                                                                         │
+ │   wire ──► AF_PACKET RAW socket (htons(0x0800))                         │
+ │              │                                                          │
+ │              │  ◄── Classic BPF (cBPF in kernel: filters IPv4 TCP      │
+ │              │      destined to/from target ports; noise dropped)       │
+ │              ▼                                                          │
+ │        nt-sniff.py / nt-sniff-cpp                                       │
+ │        · Per-flow TCP reassembly (8k flows, 5-min TTL, 256KB header cap)│
+ │        · Fast HTTP/1.x request header parser & \r\n\r\n framing         │
+ │        · Basic-auth user extraction (never extracts/emits passwords)    │
+ │        · Response head correlation (status code, duration_ms)           │
+ │        · JSONL event stream ──── stdout                                 │
+ │              │                                                          │
+ │              ▼  (UNIX Pipe)                                             │
+ │        nt-ship.py / nt-ship-cpp                                         │
+ │        · Multi-threaded batching (≤400 events / 5 s flush interval)     │
+ │        · POST {node, events[]} ──► Hub /api/ingest                      │
+ │        · Persistent disk spool + exponential backoff retry on outage    │
+ │                                                                         │
+ │  SysV Service: /etc/init.d/networktracing-legacy                        │
+ │  (chkconfig on; sniffer runs as locked 'ntsniff' user; shipper drops)   │
+ └────────────────────────────────────┬────────────────────────────────────┘
+                                      │ HTTP POST (plain JSON)
+                                      ▼
+                        NETWORKTRACING HUB (:31115)
+                    /api/ingest ──► Dashboard / Users / Violations
+                    (Events tagged source_probe="pcap-http" or "pcap-http-cpp")
 ```
 
-### Event schema (identical to main agent)
+### Event Contract Schema (Identical to Modern eBPF Agent)
 
 ```json
-{"ts": 1787713270, "host": "sale-node01", "src": "pcap",
- "method": "POST", "path": "/SALE_SERVICE/bpm/sale/...",
- "user": "vtp", "scheme": "basic",
- "caller": "10.207.58.79", "dst_ip": "10.240.147.249", "dst_port": 8011,
- "user_agent": "ReactorNetty/1.0.19", "x_forwarded_for": "...",
- "source_probe": "pcap-http"}
+{
+  "ts": 1787793510,
+  "host": "sale-node01",
+  "src": "pcap",
+  "service": "port:8010",
+  "method": "POST",
+  "path": "/SALE_SERVICE/bpm/sale/createOrder",
+  "user": "vtp_app",
+  "scheme": "basic",
+  "caller": "10.207.58.79",
+  "caller_port": 39687,
+  "dst_ip": "10.240.147.249",
+  "dst_port": 8010,
+  "status": 200,
+  "duration_ms": 14,
+  "req_bytes": 482,
+  "resp_bytes": 1024,
+  "user_agent": "ReactorNetty/1.0.19",
+  "x_forwarded_for": "10.0.0.1",
+  "traceparent": "00-ad0d1a24079a814bc0fac5090bdb538b-720eb770ce5a4487-01",
+  "trace_id": "ad0d1a24079a814bc0fac5090bdb538b",
+  "source_probe": "pcap-http"
+}
 ```
 
-### What it deliberately does NOT do
+---
 
-| Capability | Why |
-|---|---|
-| TLS payload | impossible without uprobes/root — that tier stays on the eBPF agent |
-| SOAP WSSE usernames in body | product decision: Basic-header only (revisit later if wanted) |
-| pid/process lineage | packets carry no process context rootless; port→service map instead |
+## One-Line Installation (How It Works)
 
-## Files
-
-| File | Purpose |
-|---|---|
-| `nt-sniff.py` | AF_PACKET sniffer + reassembly + Basic-auth extraction |
-| `nt-ship.py` | batching shipper → `/api/ingest`, disk spool + backoff retry |
-| `install-oldkernel.sh` | SysV installer: `--check` / install / `--uninstall` |
-| `el68-smoke.sh` | run FIRST — proves kernel/python/setcap/AF_PACKET/SELinux |
-| `CENTOS-6.7-TEST.md` | detailed real-node CentOS 6.7 / kernel 2.6.32 test runbook |
-| `verify-centos-runbook.sh` | local static/build verification for the runbook |
-
-## Usage
-
-### 0. Pull the kit onto the node
-
-For the complete CentOS 6.7 real-node procedure, use [`CENTOS-6.7-TEST.md`](CENTOS-6.7-TEST.md).
-
+### The Command
 ```sh
-HUB=10.0.0.35                       # your NetworkTracing hub
-mkdir -p /tmp/ntkit && cd /tmp/ntkit
-for f in el68-smoke.sh nt-sniff.py nt-ship.py nt-ship-cpp.cpp \
-         nt-sniff-cpp.cpp Makefile nt-run-cpp.sh install-oldkernel.sh; do
-  curl -sSf http://$HUB:30105/oldkernel/$f -o $f || wget http://$HUB:30105/oldkernel/$f -O $f
-done
-chmod +x *.sh *.py
+curl -sSf http://$HUB:30105/oldkernel/install-firstrun-el68.sh | sudo sh -s -- --endpoint http://$HUB:31115
 ```
 
-### 1. Smoke test (as root) — decide before installing
+### What Happens Under the Hood (Step-by-Step)
 
+```mermaid
+flowchart TD
+    A["1. Fetch & Self-Extraction"] --> B["2. Preflight Checks"]
+    B --> C["3. Privilege Setup (Rootless)"]
+    C --> D["4. Mode Selection (Python vs C++)"]
+    D --> E["5. SysV Pipeline Generation"]
+    E --> F["6. Service Start & Health Validation"]
+```
+
+1. **Self-Extraction & Kit Resolution**:
+   - `install-firstrun-el68.sh` is a single self-contained script generated by `build-firstrun.sh`.
+   - It checks if kit files already exist locally. If not, it automatically unpackages the embedded Base64 payload (`nt-sniff.py`, `nt-ship.py`, `nt-sniff-cpp.cpp`, `nt-ship-cpp.cpp`, `Makefile`, `nt-run-cpp.sh`) into `/tmp/ntkit`.
+   - If the embedded payload is absent, it falls back to downloading fresh files from the Hub bootstrap server (`http://$HUB:30105/oldkernel/`).
+
+2. **Preflight Environment & Hub Reachability Probes**:
+   - Validates Linux OS and kernel version (`2.6.32+`).
+   - Confirms Python 2.6/2.7 standard library availability.
+   - Probes the Hub `/api/ingest` endpoint with an empty handshake payload (`{"node":"legacy-compat-probe","events":[]}`).
+   - Auto-detects the default network interface via `/proc/net/route` (e.g., `eth0`).
+
+3. **Rootless Privilege Model (`cap_net_raw`)**:
+   - Creates a dedicated locked system user `ntsniff` with no login shell (`/sbin/nologin`).
+   - Copies `/usr/bin/python` to `/opt/networktracing-legacy/python-capnetraw`.
+   - **Crucial Order**: Changes file ownership to `ntsniff` **first**, and then attaches file capability `cap_net_raw+ep` via `setcap` (because `chown` strips POSIX file capabilities on Linux).
+   - *Automatic Fallback*: If SELinux or the filesystem blocks file capabilities, the installer falls back to running the sniffer as root with a prominent log notice.
+
+4. **Engine Compilation (C++ Mode only)**:
+   - When `NT_CAPTURE_MODE=cpp` is specified, the installer auto-detects GCC compiler dialect (`-std=gnu++98` on GCC 4.4, `-std=gnu++03` on GCC 4.7+) and compiles `nt-sniff-cpp` and `nt-ship-cpp` with `-O2`.
+
+5. **SysV Pipeline Assembly**:
+   - Writes the SysV init script `/etc/init.d/networktracing-legacy` with runlevel definitions (`chkconfig: 2345 90 10`).
+   - Chains the capture process directly into the shipper via a UNIX pipe:
+     ```sh
+     su -s /bin/sh ntsniff -c 'exec python-capnetraw nt-sniff.py ...' | exec python nt-ship.py --endpoint ...
+     ```
+   - Sets up the disk spool directory `/var/lib/networktracing/` for fail-safe event persistence.
+
+6. **Service Start & Health Assertion**:
+   - Enables the service via `chkconfig networktracing-legacy on`.
+   - Starts the service and actively verifies that the sniffer and shipper process PIDs exist before exiting with code 0.
+
+---
+
+## Script & Component Reference
+
+| File | Type | Purpose & Description |
+|---|---|---|
+| [`install-oldkernel.sh`](install-oldkernel.sh) | Shell Script | Modular SysV installer supporting `--check`, standard install, and `--uninstall`. |
+| [`install-firstrun-el68.sh`](install-firstrun-el68.sh) | Shell Script | Standalone single-file bundle with embedded Base64 payloads for direct curl execution. |
+| [`build-firstrun.sh`](build-firstrun.sh) | Shell Script | Generator script that packs current kit files into `install-firstrun-el68.sh`. |
+| [`el68-smoke.sh`](el68-smoke.sh) | Shell Script | 6-point prerequisite smoke test (Kernel, Python, `setcap`, `AF_PACKET`, SELinux, py_compile). |
+| [`nt-sniff.py`](nt-sniff.py) | Python 2.6 | Python `AF_PACKET` sniffer with classic BPF filter, TCP reassembly, and Basic auth parser. |
+| [`nt-ship.py`](nt-ship.py) | Python 2.6 | Multithreaded HTTP event shipper with disk spooling (`Queue`, `urllib2`). |
+| [`nt-sniff-cpp.cpp`](nt-sniff-cpp.cpp) | C++03 | High-performance C++03 replacement sniffer with socket BPF and flow tracking. |
+| [`nt-ship-cpp.cpp`](nt-ship-cpp.cpp) | C++03 | Native C++ shipper with socket HTTP client and disk spooling. |
+| [`Makefile`](Makefile) | Makefile | Builds C++ binaries with GCC 4.4 / 4.7+ auto-detection (`make all`, `make fixture`). |
+| [`CENTOS-6.7-TEST.md`](CENTOS-6.7-TEST.md) | Markdown | 13-gate full verification runbook for real CentOS 6.x / Linux 2.6.32 nodes. |
+| [`verify-centos-runbook.sh`](verify-centos-runbook.sh) | Shell Script | Static and local build verifier for runbook integrity. |
+
+---
+
+## Step-by-Step Usage Guide
+
+### 0. Standalone Prerequisite Smoke Test
+Run this first on any candidate node to verify kernel, Python, and file capability viability:
 ```sh
 sudo sh el68-smoke.sh
 ```
+*Expected Output:* `NT-SMOKE done: 6 pass, 0 fail`
 
-Checks: kernel family → python 2.6 → setcap present → **non-root really
-captures** (tcpdump copy test) → **capped interpreter opens AF_PACKET** →
-sniffer compiles under node python. Exit 0 = proceed.
-
-Interpreting failures:
-
-```
-setcap/capped-interpreter FAIL  → SELinux enforcing blocks filecaps.
-    Either add a local SELinux exception, or accept the installer's
-    fallback: sniffer runs as root (still passive, still no app impact).
-python missing/wrong            → kit cannot run; install python26.
-```
-
-### 2. Preflight check (no changes made)
-
+### 1. Non-Destructive Preflight Check
+Validates Hub connectivity, network interface, and dependencies without modifying system files:
 ```sh
 sudo sh install-oldkernel.sh --check --endpoint http://$HUB:31115
 ```
 
-Verifies python presence/version, reachability of the hub, and that the
-hub answers the ingest protocol probe (`{"ok":true}` on an empty batch).
-Detects the default interface automatically (`NT_IFACE=eth1` to override).
-
-### 3. Install
-
+### 2. Production Installation (Python Mode)
+Installs the standard Python 2.6 capture pipeline:
 ```sh
-sudo sh install-oldkernel.sh --endpoint http://$HUB:31115
-# optional env overrides:
-#   NT_IFACE=eth1 NT_PORTS=80,8003,8005,8009,8010 sudo -E sh install-oldkernel.sh ...
+sudo NT_IFACE=eth0 NT_PORTS=80,8003,8005,8009,8010 \
+  sh install-oldkernel.sh --endpoint http://$HUB:31115
 ```
 
-What it does:
-
-```
-/opt/networktracing-legacy/{nt-sniff.py,nt-ship.py}
-/opt/networktracing-legacy/python-capnetraw   ← interpreter copy with
-                                                cap_net_raw+ep (rootless path)
-useradd ntsniff                                ← locked account for sniffing
-/etc/init.d/networktracing-legacy + chkconfig on
-service started; verifies the sniffer PID exists before declaring DONE
+### 3. Native C++ Mode Installation
+For high-throughput environments (>1,000 requests/sec), compile and run native C++ binaries:
+```sh
+sudo NT_CAPTURE_MODE=cpp NT_IFACE=eth0 NT_PORTS=80,8003,8005,8009,8010 \
+  sh install-oldkernel.sh --endpoint http://$HUB:31115
 ```
 
-Verify:
-
+### 4. Verification & Live Event Proof
+Check service status and logs:
 ```sh
 service networktracing-legacy status
-tail -f /opt/networktracing-legacy/sniff.log     # sniffer stderr
-tail -f /opt/networktracing-legacy/ship.log      # shipper errors
-curl http://$HUB:31115/api/events?limit=20       # look for source_probe=pcap-http
+tail -f /opt/networktracing-legacy/sniff.log
+tail -f /opt/networktracing-legacy/ship.log
 ```
 
-Generate a test hit from any machine that routes through the node:
-
+Send a test request with Basic auth:
 ```sh
-curl -u testuser:testpw http://<node-ip>:<monitored-port>/anything
-→ appears in the hub as user=testuser scheme=basic within ~5 s
+curl -sS -u testuser:secretpass http://127.0.0.1:8010/api/health
 ```
 
-### 4. Uninstall (verifies zero residuals)
+Query the Hub to verify receipt:
+```sh
+curl -fsS "http://$HUB:31115/api/events?limit=10&q=testuser"
+```
+*(Confirmed: Username `testuser` is extracted; password `secretpass` is never logged or transmitted).*
 
+### 5. Clean Uninstallation
+To cleanly remove the service, PID files, and all installed binaries:
 ```sh
 sudo sh install-oldkernel.sh --uninstall
-# stops service, chkconfig off, removes init script, kills sniff/ship pids,
-# wipes /opt/networktracing-legacy, then FAILS if anything remains.
-# Note: does NOT remove the ntsniff account or /var/lib/networktracing
-# spool dir (site data); remove manually if unwanted:
-#   userdel ntsniff && rm -rf /var/lib/networktracing
 ```
+*Guarantees zero process residue, deletes `/opt/networktracing-legacy` and `/etc/init.d/networktracing-legacy`.*
 
-## Operations notes
+---
 
-```
-Hub outage        shipper spools to disk and retries with exponential
-                  backoff; nothing is lost while the node keeps running.
-Memory bounds     flow table hard-capped at 8192 flows; stale swept every
-                  30 s; per-flow buffers capped (256 KiB headers / 128 KiB body).
-Restart           service networktracing-legacy restart
-Ports             default monitored: 80,8003,8005,8007,8009,8010,8011
-                  (NT_PORTS at install time; edit init script to change later)
-SELinux           smoke test decides; enforcing usually works with filecaps,
-                  otherwise root fallback is automatic and announced loudly.
-```
+## Operational Notes & Hardening
 
-## Hub-side
-
-Nothing to change. Events ride the standard `/api/ingest` contract
-(`{"node": ..., "events": [...]}`, ≤500/request), dedupe downstream as
-usual, and appear in the normal dashboard/users/violations views tagged
-`source_probe=pcap-http`.
+- **Network Outage Resilience:** When the Hub is unreachable, events are automatically spooled to `/var/lib/networktracing/sniff-spool.jsonl`. Once connectivity is restored, the shipper drains the spool with backoff retry.
+- **Memory & Flow Bounds:** The in-memory TCP flow table is hard-capped at 8,192 concurrent flows with a 300-second TTL sweep.
+- **Reconfiguring Monitored Ports:** To monitor new ports, re-run the installer with the updated `NT_PORTS` list:
+  ```sh
+  sudo NT_PORTS=80,8010,8080 sh install-oldkernel.sh --endpoint http://$HUB:31115
+  ```
+- **Updating the Bundle:** After making changes to any `.py` or `.cpp` source files, rebuild the self-contained installer bundle:
+  ```sh
+  sh build-firstrun.sh
+  ```

@@ -11,7 +11,7 @@ Usage:
 """
 from __future__ import print_function
 
-import base64, json, os, signal, socket, sys
+import base64, errno, json, os, select, signal, socket, sys
 
 # py2.6/el6 names first; py3 fallbacks for dev-box testing. The urllib2
 # str-vs-bytes encode guard in flush() stays — do not remove.
@@ -152,27 +152,40 @@ def main():
             pass
         return n
 
-    for raw in iter(sys.stdin.readline, ""):
-        if not running[0]:
-            break
-        raw = raw.strip()
-        if not raw:
-            continue
+    while running[0]:
         try:
-            ev = json.loads(raw)
-        except ValueError:
-            continue                      # garbage in, silently dropped
-        if isinstance(ev, dict):
-            buf.append(ev)
+            r, _, _ = select.select([sys.stdin], [], [], 1.0)
+        except select.error as e:
+            if e[0] == errno.EINTR:
+                continue
+            break
+
+        if r:
+            try:
+                raw = sys.stdin.readline()
+            except (IOError, OSError) as e:
+                if getattr(e, 'errno', None) == errno.EINTR:
+                    continue
+                break
+            if not raw:
+                break                  # EOF
+            raw = raw.strip()
+            if raw:
+                try:
+                    ev = json.loads(raw)
+                    if isinstance(ev, dict):
+                        buf.append(ev)
+                except ValueError:
+                    pass
+
         now = time.time()
         while len(buf) >= MAX_BATCH or (buf and now - last_flush >= FLUSH_SEC):
             last_flush = now
-            # retry spooled events ahead of fresh ones (~once a minute)
             if now - last_spool_try >= 60 and os.path.exists(spool):
                 last_spool_try = now
                 fold_spool()
-            q.put(buf[:MAX_BATCH])        # blocks when posters fall behind —
-            del buf[:MAX_BATCH]           # that IS our backpressure signal
+            q.put(buf[:MAX_BATCH])
+            del buf[:MAX_BATCH]
 
     # stdin closed (sniffer stopped) — drain queue, then keep retrying
     # anything spooled until it lands or RETRY_MAX elapses

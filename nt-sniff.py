@@ -84,13 +84,13 @@ def build_bpf(ports):
     for i, p in enumerate(ps):                       # A: dport @ X+16
         prog.append((LDH_IND, 0, 0, 16))
         jt = ret_acc - (len(prog) + 1)
-        jf = 1 if i < n - 1 else ret_rej - (len(prog) + 1)
+        jf = 0 if (i < n - 1 or sk) else (ret_rej - (len(prog) + 1))
         prog.append((JEQ_K, jt, jf, p))
     if sk:                                           # B: sport @ X+sk
         for i, p in enumerate(ps):
             prog.append((LDH_IND, 0, 0, sk))
             jt = ret_acc - (len(prog) + 1)
-            jf = 1 if i < n - 1 else ret_rej - (len(prog) + 1)
+            jf = 0 if i < n - 1 else (ret_rej - (len(prog) + 1))
             prog.append((JEQ_K, jt, jf, p))
     prog.append((RET_K, 0, 0, 0))                    # reject
     prog.append((RET_K, 0, 0, 0x40000))              # accept
