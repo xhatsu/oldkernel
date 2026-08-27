@@ -480,12 +480,13 @@ def main():
     except socket.error as e:
         raise SystemExit("cannot open AF_PACKET socket (%s) — need "
                          "CAP_NET_RAW / root" % e)
+    s.settimeout(1.0)
     apply_perf_opts(s, ports)
     try:
-        s.bind((iface or "", socket.htons(ETH_P_ALL)))
+        s.bind((iface or "", ETH_P_ALL))
     except socket.error:
         try:
-            s.bind(("", socket.htons(ETH_P_ALL)))
+            s.bind(("", ETH_P_ALL))
         except socket.error:
             pass
     fanout_ok = False

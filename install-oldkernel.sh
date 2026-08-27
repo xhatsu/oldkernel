@@ -253,11 +253,11 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     log "native C++ capture + shipper selected"
 else
     if [ "$SNIFF_AS" != root ]; then
-        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS'"
+        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS'"
     else
-        SNIFF_CMD="exec python $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS"
+        SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS"
     fi
-    SHIP_CMD="exec python $PREFIX/nt-ship.py --endpoint $ENDPOINT"
+    SHIP_CMD="exec python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT"
 fi
 
 cat > "$INIT" <<EOF
