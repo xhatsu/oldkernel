@@ -308,13 +308,23 @@ static int run_fixture() {
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
-  for (i = 1; i < argc; ++i) { if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i]; else if (!strcmp(argv[i], "-p") && i + 1 < argc) { char *q = strtok(argv[++i], ","); while (q) { long p = atol(q); if (valid_port((unsigned)p)) ports.push_back((unsigned)p); q = strtok(NULL, ","); } } else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]); else if (!strcmp(argv[i], "-h")) { fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [-j workers]\n"); return 0; } }
+  for (i = 1; i < argc; ++i) {
+    if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i];
+    else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
+      while (i + 1 < argc && argv[i + 1][0] != '-') {
+        char *q = strtok(argv[++i], ", ");
+        while (q) { long p = atol(q); if (valid_port((unsigned)p)) ports.push_back((unsigned)p); q = strtok(NULL, ", "); }
+      }
+    }
+    else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "-h")) { fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [-j workers]\n"); return 0; }
+  }
   if (ports.empty()) { ports.push_back(80); ports.push_back(8003); ports.push_back(8005); ports.push_back(8007); ports.push_back(8009); ports.push_back(8010); ports.push_back(8011); }
   (void)workers; std::string node = host_name(); int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP)); if (fd < 0) { perror("AF_PACKET"); return 2; }
   int rb = 8 * 1024 * 1024;
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
   if (!attach_bpf(fd, ports)) logmsg("WARN: BPF attach failed; continuing unfiltered");
-  struct sockaddr_ll sa; memset(&sa, 0, sizeof(sa)); sa.sll_family = AF_PACKET; if (!iface.empty()) { sa.sll_ifindex = (int)if_nametoindex(iface.c_str()); if (!sa.sll_ifindex) { logmsg("bad interface"); close(fd); return 2; } } if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { perror("bind"); close(fd); return 2; }
+  struct sockaddr_ll sa; memset(&sa, 0, sizeof(sa)); sa.sll_family = AF_PACKET; sa.sll_protocol = htons(ETH_P_IP); if (!iface.empty()) { sa.sll_ifindex = (int)if_nametoindex(iface.c_str()); if (!sa.sll_ifindex) { logmsg("bad interface"); close(fd); return 2; } } if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { perror("bind"); close(fd); return 2; }
   signal(SIGTERM, stop_signal);
   signal(SIGINT, stop_signal);
   std::map<std::string, Flow> flows;

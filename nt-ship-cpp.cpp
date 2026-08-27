@@ -35,15 +35,23 @@ static bool write_append(const std::string &p, const std::string &data) {
   std::ofstream f(p.c_str(), std::ios::out|std::ios::app); if (!f) return false;
   f << data; return f.good();
 }
+static std::string number_string(size_t n) { std::ostringstream o; o << n; return o.str(); }
 static std::string json_array(const std::vector<std::string> &a) {
   std::string o="["; for(size_t i=0;i<a.size();++i){if(i)o+=",";o+=a[i];} return o+"]";
 }
 static bool post(const std::string &endpoint, const std::string &node,
                  const std::vector<std::string> &batch) {
   std::string body="{\"node\":\""+node+"\",\"events\":"+json_array(batch)+"}";
-  std::string cmd="curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary "+shellq(body)+" "+shellq(endpoint+"/api/ingest");
-  FILE *fp=popen(cmd.c_str(),"r"); if(!fp)return false; char b[32]; size_t n=fread(b,1,sizeof(b)-1,fp); b[n]=0; int rc=pclose(fp);
-  return rc==0 && std::string(b,n)=="200";
+  std::string code_file = "/tmp/nt_code." + number_string(getpid());
+  std::string cmd="curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- "+shellq(endpoint+"/api/ingest")+" > "+shellq(code_file);
+  FILE *fp=popen(cmd.c_str(),"w"); if(!fp)return false;
+  fwrite(body.data(), 1, body.size(), fp);
+  int rc=pclose(fp);
+  std::string code;
+  read_file(code_file, &code);
+  unlink(code_file.c_str());
+  while (!code.empty() && (code[code.size()-1]=='\r' || code[code.size()-1]=='\n' || code[code.size()-1]==' ')) code.erase(code.size()-1);
+  return rc==0 && code=="200";
 }
 static void spool(const std::string &path, const std::vector<std::string> &batch) {
   std::string data; for(size_t i=0;i<batch.size();++i)data+=batch[i]+"\n";
@@ -54,10 +62,9 @@ static void load_spool(const std::string &path, std::vector<std::string> *buf) {
   std::istringstream in(data); std::string line; while(std::getline(in,line)) if(!line.empty()) buf->push_back(line);
   unlink(path.c_str());
 }
-static std::string number_string(size_t n) { std::ostringstream o; o << n; return o.str(); }
 static void send_batches(const std::string &endpoint,const std::string &node,const std::string &spool_path,
-                         std::vector<std::string> *buf, bool final) {
-  while (buf->size() >= MAX_BATCH || (final && !buf->empty())) {
+                         std::vector<std::string> *buf, bool flush_all) {
+  while (!buf->empty() && (flush_all || buf->size() >= MAX_BATCH)) {
     size_t n=buf->size()>=MAX_BATCH?MAX_BATCH:buf->size();
     std::vector<std::string> batch(buf->begin(),buf->begin()+n);
     if(post(endpoint,node,batch)) { buf->erase(buf->begin(),buf->begin()+n); logmsg("flushed "+number_string(n)+" events"); }
@@ -74,6 +81,23 @@ int main(int argc,char **argv) {
   std::string node = (node_env && *node_env) ? node_env : host;
   std::vector<std::string> buf; load_spool(spool_path,&buf); time_t last=time(NULL), last_retry=last;
   std::string line;
-  while(running && std::getline(std::cin,line)) { if(line.empty())continue; buf.push_back(line); time_t now=time(NULL); if(now-last>=FLUSH_SEC || buf.size()>=MAX_BATCH){send_batches(endpoint,node,spool_path,&buf,false);last=now;} if(now-last_retry>=RETRY_SEC){load_spool(spool_path,&buf);last_retry=now;} }
+  while(running) {
+    fd_set r; FD_ZERO(&r); FD_SET(0, &r);
+    struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
+    int rc = select(1, &r, NULL, NULL, &tv);
+    if (rc > 0 && FD_ISSET(0, &r)) {
+      if (!std::getline(std::cin, line)) break;
+      if (!line.empty()) buf.push_back(line);
+    }
+    time_t now = time(NULL);
+    if (now - last >= FLUSH_SEC || buf.size() >= MAX_BATCH) {
+      if (!buf.empty()) send_batches(endpoint, node, spool_path, &buf, true);
+      last = now;
+    }
+    if (now - last_retry >= RETRY_SEC) {
+      load_spool(spool_path, &buf);
+      last_retry = now;
+    }
+  }
   send_batches(endpoint,node,spool_path,&buf,true); logmsg("stopped"); return 0;
 }
