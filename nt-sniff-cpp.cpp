@@ -31,7 +31,7 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <iostream>
-
+#include <fstream>
 #include <map>
 #include <sstream>
 #include <string>
@@ -43,6 +43,10 @@ static void stop_signal(int) { g_running = 0; }
 static const size_t MAX_FLOWS = 8192;
 static const size_t MAX_PENDING = 8192;
 static const size_t MAX_HEADER = 262144;
+static const size_t MAX_BATCH = 400;
+static const size_t MAX_QUEUE = 4000;
+static const int FLUSH_SEC = 5;
+static const int RETRY_SEC = 60;
 static const unsigned FLOW_TTL = 300;
 static const unsigned PENDING_TTL = 5;
 static const unsigned ACCEPT = 2048;
@@ -255,18 +259,88 @@ static bool parse_response(const char *data, size_t len, int *status, unsigned *
   return true;
 }
 
+static std::string g_endpoint;
+static std::string g_spool_path;
+static std::string g_ship_node;
+static std::vector<std::string> g_ship_buf;
+
+static std::string shellq(const std::string &s) {
+  std::string o = "'";
+  for (size_t i = 0; i < s.size(); ++i) { if (s[i] == '\'') o += "'\\''"; else o += s[i]; }
+  return o + "'";
+}
+static bool read_file(const std::string &p, std::string *out) {
+  std::ifstream f(p.c_str()); if (!f) return false;
+  std::ostringstream ss; ss << f.rdbuf(); *out = ss.str(); return true;
+}
+static bool write_append(const std::string &p, const std::string &data) {
+  std::string dir = p.substr(0, p.find_last_of('/'));
+  if (!dir.empty()) { std::string cmd = "mkdir -p " + shellq(dir); if (system(cmd.c_str()) != 0) return false; }
+  std::ofstream f(p.c_str(), std::ios::out | std::ios::app); if (!f) return false;
+  f << data; return f.good();
+}
+static std::string number_string(size_t n) { std::ostringstream o; o << n; return o.str(); }
+static std::string json_array(const std::vector<std::string> &a) {
+  std::string o = "["; for (size_t i = 0; i < a.size(); ++i) { if (i) o += ","; o += a[i]; } return o + "]";
+}
+static bool post(const std::string &endpoint, const std::string &node, const std::vector<std::string> &batch) {
+  std::string body = "{\"node\":" + jsonq(node) + ",\"events\":" + json_array(batch) + "}";
+  char code_tmpl[] = "/tmp/nt_code_XXXXXX";
+  int tmp_fd = mkstemp(code_tmpl);
+  if (tmp_fd < 0) return false;
+  close(tmp_fd);
+  std::string code_file = code_tmpl;
+  std::string cmd = "curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + "/api/ingest") + " > " + shellq(code_file);
+  FILE *fp = popen(cmd.c_str(), "w"); if (!fp) { unlink(code_file.c_str()); return false; }
+  fwrite(body.data(), 1, body.size(), fp);
+  int rc = pclose(fp);
+  std::string code;
+  read_file(code_file, &code);
+  unlink(code_file.c_str());
+  while (!code.empty() && (code[code.size() - 1] == '\r' || code[code.size() - 1] == '\n' || code[code.size() - 1] == ' ')) code.erase(code.size() - 1);
+  return rc == 0 && code == "200";
+}
+static void spool(const std::string &path, const std::vector<std::string> &batch) {
+  std::string data; for (size_t i = 0; i < batch.size(); ++i) data += batch[i] + "\n";
+  if (!write_append(path, data)) { logmsg("FATAL: cannot write spool"); exit(3); }
+}
+static void load_spool(const std::string &path, std::vector<std::string> *buf) {
+  std::string data; if (!read_file(path, &data)) return;
+  std::istringstream in(data); std::string line; while (std::getline(in, line)) if (!line.empty()) buf->push_back(line);
+  unlink(path.c_str());
+}
+static void send_batches(const std::string &endpoint, const std::string &node, const std::string &spool_path,
+                         std::vector<std::string> *buf, bool flush_all) {
+  while (!buf->empty() && (flush_all || buf->size() >= MAX_BATCH)) {
+    size_t n = buf->size() >= MAX_BATCH ? MAX_BATCH : buf->size();
+    std::vector<std::string> batch(buf->begin(), buf->begin() + n);
+    if (post(endpoint, node, batch)) { buf->erase(buf->begin(), buf->begin() + n); logmsg("flushed " + number_string(n) + " events"); }
+    else { spool(spool_path, batch); buf->erase(buf->begin(), buf->begin() + n); logmsg("spooled " + number_string(n) + " events"); break; }
+  }
+}
+
 static void emit_event(const Event &e) {
-  std::cout << "{\"ts\":" << e.ts << ",\"host\":" << jsonq(e.host) << ",\"src\":\"pcap\",\"service\":" << jsonq(e.service)
-            << ",\"method\":" << jsonq(e.method) << ",\"path\":" << jsonq(e.path) << ",\"user\":" << jsonq(e.user)
-            << ",\"scheme\":" << jsonq(e.scheme) << ",\"source_probe\":\"pcap-http-cpp\",\"host_hdr\":" << jsonq(e.host_hdr)
-            << ",\"user_agent\":" << jsonq(e.user_agent) << ",\"x_forwarded_for\":" << jsonq(e.xff)
-            << ",\"caller\":" << jsonq(e.caller) << ",\"caller_port\":" << e.caller_port << ",\"dst_ip\":" << jsonq(e.dst_ip)
-            << ",\"dst_port\":" << e.dst_port << ",\"traceparent\":" << jsonq(e.traceparent) << ",\"trace_id\":" << jsonq(e.trace_id)
-            << ",\"service_id\":null,\"module_id\":\"pcap-http-cpp\",\"req_bytes\":" << e.req_bytes;
-  if (e.has_status) std::cout << ",\"status\":" << e.status; else std::cout << ",\"status\":null";
-  if (e.has_duration) std::cout << ",\"duration_ms\":" << e.duration_ms; else std::cout << ",\"duration_ms\":null";
-  if (e.has_resp) std::cout << ",\"resp_bytes\":" << e.resp_bytes; else std::cout << ",\"resp_bytes\":null";
-  std::cout << "}\n";
+  std::ostringstream ss;
+  ss << "{\"ts\":" << e.ts << ",\"host\":" << jsonq(e.host) << ",\"src\":\"pcap\",\"service\":" << jsonq(e.service)
+     << ",\"method\":" << jsonq(e.method) << ",\"path\":" << jsonq(e.path) << ",\"user\":" << jsonq(e.user)
+     << ",\"scheme\":" << jsonq(e.scheme) << ",\"source_probe\":\"pcap-http-cpp\",\"host_hdr\":" << jsonq(e.host_hdr)
+     << ",\"user_agent\":" << jsonq(e.user_agent) << ",\"x_forwarded_for\":" << jsonq(e.xff)
+     << ",\"caller\":" << jsonq(e.caller) << ",\"caller_port\":" << e.caller_port << ",\"dst_ip\":" << jsonq(e.dst_ip)
+     << ",\"dst_port\":" << e.dst_port << ",\"traceparent\":" << jsonq(e.traceparent) << ",\"trace_id\":" << jsonq(e.trace_id)
+     << ",\"service_id\":null,\"module_id\":\"pcap-http-cpp\",\"req_bytes\":" << e.req_bytes;
+  if (e.has_status) ss << ",\"status\":" << e.status; else ss << ",\"status\":null";
+  if (e.has_duration) ss << ",\"duration_ms\":" << e.duration_ms; else ss << ",\"duration_ms\":null";
+  if (e.has_resp) ss << ",\"resp_bytes\":" << e.resp_bytes; else ss << ",\"resp_bytes\":null";
+  ss << "}";
+
+  if (!g_endpoint.empty()) {
+    g_ship_buf.push_back(ss.str());
+    if (g_ship_buf.size() >= MAX_QUEUE) {
+      send_batches(g_endpoint, g_ship_node, g_spool_path, &g_ship_buf, false);
+    }
+  } else {
+    std::cout << ss.str() << "\n";
+  }
 }
 
 static void flush_oldest(std::map<PacketKey, std::vector<Pending> > &pending) {
@@ -521,6 +595,7 @@ static int run_fixture() {
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
+  std::string endpoint, spool_path = "/var/lib/networktracing/sniff-spool.jsonl";
   for (i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i];
     else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
@@ -529,12 +604,28 @@ int main(int argc, char **argv) {
         while (q) { long p = atol(q); if (valid_port((unsigned)p)) ports.push_back((unsigned)p); q = strtok(NULL, ", "); }
       }
     }
+    else if (!strcmp(argv[i], "--endpoint") && i + 1 < argc) endpoint = argv[++i];
+    else if (!strcmp(argv[i], "--spool") && i + 1 < argc) spool_path = argv[++i];
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "-h")) { fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [-j workers]\n"); return 0; }
+    else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--spool PATH] [-j workers]\n");
+      return 0;
+    }
   }
   if (ports.empty()) { ports.push_back(80); ports.push_back(8003); ports.push_back(8005); ports.push_back(8007); ports.push_back(8009); ports.push_back(8010); ports.push_back(8011); }
   (void)workers;
-  std::string node = host_name();
+
+  const char *node_env = getenv("NT_NODE_NAME");
+  std::string node = (node_env && *node_env) ? node_env : host_name();
+
+  g_endpoint = endpoint;
+  g_spool_path = spool_path;
+  g_ship_node = node;
+
+  if (!g_endpoint.empty()) {
+    load_spool(g_spool_path, &g_ship_buf);
+  }
+
   int fd = socket(AF_PACKET, SOCK_RAW, htons(3));
   if (fd < 0) { perror("AF_PACKET"); return 2; }
   int rb = 8 * 1024 * 1024;
@@ -565,9 +656,12 @@ int main(int argc, char **argv) {
   } else {
     logmsg("WARN: PACKET_MMAP setup failed, falling back to standard socket recv");
   }
+  if (!g_endpoint.empty()) {
+    logmsg("single-binary mode: shipping directly to " + g_endpoint);
+  }
   logmsg("listening");
 
-  time_t last = time(NULL);
+  time_t last = time(NULL), last_flush = last, last_retry = last;
   unsigned char *fallback_buf = NULL;
   if (!use_mmap) {
     fallback_buf = (unsigned char *)malloc(65536);
@@ -608,13 +702,13 @@ int main(int argc, char **argv) {
           hdr->tp_status = TP_STATUS_KERNEL; /* Return frame ownership to kernel */
           ring.frame_idx = (ring.frame_idx + 1) % ring.frame_nr;
         }
-        std::cout.flush();
+        if (g_endpoint.empty()) std::cout.flush();
       } else {
         if (pfd.revents & POLLIN) {
           ssize_t n = recv(fd, fallback_buf, 65536, 0);
           if (n > 0) {
             handle_packet(fallback_buf, (size_t)n, node, ports, flows, pending);
-            std::cout.flush();
+            if (g_endpoint.empty()) std::cout.flush();
           }
         }
       }
@@ -623,9 +717,25 @@ int main(int argc, char **argv) {
     time_t now = time(NULL);
     if (now - last >= 1) {
       sweep(flows, pending, now);
-      std::cout.flush();
+      if (g_endpoint.empty()) std::cout.flush();
       last = now;
     }
+
+    if (!g_endpoint.empty()) {
+      if (now - last_flush >= FLUSH_SEC || g_ship_buf.size() >= MAX_BATCH) {
+        if (!g_ship_buf.empty()) send_batches(g_endpoint, g_ship_node, g_spool_path, &g_ship_buf, true);
+        last_flush = now;
+      }
+      if (now - last_retry >= RETRY_SEC) {
+        load_spool(g_spool_path, &g_ship_buf);
+        last_retry = now;
+      }
+    }
+  }
+
+  if (!g_endpoint.empty() && !g_ship_buf.empty()) {
+    send_batches(g_endpoint, g_ship_node, g_spool_path, &g_ship_buf, true);
+    if (!g_ship_buf.empty()) spool(g_spool_path, g_ship_buf);
   }
 
   if (use_mmap && ring.ring != MAP_FAILED) {

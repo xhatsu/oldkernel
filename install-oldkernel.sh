@@ -300,12 +300,11 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
         fi
     fi
     if [ "$SNIFF_AS" != root ]; then
-        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS'"
+        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl' >>\$PREFIX/sniff.log 2>&1"
     else
-        SNIFF_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS"
+        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl >>\$PREFIX/sniff.log 2>&1"
     fi
-    SHIP_CMD="exec $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl"
-    log "native C++ capture + shipper selected"
+    log "native C++ single-binary capture + shipping selected"
 else
     if [ "$SNIFF_AS" != root ]; then
         SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS'"
@@ -313,6 +312,7 @@ else
         SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS"
     fi
     SHIP_CMD="exec python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT"
+    RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
 fi
 
 cat > "$INIT" <<EOF
@@ -349,7 +349,7 @@ case "\$1" in
             export NT_CONTROL_RUN="\$CONTROL_RUN"
             export NT_NODE_NAME="\${NT_NODE_NAME:-\$(hostname -s)}"
         fi
-        nohup sh -c "$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1" >/dev/null 2>&1 &
+        nohup sh -c "$RUN_CMD" >/dev/null 2>&1 &
         echo \$! > "\$PIDFILE"
         sleep 1
         pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null || { echo "sniffer failed to start"; exit 1; }
