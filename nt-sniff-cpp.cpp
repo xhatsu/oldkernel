@@ -111,15 +111,12 @@ static std::string b64decode_user(const std::string &v) {
   if (p == std::string::npos) return "";
   return out.substr(0, p > 64 ? 64 : p);
 }
-static std::string header_value(const std::string &head, const std::string &want) {
-  std::istringstream in(head); std::string line, w = lower(want);
-  while (std::getline(in, line)) {
-    if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
-    size_t p = line.find(':'); if (p == std::string::npos) continue;
-    if (lower(trim(line.substr(0, p))) == w) return trim(line.substr(p + 1));
-  }
-  return "";
+static std::string ip_to_str(uint32_t ip_be) {
+  char b[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &ip_be, b, sizeof(b));
+  return b;
 }
+
 static std::string trace_id_from_parent(const std::string &tp) {
   std::string x = trim(tp);
   if (x.size() == 55 && x[2] == '-' && x[35] == '-' && x[52] == '-') return lower(x.substr(3, 32));
@@ -149,47 +146,115 @@ struct Pending {
   Pending() : started_ms(0) {}
   Pending(const Event &e, long long t) : ev(e), started_ms(t) {}
 };
-struct PacketKey { std::string src; unsigned sport; std::string dst; unsigned dport; bool operator<(const PacketKey &x) const { return src != x.src ? src < x.src : sport != x.sport ? sport < x.sport : dst != x.dst ? dst < x.dst : dport < x.dport; } };
+struct FlowKey {
+  uint32_t s_ip;
+  uint16_t sport;
+  uint32_t d_ip;
+  uint16_t dport;
+  bool operator<(const FlowKey &x) const {
+    if (s_ip != x.s_ip) return s_ip < x.s_ip;
+    if (sport != x.sport) return sport < x.sport;
+    if (d_ip != x.d_ip) return d_ip < x.d_ip;
+    return dport < x.dport;
+  }
+};
+typedef FlowKey PacketKey;
 
-static std::string key_string(const std::string &a, unsigned ap, const std::string &b, unsigned bp) { return a + ":" + num(ap) + "->" + b + ":" + num(bp); }
 static void logmsg(const std::string &s) { fprintf(stderr, "nt-sniff-cpp: %s\n", s.c_str()); fflush(stderr); }
 
-static bool parse_request(const std::string &head, Event *e) {
-  std::string first; std::istringstream in(head); if (!std::getline(in, first)) return false;
-  std::istringstream p(trim(first)); if (!(p >> e->method >> e->path)) return false;
+static bool parse_request(const char *data, size_t len, Event *e) {
+  const char *end = data + len;
+  const char *p = data;
+  const char *eol = (const char *)memchr(p, '\n', end - p);
+  if (!eol) return false;
+  const char *sp1 = (const char *)memchr(p, ' ', eol - p);
+  if (!sp1) return false;
+  e->method.assign(p, sp1 - p);
   if (!has_method(e->method)) return false;
-  size_t q = e->path.find('?'); if (q != std::string::npos) e->path.erase(q);
-  if (e->path.size() > 120) e->path.erase(120);
-  std::string auth = header_value(head, "authorization");
-  if (lower(auth).find("basic ") == 0) { e->user = b64decode_user(auth.substr(6)); e->scheme = "basic"; }
-  else if (lower(auth).find("bearer ") == 0) e->scheme = "bearer";
-  std::string x = header_value(head, "traceparent"); e->trace_id = trace_id_from_parent(x); e->traceparent = e->trace_id.empty() ? make_traceparent(&e->trace_id) : x;
-  e->host_hdr = header_value(head, "host");
-  e->user_agent = header_value(head, "user-agent");
-  e->xff = header_value(head, "x-forwarded-for");
-  if (e->user.empty()) {
-    e->user = "-anonymous-";
+
+  const char *path_start = sp1 + 1;
+  while (path_start < eol && *path_start == ' ') ++path_start;
+  const char *sp2 = (const char *)memchr(path_start, ' ', eol - path_start);
+  if (!sp2) sp2 = (eol > data && *(eol - 1) == '\r') ? eol - 1 : eol;
+  const char *qmark = (const char *)memchr(path_start, '?', sp2 - path_start);
+  size_t path_len = (qmark ? qmark : sp2) - path_start;
+  if (path_len > 120) path_len = 120;
+  e->path.assign(path_start, path_len);
+
+  p = eol + 1;
+  while (p < end) {
+    if (*p == '\r' || *p == '\n') break;
+    const char *line_end = (const char *)memchr(p, '\n', end - p);
+    if (!line_end) line_end = end;
+    const char *colon = (const char *)memchr(p, ':', line_end - p);
+    if (colon) {
+      size_t hname_len = colon - p;
+      const char *val_start = colon + 1;
+      while (val_start < line_end && (*val_start == ' ' || *val_start == '\t')) ++val_start;
+      const char *val_end = line_end;
+      while (val_end > val_start && (val_end[-1] == '\r' || val_end[-1] == '\n' || val_end[-1] == ' ' || val_end[-1] == '\t')) --val_end;
+      size_t val_len = val_end - val_start;
+
+      if (hname_len == 13 && !strncasecmp(p, "authorization", 13)) {
+        if (val_len > 6 && !strncasecmp(val_start, "Basic ", 6)) {
+          e->user = b64decode_user(std::string(val_start + 6, val_len - 6));
+          e->scheme = "basic";
+        } else if (val_len > 7 && !strncasecmp(val_start, "Bearer ", 7)) {
+          e->scheme = "bearer";
+        }
+      } else if (hname_len == 11 && !strncasecmp(p, "traceparent", 11)) {
+        e->traceparent.assign(val_start, val_len);
+        e->trace_id = trace_id_from_parent(e->traceparent);
+      } else if (hname_len == 4 && !strncasecmp(p, "host", 4)) {
+        e->host_hdr.assign(val_start, val_len);
+      } else if (hname_len == 10 && !strncasecmp(p, "user-agent", 10)) {
+        e->user_agent.assign(val_start, val_len);
+      } else if (hname_len == 15 && !strncasecmp(p, "x-forwarded-for", 15)) {
+        e->xff.assign(val_start, val_len);
+      }
+    }
+    p = line_end + 1;
   }
-  if (e->scheme.empty()) {
-    e->scheme = "none";
+
+  if (e->user.empty()) e->user = "-anonymous-";
+  if (e->scheme.empty()) e->scheme = "none";
+  if (e->trace_id.empty()) e->traceparent = make_traceparent(&e->trace_id);
+  return true;
+}
+
+static bool parse_response(const char *data, size_t len, int *status, unsigned *clen) {
+  const char *end = data + len;
+  const char *p = data;
+  const char *eol = (const char *)memchr(p, '\n', end - p);
+  if (!eol) return false;
+  if (strncmp(p, "HTTP/", 5) != 0) return false;
+  const char *sp1 = (const char *)memchr(p, ' ', eol - p);
+  if (!sp1) return false;
+  const char *sc_start = sp1 + 1;
+  while (sc_start < eol && *sc_start == ' ') ++sc_start;
+  *status = atoi(sc_start);
+  if (*status < 100 || *status > 599) return false;
+  *clen = 0;
+  p = eol + 1;
+  while (p < end) {
+    if (*p == '\r' || *p == '\n') break;
+    const char *line_end = (const char *)memchr(p, '\n', end - p);
+    if (!line_end) line_end = end;
+    const char *colon = (const char *)memchr(p, ':', line_end - p);
+    if (colon) {
+      size_t hlen = colon - p;
+      if (hlen == 14 && !strncasecmp(p, "content-length", 14)) {
+        const char *v = colon + 1;
+        while (v < line_end && (*v == ' ' || *v == '\t')) ++v;
+        long n = atol(v);
+        if (n >= 0 && n <= 0x7fffffff) *clen = (unsigned)n;
+      }
+    }
+    p = line_end + 1;
   }
   return true;
 }
-static bool parse_response(const std::string &payload, int *status, unsigned *clen) {
-  size_t end = payload.find("\r\n\r\n");
-  std::string h = payload.substr(0, end == std::string::npos ? payload.size() : end);
-  if (h.size() > MAX_HEADER) return false;
-  std::istringstream in(h);
-  std::string first;
-  if (!std::getline(in, first)) return false;
-  std::istringstream p(first);
-  std::string proto;
-  if (!(p >> proto >> *status)) return false;
-  if (proto.find("HTTP/") != 0 || *status < 100 || *status > 599) return false;
-  *clen = 0; std::string line;
-  while (std::getline(in, line)) { size_t x = line.find(':'); if (x != std::string::npos && lower(trim(line.substr(0, x))) == "content-length") { long n = atol(trim(line.substr(x + 1)).c_str()); if (n >= 0 && n <= 0x7fffffff) *clen = (unsigned)n; } }
-  return true;
-}
+
 static void emit_event(const Event &e) {
   std::cout << "{\"ts\":" << e.ts << ",\"host\":" << jsonq(e.host) << ",\"src\":\"pcap\",\"service\":" << jsonq(e.service)
             << ",\"method\":" << jsonq(e.method) << ",\"path\":" << jsonq(e.path) << ",\"user\":" << jsonq(e.user)
@@ -210,8 +275,8 @@ static void flush_oldest(std::map<PacketKey, std::vector<Pending> > &pending) {
   for (i = pending.begin(); i != pending.end(); ++i) if (!i->second.empty() && (!found || i->second[0].started_ms < bt)) { best = i; bt = i->second[0].started_ms; found = true; }
   if (found) { emit_event(best->second[0].ev); best->second.erase(best->second.begin()); if (best->second.empty()) pending.erase(best); }
 }
-static void sweep(std::map<std::string, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending, time_t now) {
-  std::map<std::string, Flow>::iterator f, fn;
+static void sweep(std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending, time_t now) {
+  std::map<FlowKey, Flow>::iterator f, fn;
   for (f = flows.begin(); f != flows.end();) {
     fn = f; ++fn;
     if ((unsigned)(now - f->second.touched) > FLOW_TTL) flows.erase(f);
@@ -245,7 +310,7 @@ static size_t find_http_start(const std::string &s) {
 }
 
 static bool handle_packet(const unsigned char *buf, size_t n, const std::string &node, const std::vector<unsigned> &ports,
-                          std::map<std::string, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending) {
+                          std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending) {
   if (n < 34) return false;
   size_t off = 14;
   unsigned short et = ntohs(*(const unsigned short *)(buf + 12));
@@ -253,8 +318,18 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   if (et != ETH_P_IP || n < off + 20) return false;
   unsigned char ihl = (unsigned char)(buf[off] & 15) * 4;
   if ((buf[off] >> 4) != 4 || buf[off + 9] != 6 || n < off + ihl + 20) return false;
-  char a[INET_ADDRSTRLEN], b[INET_ADDRSTRLEN]; inet_ntop(AF_INET, buf + off + 12, a, sizeof(a)); inet_ntop(AF_INET, buf + off + 16, b, sizeof(b));
-  size_t to = off + ihl; unsigned sport = ntohs(*(const unsigned short *)(buf + to)); unsigned dport = ntohs(*(const unsigned short *)(buf + to + 2)); unsigned doff = (buf[to + 12] >> 4) * 4; if (n < to + doff) return false; const char *payload = (const char *)(buf + to + doff); size_t plen = n - to - doff; if (!plen) return false;
+
+  uint32_t s_ip = *(const uint32_t *)(buf + off + 12);
+  uint32_t d_ip = *(const uint32_t *)(buf + off + 16);
+  size_t to = off + ihl;
+  unsigned sport = ntohs(*(const unsigned short *)(buf + to));
+  unsigned dport = ntohs(*(const unsigned short *)(buf + to + 2));
+  unsigned doff = (buf[to + 12] >> 4) * 4;
+  if (n < to + doff) return false;
+  const char *payload = (const char *)(buf + to + doff);
+  size_t plen = n - to - doff;
+  if (!plen) return false;
+
   time_t now = time(NULL);
   bool dst_mon = false, src_mon = false;
   size_t j;
@@ -262,16 +337,15 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     if (dport == ports[j]) dst_mon = true;
     if (sport == ports[j]) src_mon = true;
   }
+
   if (src_mon && !dst_mon && plen >= 5) {
-    std::string s_pay(payload, plen);
-    size_t hpos = s_pay.find("HTTP/");
-    if (hpos != std::string::npos) {
+    if (memcmp(payload, "HTTP/", 5) == 0) {
       PacketKey k;
-      k.src = a; k.sport = sport; k.dst = b; k.dport = dport;
+      k.s_ip = s_ip; k.sport = (uint16_t)sport; k.d_ip = d_ip; k.dport = (uint16_t)dport;
       std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(k);
       if (p != pending.end() && !p->second.empty()) {
         int st; unsigned cl;
-        if (parse_response(s_pay.substr(hpos), &st, &cl)) {
+        if (parse_response(payload, plen, &st, &cl)) {
           Event e = p->second[0].ev;
           e.status = st; e.has_status = true;
           e.duration_ms = (long)(now_ms() - p->second[0].started_ms);
@@ -287,11 +361,13 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     return true;
   }
   if (!dst_mon) return false;
-  std::string fk = key_string(a, sport, b, dport);
+
+  FlowKey fk;
+  fk.s_ip = s_ip; fk.sport = (uint16_t)sport; fk.d_ip = d_ip; fk.dport = (uint16_t)dport;
   if (flows.find(fk) == flows.end() && flows.size() >= MAX_FLOWS) {
     time_t oldest_t = now + 1;
-    std::map<std::string, Flow>::iterator oldest_it = flows.begin();
-    for (std::map<std::string, Flow>::iterator fi = flows.begin(); fi != flows.end(); ++fi) {
+    std::map<FlowKey, Flow>::iterator oldest_it = flows.begin();
+    for (std::map<FlowKey, Flow>::iterator fi = flows.begin(); fi != flows.end(); ++fi) {
       if (fi->second.touched < oldest_t) {
         oldest_t = fi->second.touched;
         oldest_it = fi;
@@ -307,10 +383,10 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     if (start > 0) fl.buf.erase(0, start);
     size_t end = fl.buf.find("\r\n\r\n");
     if (end == std::string::npos) break;
-    Event e; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = a; e.caller_port = sport; e.dst_ip = b; e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
-    if (!parse_request(fl.buf.substr(0, end), &e)) { fl.buf.erase(0, end + 4); continue; }
+    Event e; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = ip_to_str(s_ip); e.caller_port = sport; e.dst_ip = ip_to_str(d_ip); e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
+    if (!parse_request(fl.buf.data(), end, &e)) { fl.buf.erase(0, end + 4); continue; }
     fl.buf.erase(0, end + 4);
-    PacketKey rk; rk.src = b; rk.sport = dport; rk.dst = a; rk.dport = sport;
+    PacketKey rk; rk.s_ip = d_ip; rk.sport = (uint16_t)dport; rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
     if (pending.size() >= MAX_PENDING) flush_oldest(pending);
     pending[rk].push_back(Pending(e, now_ms()));
   }
@@ -439,7 +515,7 @@ static bool setup_mmap_ring(int fd, MmapRing &mr) {
 
 static int run_fixture() {
   std::string req = "GET /api/items?x=1 HTTP/1.1\r\nHost: api.local\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nTraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\n\r\n";
-  Event e; e.ts = 1700000000; e.host = "cpp-node"; e.service = "port:8080"; e.caller = "10.0.0.9"; e.caller_port = 51000; e.dst_ip = "10.0.0.2"; e.dst_port = 8080; e.req_bytes = (unsigned)req.size(); parse_request(req.substr(0, req.size() - 4), &e); e.status = 200; e.has_status = true; e.duration_ms = 3; e.has_duration = true; e.resp_bytes = 42; e.has_resp = true; emit_event(e); return 0;
+  Event e; e.ts = 1700000000; e.host = "cpp-node"; e.service = "port:8080"; e.caller = "10.0.0.9"; e.caller_port = 51000; e.dst_ip = "10.0.0.2"; e.dst_port = 8080; e.req_bytes = (unsigned)req.size(); parse_request(req.data(), req.size() - 4, &e); e.status = 200; e.has_status = true; e.duration_ms = 3; e.has_duration = true; e.resp_bytes = 42; e.has_resp = true; emit_event(e); return 0;
 }
 
 int main(int argc, char **argv) {
@@ -480,7 +556,8 @@ int main(int argc, char **argv) {
 
   signal(SIGTERM, stop_signal);
   signal(SIGINT, stop_signal);
-  std::map<std::string, Flow> flows;
+  setvbuf(stdout, NULL, _IOLBF, 65536);
+  std::map<FlowKey, Flow> flows;
   std::map<PacketKey, std::vector<Pending> > pending;
 
   if (use_mmap) {
