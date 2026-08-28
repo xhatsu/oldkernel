@@ -304,9 +304,18 @@ fi
 
 cat > "$INIT" <<EOF
 #!/bin/sh
-# networktracing-legacy — pcap sniffer + shipper (SysV, el6)
+# networktracing-legacy — pcap sniffer + shipper (SysV, el6/debian/ubuntu)
 # chkconfig: 2345 90 10
 # description: NetworkTracing passive HTTP/SOAP capture (old-kernel kit)
+### BEGIN INIT INFO
+# Provides:          networktracing-legacy
+# Required-Start:    \$network \$local_fs \$remote_fs
+# Required-Stop:     \$network \$local_fs \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: NetworkTracing passive HTTP/SOAP capture
+# Description:       NetworkTracing legacy capture agent
+### END INIT INFO
 
 PREFIX=$PREFIX
 SNIFF_USER=$SNIFF_AS
@@ -367,8 +376,10 @@ case "\$1" in
             sh "\$PREFIX/install.sh" --uninstall
         else
             if command -v chkconfig >/dev/null 2>&1; then chkconfig networktracing-legacy off >/dev/null 2>&1 || true; fi
+            if command -v update-rc.d >/dev/null 2>&1; then update-rc.d -f networktracing-legacy remove >/dev/null 2>&1 || true; fi
             rm -f "\$INIT" "\$PIDFILE"
-            rm -rf "\$PREFIX" /tmp/ntkit
+            rm -rf "\$PREFIX" /tmp/ntkit*
+            if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
             echo "networktracing-legacy uninstalled"
         fi
         ;;
@@ -387,9 +398,19 @@ if have chkconfig; then
     chkconfig --add networktracing-legacy 2>/dev/null || true
     chkconfig networktracing-legacy on 2>/dev/null || true
 fi
+if have update-rc.d; then
+    update-rc.d networktracing-legacy defaults 2>/dev/null || true
+fi
+if have systemctl; then
+    systemctl daemon-reload 2>/dev/null || true
+fi
 
-"$INIT" start || die "service failed to start"
-sleep 3
+if have service; then
+    service networktracing-legacy start || "$INIT" start || die "service failed to start"
+else
+    "$INIT" start || die "service failed to start"
+fi
+sleep 2
 pgrep -f "$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "$PREFIX/nt-sniff-cpp" >/dev/null || die "sniffer not running after start"
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
