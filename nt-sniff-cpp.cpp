@@ -47,8 +47,8 @@ static const size_t MAX_BATCH = 400;
 static const size_t MAX_QUEUE = 4000;
 static const int FLUSH_SEC = 5;
 static const int RETRY_SEC = 60;
-static const unsigned FLOW_TTL = 300;
-static const unsigned PENDING_TTL = 5;
+static const unsigned FLOW_TTL = 15;
+static const unsigned PENDING_TTL = 3;
 static const unsigned ACCEPT = 2048;
 static const int SO_ATTACH_FILTER_OLD = 26;
 static const unsigned short ETH_P_IP_HOST = 0x0800;
@@ -322,10 +322,15 @@ static void emit_event(const Event &e) {
 }
 
 static void flush_oldest(std::map<PacketKey, std::vector<Pending> > &pending) {
-  std::map<PacketKey, std::vector<Pending> >::iterator best = pending.end(); long long bt = 0; bool found = false;
-  std::map<PacketKey, std::vector<Pending> >::iterator i;
-  for (i = pending.begin(); i != pending.end(); ++i) if (!i->second.empty() && (!found || i->second[0].started_ms < bt)) { best = i; bt = i->second[0].started_ms; found = true; }
-  if (found) { emit_event(best->second[0].ev); best->second.erase(best->second.begin()); if (best->second.empty()) pending.erase(best); }
+  if (pending.empty()) return;
+  std::map<PacketKey, std::vector<Pending> >::iterator it = pending.begin();
+  if (!it->second.empty()) {
+    emit_event(it->second[0].ev);
+    it->second.erase(it->second.begin());
+  }
+  if (it->second.empty()) {
+    pending.erase(it);
+  }
 }
 static void sweep(std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending, time_t now) {
   std::map<FlowKey, Flow>::iterator f, fn;
@@ -412,20 +417,24 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     }
     return true;
   }
-  if (!dst_mon) return false;
+  unsigned char tcp_flags = buf[to + 13];
+  if (!dst_mon) {
+    if (tcp_flags & 0x05) { /* FIN or RST */
+      FlowKey rfk; rfk.s_ip = d_ip; rfk.sport = (uint16_t)dport; rfk.d_ip = s_ip; rfk.dport = (uint16_t)sport;
+      flows.erase(rfk);
+    }
+    return false;
+  }
 
   FlowKey fk;
   fk.s_ip = s_ip; fk.sport = (uint16_t)sport; fk.d_ip = d_ip; fk.dport = (uint16_t)dport;
+  if (tcp_flags & 0x05) { /* FIN or RST */
+    flows.erase(fk);
+    return true;
+  }
+
   if (flows.find(fk) == flows.end() && flows.size() >= MAX_FLOWS) {
-    time_t oldest_t = now + 1;
-    std::map<FlowKey, Flow>::iterator oldest_it = flows.begin();
-    for (std::map<FlowKey, Flow>::iterator fi = flows.begin(); fi != flows.end(); ++fi) {
-      if (fi->second.touched < oldest_t) {
-        oldest_t = fi->second.touched;
-        oldest_it = fi;
-      }
-    }
-    if (oldest_it != flows.end()) flows.erase(oldest_it);
+    flows.erase(flows.begin());
   }
   Flow &fl = flows[fk]; fl.touched = now; fl.buf.append(payload, plen);
   if (fl.buf.size() > MAX_HEADER) { flows.erase(fk); return false; }
@@ -441,6 +450,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     PacketKey rk; rk.s_ip = d_ip; rk.sport = (uint16_t)dport; rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
     if (pending.size() >= MAX_PENDING) flush_oldest(pending);
     pending[rk].push_back(Pending(e, now_ms()));
+  }
+  if (fl.buf.empty()) {
+    flows.erase(fk);
   }
   return true;
 }
