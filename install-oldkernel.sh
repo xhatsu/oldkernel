@@ -300,9 +300,9 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
         fi
     fi
     if [ "$SNIFF_AS" != root ]; then
-        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl' >>\$PREFIX/sniff.log 2>&1"
+        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT' >>\$PREFIX/sniff.log 2>&1"
     else
-        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl >>\$PREFIX/sniff.log 2>&1"
+        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT >>\$PREFIX/sniff.log 2>&1"
     fi
     log "native C++ single-binary capture + shipping selected"
 else

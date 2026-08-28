@@ -260,7 +260,6 @@ static bool parse_response(const char *data, size_t len, int *status, unsigned *
 }
 
 static std::string g_endpoint;
-static std::string g_spool_path;
 static std::string g_ship_node;
 static std::vector<std::string> g_ship_buf;
 
@@ -269,53 +268,32 @@ static std::string shellq(const std::string &s) {
   for (size_t i = 0; i < s.size(); ++i) { if (s[i] == '\'') o += "'\\''"; else o += s[i]; }
   return o + "'";
 }
-static bool read_file(const std::string &p, std::string *out) {
-  std::ifstream f(p.c_str()); if (!f) return false;
-  std::ostringstream ss; ss << f.rdbuf(); *out = ss.str(); return true;
-}
-static bool write_append(const std::string &p, const std::string &data) {
-  std::string dir = p.substr(0, p.find_last_of('/'));
-  if (!dir.empty()) { std::string cmd = "mkdir -p " + shellq(dir); if (system(cmd.c_str()) != 0) return false; }
-  std::ofstream f(p.c_str(), std::ios::out | std::ios::app); if (!f) return false;
-  f << data; return f.good();
-}
 static std::string number_string(size_t n) { std::ostringstream o; o << n; return o.str(); }
 static std::string json_array(const std::vector<std::string> &a) {
   std::string o = "["; for (size_t i = 0; i < a.size(); ++i) { if (i) o += ","; o += a[i]; } return o + "]";
 }
 static bool post(const std::string &endpoint, const std::string &node, const std::vector<std::string> &batch) {
   std::string body = "{\"node\":" + jsonq(node) + ",\"events\":" + json_array(batch) + "}";
-  char code_tmpl[] = "/tmp/nt_code_XXXXXX";
-  int tmp_fd = mkstemp(code_tmpl);
-  if (tmp_fd < 0) return false;
-  close(tmp_fd);
-  std::string code_file = code_tmpl;
-  std::string cmd = "curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + "/api/ingest") + " > " + shellq(code_file);
-  FILE *fp = popen(cmd.c_str(), "w"); if (!fp) { unlink(code_file.c_str()); return false; }
+  std::string cmd = "curl -sSf --max-time 10 -o /dev/null -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + "/api/ingest");
+  FILE *fp = popen(cmd.c_str(), "w"); if (!fp) return false;
   fwrite(body.data(), 1, body.size(), fp);
   int rc = pclose(fp);
-  std::string code;
-  read_file(code_file, &code);
-  unlink(code_file.c_str());
-  while (!code.empty() && (code[code.size() - 1] == '\r' || code[code.size() - 1] == '\n' || code[code.size() - 1] == ' ')) code.erase(code.size() - 1);
-  return rc == 0 && code == "200";
+  return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
 }
-static void spool(const std::string &path, const std::vector<std::string> &batch) {
-  std::string data; for (size_t i = 0; i < batch.size(); ++i) data += batch[i] + "\n";
-  if (!write_append(path, data)) { logmsg("FATAL: cannot write spool"); exit(3); }
-}
-static void load_spool(const std::string &path, std::vector<std::string> *buf) {
-  std::string data; if (!read_file(path, &data)) return;
-  std::istringstream in(data); std::string line; while (std::getline(in, line)) if (!line.empty()) buf->push_back(line);
-  unlink(path.c_str());
-}
-static void send_batches(const std::string &endpoint, const std::string &node, const std::string &spool_path,
+static void send_batches(const std::string &endpoint, const std::string &node,
                          std::vector<std::string> *buf, bool flush_all) {
   while (!buf->empty() && (flush_all || buf->size() >= MAX_BATCH)) {
     size_t n = buf->size() >= MAX_BATCH ? MAX_BATCH : buf->size();
     std::vector<std::string> batch(buf->begin(), buf->begin() + n);
-    if (post(endpoint, node, batch)) { buf->erase(buf->begin(), buf->begin() + n); logmsg("flushed " + number_string(n) + " events"); }
-    else { spool(spool_path, batch); buf->erase(buf->begin(), buf->begin() + n); logmsg("spooled " + number_string(n) + " events"); break; }
+    if (post(endpoint, node, batch)) {
+      buf->erase(buf->begin(), buf->begin() + n);
+      logmsg("flushed " + number_string(n) + " events");
+    } else {
+      /* Pure in-memory drop when Hub unreachable (zero disk I/O) */
+      buf->erase(buf->begin(), buf->begin() + n);
+      logmsg("WARN: Hub unreachable, dropped " + number_string(n) + " events (in-memory drop, 0 disk I/O)");
+      break;
+    }
   }
 }
 
@@ -334,10 +312,10 @@ static void emit_event(const Event &e) {
   ss << "}";
 
   if (!g_endpoint.empty()) {
-    g_ship_buf.push_back(ss.str());
     if (g_ship_buf.size() >= MAX_QUEUE) {
-      send_batches(g_endpoint, g_ship_node, g_spool_path, &g_ship_buf, false);
+      g_ship_buf.erase(g_ship_buf.begin());
     }
+    g_ship_buf.push_back(ss.str());
   } else {
     std::cout << ss.str() << "\n";
   }
@@ -595,7 +573,7 @@ static int run_fixture() {
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
-  std::string endpoint, spool_path = "/var/lib/networktracing/sniff-spool.jsonl";
+  std::string endpoint;
   for (i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i];
     else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
@@ -605,10 +583,10 @@ int main(int argc, char **argv) {
       }
     }
     else if (!strcmp(argv[i], "--endpoint") && i + 1 < argc) endpoint = argv[++i];
-    else if (!strcmp(argv[i], "--spool") && i + 1 < argc) spool_path = argv[++i];
+    else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i; /* ignored: 0 disk write */
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--spool PATH] [-j workers]\n");
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [-j workers]\n");
       return 0;
     }
   }
@@ -619,12 +597,7 @@ int main(int argc, char **argv) {
   std::string node = (node_env && *node_env) ? node_env : host_name();
 
   g_endpoint = endpoint;
-  g_spool_path = spool_path;
   g_ship_node = node;
-
-  if (!g_endpoint.empty()) {
-    load_spool(g_spool_path, &g_ship_buf);
-  }
 
   int fd = socket(AF_PACKET, SOCK_RAW, htons(3));
   if (fd < 0) { perror("AF_PACKET"); return 2; }
@@ -657,11 +630,11 @@ int main(int argc, char **argv) {
     logmsg("WARN: PACKET_MMAP setup failed, falling back to standard socket recv");
   }
   if (!g_endpoint.empty()) {
-    logmsg("single-binary mode: shipping directly to " + g_endpoint);
+    logmsg("single-binary in-memory mode: shipping directly to " + g_endpoint + " (0 disk I/O)");
   }
   logmsg("listening");
 
-  time_t last = time(NULL), last_flush = last, last_retry = last;
+  time_t last = time(NULL), last_flush = last;
   unsigned char *fallback_buf = NULL;
   if (!use_mmap) {
     fallback_buf = (unsigned char *)malloc(65536);
@@ -723,19 +696,14 @@ int main(int argc, char **argv) {
 
     if (!g_endpoint.empty()) {
       if (now - last_flush >= FLUSH_SEC || g_ship_buf.size() >= MAX_BATCH) {
-        if (!g_ship_buf.empty()) send_batches(g_endpoint, g_ship_node, g_spool_path, &g_ship_buf, true);
+        if (!g_ship_buf.empty()) send_batches(g_endpoint, g_ship_node, &g_ship_buf, true);
         last_flush = now;
-      }
-      if (now - last_retry >= RETRY_SEC) {
-        load_spool(g_spool_path, &g_ship_buf);
-        last_retry = now;
       }
     }
   }
 
   if (!g_endpoint.empty() && !g_ship_buf.empty()) {
-    send_batches(g_endpoint, g_ship_node, g_spool_path, &g_ship_buf, true);
-    if (!g_ship_buf.empty()) spool(g_spool_path, g_ship_buf);
+    send_batches(g_endpoint, g_ship_node, &g_ship_buf, true);
   }
 
   if (use_mmap && ring.ring != MAP_FAILED) {
