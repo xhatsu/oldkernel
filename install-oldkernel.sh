@@ -208,6 +208,15 @@ fi
 have_root || die "must run as root (try: sudo sh $0 ...)"
 
 # ---------------------------------------------------------------- install
+# Stop existing service and terminate any old running processes
+[ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1 || true
+for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-ship-cpp"; do
+    for p in $(pgrep -f "$pattern" 2>/dev/null || true); do
+        [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null || true
+    done
+done
+rm -f "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship-cpp"
+
 mkdir -p "$PREFIX" || die "mkdir $PREFIX failed"
 # Python control client is bundled for CentOS 6.x nodes.
 for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh; do
@@ -281,9 +290,13 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
     if [ -f "$PREFIX/nt-sniff-cpp" ] && have setcap && have useradd; then
         chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
-        if setcap cap_net_raw+ep "$PREFIX/nt-sniff-cpp" 2>/dev/null; then
+        if setcap cap_net_raw+ep "$PREFIX/nt-sniff-cpp" 2>/dev/null \
+           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-sniff-cpp --fixture" >/dev/null 2>&1; then
             SNIFF_AS="$SNIFF_USER"
             log "rootless mode: cap_net_raw on native C++ binary, user=$SNIFF_USER"
+        else
+            SNIFF_AS=root
+            log "WARN: rootless capability execution failed — sniffer will run as root"
         fi
     fi
     if [ "$SNIFF_AS" != root ]; then
@@ -405,13 +418,17 @@ if have systemctl; then
     systemctl daemon-reload 2>/dev/null || true
 fi
 
-if have service; then
-    service networktracing-legacy start || "$INIT" start || die "service failed to start"
-else
-    "$INIT" start || die "service failed to start"
-fi
+"$INIT" start || {
+    [ -f "$PREFIX/sniff.log" ] && { echo "--- $PREFIX/sniff.log ---"; cat "$PREFIX/sniff.log"; }
+    [ -f "$PREFIX/ship.log" ] && { echo "--- $PREFIX/ship.log ---"; cat "$PREFIX/ship.log"; }
+    die "service failed to start"
+}
 sleep 2
-pgrep -f "$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "$PREFIX/nt-sniff-cpp" >/dev/null || die "sniffer not running after start"
+if ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-cpp" >/dev/null; then
+    [ -f "$PREFIX/sniff.log" ] && { echo "--- $PREFIX/sniff.log ---"; cat "$PREFIX/sniff.log"; }
+    [ -f "$PREFIX/ship.log" ] && { echo "--- $PREFIX/ship.log ---"; cat "$PREFIX/ship.log"; }
+    die "sniffer not running after start"
+fi
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
 log "Logs: $PREFIX/sniff.log $PREFIX/ship.log"
