@@ -715,6 +715,16 @@ def main():
                 w(json.dumps(ev) + "\n")
             sys.stdout.flush()
 
+        if now - last_sweep > 5.0:
+            sweep_idle(flows, now)
+            out_s = []
+            sweep_pending(pending, now, out_s)
+            for ev in out_s:
+                sys.stdout.write(json.dumps(ev) + "\n")
+            if out_s:
+                sys.stdout.flush()
+            last_sweep = now
+
     log("stopped")
 
 

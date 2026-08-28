@@ -92,9 +92,11 @@ static std::string host_name() {
   char b[256]; if (gethostname(b, sizeof(b) - 1) != 0) return "unknown-node";
   b[sizeof(b) - 1] = 0; char *p = strchr(b, '.'); if (p) *p = 0; return b;
 }
-static std::string b64decode_user(const std::string &v) {
-  std::string in = trim(v), out; int val = 0, bits = -8; size_t i;
-  for (i = 0; i < in.size(); ++i) {
+static std::string b64decode_user(const char *in, size_t in_len) {
+  while (in_len > 0 && isspace((unsigned char)*in)) { ++in; --in_len; }
+  while (in_len > 0 && isspace((unsigned char)in[in_len - 1])) { --in_len; }
+  std::string out; int val = 0, bits = -8; size_t i;
+  for (i = 0; i < in_len; ++i) {
     unsigned char c = (unsigned char)in[i]; int d = -1;
     if (c >= 'A' && c <= 'Z') d = c - 'A';
     else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
@@ -126,14 +128,37 @@ static std::string trace_id_from_parent(const std::string &tp) {
   if (x.size() == 55 && x[2] == '-' && x[35] == '-' && x[52] == '-') return lower(x.substr(3, 32));
   return "";
 }
+
+static uint64_t g_rng_state = 0;
+static void init_rng() {
+  FILE *f = fopen("/dev/urandom", "rb");
+  if (f) {
+    size_t n = fread(&g_rng_state, 1, sizeof(g_rng_state), f);
+    (void)n;
+    fclose(f);
+  }
+  if (!g_rng_state) {
+    g_rng_state = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
+  }
+}
+static inline uint64_t next_rng() {
+  uint64_t x = g_rng_state;
+  x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+  return g_rng_state = (x ? x : 0x853c49e6748fea9bULL);
+}
+
 static std::string make_traceparent(std::string *tid) {
-  unsigned char b[24]; size_t i; FILE *f = fopen("/dev/urandom", "rb");
-  if (f) { size_t got = fread(b, 1, sizeof(b), f); (void)got; fclose(f); }
-  else { unsigned long t = (unsigned long)time(NULL) ^ (unsigned long)getpid(); for (i = 0; i < sizeof(b); ++i) b[i] = (unsigned char)(t = t * 1103515245UL + 12345UL); }
-  static const char *hex = "0123456789abcdef"; std::string a, c;
-  for (i = 0; i < 16; ++i) { a += hex[b[i] >> 4]; a += hex[b[i] & 15]; }
-  for (i = 16; i < 24; ++i) { c += hex[b[i] >> 4]; c += hex[b[i] & 15]; }
-  *tid = a; return "00-" + a + "-" + c + "-01";
+  uint64_t r1 = next_rng();
+  uint64_t r2 = next_rng();
+  uint64_t r3 = next_rng();
+  char buf[64];
+  snprintf(buf, sizeof(buf), "00-%016llx%016llx-%016llx-01",
+           (unsigned long long)r1, (unsigned long long)r2, (unsigned long long)r3);
+  char tid_buf[33];
+  snprintf(tid_buf, sizeof(tid_buf), "%016llx%016llx",
+           (unsigned long long)r1, (unsigned long long)r2);
+  *tid = tid_buf;
+  return buf;
 }
 
 struct Event {
@@ -201,7 +226,7 @@ static bool parse_request(const char *data, size_t len, Event *e) {
 
       if (hname_len == 13 && !strncasecmp(p, "authorization", 13)) {
         if (val_len > 6 && !strncasecmp(val_start, "Basic ", 6)) {
-          e->user = b64decode_user(std::string(val_start + 6, val_len - 6));
+          e->user = b64decode_user(val_start + 6, val_len - 6);
           e->scheme = "basic";
         } else if (val_len > 7 && !strncasecmp(val_start, "Bearer ", 7)) {
           e->scheme = "bearer";
@@ -366,8 +391,11 @@ static size_t find_http_start(const std::string &s) {
   return best;
 }
 
+static bool g_monitored_ports[65536];
+
 static bool handle_packet(const unsigned char *buf, size_t n, const std::string &node, const std::vector<unsigned> &ports,
                           std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending) {
+  (void)ports;
   if (n < 34) return false;
   size_t off = 14;
   unsigned short et = ntohs(*(const unsigned short *)(buf + 12));
@@ -388,12 +416,8 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   if (!plen) return false;
 
   time_t now = time(NULL);
-  bool dst_mon = false, src_mon = false;
-  size_t j;
-  for (j = 0; j < ports.size(); ++j) {
-    if (dport == ports[j]) dst_mon = true;
-    if (sport == ports[j]) src_mon = true;
-  }
+  bool dst_mon = (dport < 65536) ? g_monitored_ports[dport] : false;
+  bool src_mon = (sport < 65536) ? g_monitored_ports[sport] : false;
 
   if (src_mon && !dst_mon && plen >= 5) {
     if (memcmp(payload, "HTTP/", 5) == 0) {
@@ -604,6 +628,12 @@ int main(int argc, char **argv) {
   }
   if (ports.empty()) { ports.push_back(80); ports.push_back(8003); ports.push_back(8005); ports.push_back(8007); ports.push_back(8009); ports.push_back(8010); ports.push_back(8011); }
   (void)workers;
+
+  init_rng();
+  memset(g_monitored_ports, 0, sizeof(g_monitored_ports));
+  for (size_t k = 0; k < ports.size(); ++k) {
+    if (ports[k] < 65536) g_monitored_ports[ports[k]] = true;
+  }
 
   const char *node_env = getenv("NT_NODE_NAME");
   std::string node = (node_env && *node_env) ? node_env : host_name();
