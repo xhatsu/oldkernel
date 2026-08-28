@@ -322,28 +322,28 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
   std::vector<struct sock_filter> f; size_t i;
   /* Dual-path cBPF: Path A (standard IPv4) and Path B (802.1Q VLAN tagged IPv4). */
   unsigned N = (unsigned)ports.size();
-  unsigned reject = 11 + N * 4;
+  unsigned reject = 11 + N * 8;
   unsigned accept = reject + 1;
   struct sock_filter x;
 #define ADD(C,J,T,K) do { x.code=(C); x.jt=(J); x.jf=(T); x.k=(K); f.push_back(x); } while(0)
   /* [0] Load EtherType at offset 12 */
   ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 12);
-  /* [1] If standard IPv4 (0x0800), jump to Path A start (index 8 + 2*N) */
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, (unsigned)(6 + 2 * N), 0, ETH_P_IP_HOST);
+  /* [1] If standard IPv4 (0x0800), jump over Path B (6 + 4*N instructions) to Path A */
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, (unsigned)(6 + 4 * N), 0, ETH_P_IP_HOST);
 
   /* --- Path B: 802.1Q VLAN (index 2) --- */
   /* [2] If not 802.1Q (0x8100), reject */
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - 2 - 1), ETH_P_8021Q_HOST);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), ETH_P_8021Q_HOST);
   /* [3] Load encapsulated EtherType at offset 16 */
   ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 16);
   /* [4] If encapsulated != IPv4, reject */
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - 4 - 1), ETH_P_IP_HOST);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), ETH_P_IP_HOST);
   /* [5] Load IP protocol at offset 27 (23 + 4) */
   ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 27);
   /* [6] If not TCP, reject */
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - 6 - 1), IPPROTO_TCP);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), IPPROTO_TCP);
   /* [7] Load IHL at offset 18 (14 + 4) */
-  ADD(BPF_LD|BPF_B|BPF_MSH, 0, 0, 18);
+  ADD(BPF_LDX|BPF_B|BPF_MSH, 0, 0, 18);
   /* Destination port checks for VLAN */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 20);
@@ -358,13 +358,13 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
     ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
   }
 
-  /* --- Path A: Standard IPv4 (index 8 + 2*N) --- */
+  /* --- Path A: Standard IPv4 --- */
   /* Load IP protocol at offset 23 */
   ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 23);
   /* If not TCP, reject */
   ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), IPPROTO_TCP);
   /* Load IHL at offset 14 */
-  ADD(BPF_LD|BPF_B|BPF_MSH, 0, 0, 14);
+  ADD(BPF_LDX|BPF_B|BPF_MSH, 0, 0, 14);
   /* Destination port checks for standard IPv4 */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 16);
@@ -385,7 +385,11 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
   ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
 #undef ADD
   if (f.size() > 4096) return false;
-  struct sock_fprog prog; prog.len = (unsigned short)f.size(); prog.filter = &f[0]; return setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER_OLD, &prog, sizeof(prog)) == 0;
+  struct sock_fprog prog; prog.len = (unsigned short)f.size(); prog.filter = &f[0];
+#ifndef SO_ATTACH_FILTER
+#define SO_ATTACH_FILTER 26
+#endif
+  return setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) == 0;
 }
 
 struct MmapRing {
