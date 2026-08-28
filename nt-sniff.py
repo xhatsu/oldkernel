@@ -26,6 +26,11 @@ ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 ETH_P_VLAN = 0x8100
 
+try:
+    import nt_control
+except ImportError:
+    nt_control = None
+
 # py2.6 str-indexing yields 1-char str, not int (proven on real el6 VM);
 # normalize so byte-at-index works identically under python 2 and 3
 PY2 = sys.version_info[0] == 2
@@ -466,9 +471,84 @@ def enforce_limit(flows, now):
         flows.popitem()          # oldest-inserted key on CPython 2.6/2.7
 
 
+def _control_config():
+    """Read optional control settings without exposing the bearer token."""
+    endpoint = os.environ.get("NT_CONTROL_ENDPOINT") or os.environ.get("NT_ENDPOINT")
+    token_file = os.environ.get("NT_CONTROL_TOKEN_FILE", "")
+    token = os.environ.get("NT_CONTROL_TOKEN", "")
+    if token_file:
+        try:
+            f = open(token_file, "r")
+            try:
+                token = f.read().strip()
+            finally:
+                f.close()
+        except IOError:
+            token = ""
+    node = os.environ.get("NT_NODE_NAME") or socket.gethostname().split(".")[0]
+    run_dir = os.environ.get("NT_CONTROL_RUN", "/var/lib/networktracing")
+    try:
+        interval = max(5, min(int(os.environ.get("NT_CONTROL_SEC", "30")), 300))
+    except ValueError:
+        interval = 30
+    return endpoint, token, node, run_dir, interval
+
+
+def _run_control_tick(ports, iface, run_dir, client):
+    reply = client.poll()
+    if not reply:
+        return ports, iface, False, "poll failed"
+    desired = reply.get("desired") or {}
+    generation = desired.get("generation", 0)
+    restart_requested = False
+    if desired.get("ports"):
+        new_ports = set(desired["ports"])
+        if new_ports != ports:
+            ports = new_ports
+    if desired.get("iface"):
+        iface = desired["iface"]
+    nt_control.write_state(os.path.join(run_dir, "remote-desired.json"), desired, "restart required")
+    for task in reply.get("tasks", []):
+        action = task.get("action")
+        if action == "health":
+            message = "healthy"
+            status = "done"
+        elif action in ("restart", "reload", "set_ports"):
+            message = "accepted; capture restart requested"
+            status = "done"
+            restart_requested = True
+            if action == "set_ports":
+                args = task.get("args") or {}
+                if args.get("ports"):
+                    ports = set(args["ports"])
+                    nt_control.write_state(os.path.join(run_dir, "remote-desired.json"),
+                                           {"ports": sorted(ports), "mode": "python",
+                                            "generation": generation}, message)
+        elif action == "stop":
+            message = "stop requested"
+            status = "done"
+            restart_requested = False
+        else:
+            message = "unsupported by direct sniffer"
+            status = "failed"
+        client.report(task.get("id"), status, message)
+    client.heartbeat(generation, "restart required" if restart_requested else "poll ok")
+    return ports, iface, restart_requested, "poll ok"
+
+
 def main():
     iface, ports, verbose, workers = parse_args(sys.argv[1:])
     node_host = socket.gethostname().split(".")[0]
+    control_client = None
+    endpoint, token, control_node, control_run, control_interval = _control_config()
+    if nt_control is not None and endpoint and token:
+        try:
+            control_client = nt_control.ControlClient(endpoint, token, control_node)
+            if not os.path.isdir(control_run):
+                os.makedirs(control_run)
+            log("remote control enabled")
+        except Exception as e:
+            log("WARN: remote control disabled (%s)" % nt_control.safe_message(e))
 
     try:
         # protocol MUST be htons(ETH_P_ALL) to receive both INGRESS (req) and
@@ -511,6 +591,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     last_sweep = time.time()
+    control_next = time.time()
     log("listening on %s ports=%s pid=%d" %
         (iface or "<all>", sorted(ports), os.getpid()))
 
@@ -541,6 +622,17 @@ def main():
                 log("DEBUG rx=%d" % dbg_rx)
                 dbg_last = time.time()
         except socket.timeout:
+            if control_client is not None and time.time() >= control_next:
+                try:
+                    ports, iface, restart_requested, control_status = _run_control_tick(
+                        ports, iface, control_run, control_client)
+                    log("remote control: %s" % control_status)
+                    if restart_requested:
+                        log("remote control: restart required; exiting for SysV wrapper")
+                        running[0] = False
+                except Exception as e:
+                    log("WARN: remote control tick failed (%s)" % nt_control.safe_message(e))
+                control_next = time.time() + control_interval
             if dbg:
                 log("DEBUG timeout rx=%d" % dbg_rx)
                 dbg_last = time.time()

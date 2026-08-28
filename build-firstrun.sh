@@ -1,6 +1,6 @@
 #!/bin/sh
 # build-firstrun.sh — produce the single-file first-run installer bundle.
-# Includes the native C++ capture and C++ shipper payloads when present.
+# Includes Python remote control and native C++ payloads.
 set -e
 cd "$(dirname "$0")"
 OUT=install-firstrun-el68.sh
@@ -13,6 +13,12 @@ cp install-oldkernel.sh "$OUT"
     printf '#__SHIP_B64__\n'
     base64 nt-ship.py
     printf '#__END_SHIP__\n'
+    printf '#__CONTROL_B64__\n'
+    base64 nt_control.py
+    printf '#__END_CONTROL__\n'
+    printf '#__CONTROL_RUN_B64__\n'
+    base64 nt-control.py
+    printf '#__END_CONTROL_RUN__\n'
     printf '#__CPP_SHIP_B64__\n'
     base64 nt-ship-cpp.cpp
     printf '#__END_CPP_SHIP__\n'

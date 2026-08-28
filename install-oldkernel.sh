@@ -30,6 +30,7 @@ PORTS="${NT_PORTS:-80,8003,8005,8007,8009,8010,8011}"
 WORKERS="${NT_WORKERS:-1}"   # PACKET_FANOUT workers (needs kernel>=3.1)
 SHIPPERS="${NT_SHIP_THREADS:-8}"  # concurrent hub POST threads
 KIT_URLS="${NT_HUB:-}"
+CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 
 log()  { echo "[nt-legacy] $*"; }
 die()  { echo "[nt-legacy] FAIL: $*"; exit 1; }
@@ -88,8 +89,10 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
             | base64 -d > "$WORKDIR/nt-sniff.py" 2>/dev/null
         sed -n '/^#__SHIP_B64__$/,/^#__END_SHIP__$/p' "$SELF" | sed '1d;$d' \
             | base64 -d > "$WORKDIR/nt-ship.py" 2>/dev/null
-        sed -n '/^#__CPP_SHIP_B64__$/,/^#__END_CPP_SHIP__$/p' "$SELF" | sed '1d;$d' \
-            | base64 -d > "$WORKDIR/nt-ship-cpp.cpp" 2>/dev/null
+        sed -n '/^#__CPP_SHIP_B64__$/,/^#__END_CPP_SHIP__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-ship-cpp.cpp" 2>/dev/null
+        sed -n '/^#__CONTROL_B64__$/,/^#__END_CONTROL__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt_control.py" 2>/dev/null
+        sed -n '/^#__CONTROL_RUN_B64__$/,/^#__END_CONTROL_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-control.py" 2>/dev/null
+        # Control client is optional at runtime; missing token keeps it disabled.
         sed -n '/^#__CPP_B64__$/,/^#__END_CPP__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-sniff-cpp.cpp" 2>/dev/null
         sed -n '/^#__CPP_MAKE_B64__$/,/^#__END_CPP_MAKE__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/Makefile" 2>/dev/null
         sed -n '/^#__CPP_RUN_B64__$/,/^#__END_CPP_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-run-cpp.sh" 2>/dev/null
@@ -104,7 +107,7 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         [ -n "$KIT_URLS" ] || die "kit files missing, no embedded payload, cannot derive hub URL — pass --hub http://HUB:30105/oldkernel"
         log "first run: fetching kit from $KIT_URLS -> $WORKDIR"
         have curl || have wget || die "neither curl nor wget present and no embedded payload"
-        for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
+        for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
             fetch "$KIT_URLS/$f" "$WORKDIR/$f.new" || die "cannot download $f from $KIT_URLS"
             mv "$WORKDIR/$f.new" "$WORKDIR/$f"
         done
@@ -130,14 +133,15 @@ if [ "$MODE" = "uninstall" ]; then
     [ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1 || true
     if have chkconfig; then chkconfig networktracing-legacy off >/dev/null 2>&1 || true; fi
     rm -f "$INIT"
-    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py"; do
+    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py"; do
         for p in $(pgrep -f "$pattern" 2>/dev/null || true); do
             [ "$p" = "$$" ] || kill "$p" 2>/dev/null || true
         done
     done
-    rm -rf "$PREFIX"
+    rm -f "$INIT" "$CONTROL_TOKEN_FILE" /var/run/networktracing-legacy.pid
+    rm -rf "$PREFIX" /tmp/ntkit
     RESIDUE=""
-    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py"; do
+    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py"; do
         pgrep -f "$pattern" >/dev/null 2>&1 && RESIDUE="$RESIDUE procs-alive"
     done
     [ -e "$INIT" ] && RESIDUE="$RESIDUE init-script-present"
@@ -161,9 +165,9 @@ if [ "${NT_CAPTURE_MODE:-python}" = "cpp" ]; then
     have g++ || die "NT_CAPTURE_MODE=cpp requires g++ on target"
     have python || die "python shipper required on target"
 else
-    have python || die "python (2.6/2.7) required on the node"
-    python -c 'import sys; assert sys.version_info >= (2,6) and sys.version_info < (3,)' \
-        || die "python 2.6/2.7 required"
+    have python || die "python (2.6+) required on the node"
+    python -c 'import sys; assert sys.version_info >= (2,6)' \
+        || die "python 2.6+ required"
 fi
 
 [ -n "$ENDPOINT" ] || die "--endpoint http://hub:port required"
@@ -193,16 +197,26 @@ have_root || die "must run as root (try: sudo sh $0 ...)"
 
 # ---------------------------------------------------------------- install
 mkdir -p "$PREFIX" || die "mkdir $PREFIX failed"
-for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh; do
+# Python control client is bundled for CentOS 6.x nodes.
+for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh; do
     [ -f "$SCRIPT_DIR/$f" ] || die "bundle incomplete: missing $f"
 done
 cp "$SCRIPT_DIR"/nt-sniff.py "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-ship.py  "$PREFIX/"
+cp "$SCRIPT_DIR"/nt_control.py "$PREFIX/"
+cp "$SCRIPT_DIR"/nt-control.py "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-ship-cpp.cpp "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-sniff-cpp.cpp "$PREFIX/"
 cp "$SCRIPT_DIR"/Makefile "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-run-cpp.sh "$PREFIX/"
-chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-run-cpp.sh
+if [ -f "$SCRIPT_DIR/install-oldkernel.sh" ]; then
+    cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install-oldkernel.sh"
+    cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install.sh"
+elif [ -n "${SELF:-}" ] && [ -f "$SELF" ]; then
+    cp "$SELF" "$PREFIX/install-oldkernel.sh"
+    cp "$SELF" "$PREFIX/install.sh"
+fi
+chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-control.py "$PREFIX"/nt_control.py "$PREFIX"/nt-run-cpp.sh "$PREFIX"/install*.sh 2>/dev/null || true
 
 # privilege model: copy the interpreter, grant IT cap_net_raw, run sniffer
 # as a locked account. Falls back to root when setcap/SELinux refuses.
@@ -227,6 +241,12 @@ else
 fi
 
 mkdir -p /var/lib/networktracing
+if [ -n "${NT_CONTROL_TOKEN:-}" ]; then
+    umask 077
+    printf '%s' "$NT_CONTROL_TOKEN" > "$CONTROL_TOKEN_FILE"
+    unset NT_CONTROL_TOKEN
+    chmod 600 "$CONTROL_TOKEN_FILE"
+fi
 if [ "$SNIFF_AS" != root ]; then
     chown "$SNIFF_USER" /var/lib/networktracing 2>/dev/null || true
 fi
@@ -270,17 +290,29 @@ PREFIX=$PREFIX
 SNIFF_USER=$SNIFF_AS
 export NT_SHIP_THREADS=$SHIPPERS
 PIDFILE=/var/run/networktracing-legacy.pid
+CONTROL_FILE=/var/lib/networktracing/remote-desired.json
+CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
+CONTROL_RUN=/var/lib/networktracing
 
 case "\$1" in
     start)
         if pgrep -f "\\\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\\\$PREFIX/nt-sniff-cpp" >/dev/null; then
             echo "already running"; exit 0
         fi
+        if [ -s "\$CONTROL_TOKEN_FILE" ]; then
+            export NT_CONTROL_TOKEN_FILE="\$CONTROL_TOKEN_FILE"
+            export NT_CONTROL_ENDPOINT="$ENDPOINT"
+            export NT_CONTROL_RUN="\$CONTROL_RUN"
+            export NT_NODE_NAME="\${NT_NODE_NAME:-\$(hostname -s)}"
+        fi
         nohup sh -c "$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1" >/dev/null 2>&1 &
         echo \$! > "\$PIDFILE"
         sleep 1
         pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null || { echo "sniffer failed to start"; exit 1; }
         echo "networktracing-legacy started"
+        ;;
+    reload)
+        "\$0" restart
         ;;
     stop)
         for pattern in "\$PREFIX/nt-sniff.py" "\$PREFIX/nt-sniff-cpp" "\$PREFIX/nt-ship.py"; do
@@ -297,11 +329,24 @@ case "\$1" in
         fi
         echo "stopped"; exit 3
         ;;
+    uninstall)
+        \$0 stop
+        if [ -f "\$PREFIX/install-oldkernel.sh" ]; then
+            sh "\$PREFIX/install-oldkernel.sh" --uninstall
+        elif [ -f "\$PREFIX/install.sh" ]; then
+            sh "\$PREFIX/install.sh" --uninstall
+        else
+            if command -v chkconfig >/dev/null 2>&1; then chkconfig networktracing-legacy off >/dev/null 2>&1 || true; fi
+            rm -f "\$INIT" "\$PIDFILE"
+            rm -rf "\$PREFIX" /tmp/ntkit
+            echo "networktracing-legacy uninstalled"
+        fi
+        ;;
     restart)
         \$0 stop; sleep 1; \$0 start
         ;;
     *)
-        echo "Usage: \$0 {start|stop|status|restart}"; exit 2
+        echo "Usage: \$0 {start|stop|status|restart|reload|uninstall}"; exit 2
         ;;
 esac
 exit 0
@@ -319,4 +364,6 @@ pgrep -f "$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "$PREFIX/nt-sniff-cpp" >/d
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
 log "Logs: $PREFIX/sniff.log $PREFIX/ship.log"
-log "Uninstall: sh $SCRIPT_DIR/install-oldkernel.sh --uninstall"
+log "Uninstall: sudo -n sh $PREFIX/install-oldkernel.sh --uninstall"
+log "       or: sudo -n service networktracing-legacy uninstall"
+exit 0
