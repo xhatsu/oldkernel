@@ -12,9 +12,9 @@
   - `pytest test_nt_control.py`: 4/4 tests PASS.
   - `python3 -m py_compile`: nt-sniff.py, nt-ship.py, nt-control.py, nt_control.py compiled cleanly.
   - `sh oldkernel/el68-smoke.sh`: PASS for downloader and python compile assertions (fixed shell operator precedence).
-  - `sh oldkernel/build-firstrun.sh`: bundle successfully built (120,892 bytes) with PACKET_MMAP (TPACKET_V2) zero-copy ring buffer, dual-path 802.1Q cBPF, MAX_FLOWS / MAX_QUEUE bounding, and mkstemp hardening.
+  - `sh oldkernel/build-firstrun.sh`: bundle successfully built (121,038 bytes) with PACKET_MMAP (TPACKET_V2) zero-copy ring buffer, dual-path 802.1Q cBPF (BPF_LDX + correct jump offsets), MAX_FLOWS / MAX_QUEUE bounding, and mkstemp hardening.
   - `sh bootstrap/package-oldkernel.sh`: verified extraction comparison against source files (BOOTSTRAP-PACKAGE PASS, bundle: 36,987,722 bytes).
-  - PACKET_MMAP (TPACKET_V2) 4MB 2048-frame zero-copy circular ring buffer implemented in `nt-sniff-cpp.cpp` with automatic fallback to standard socket `recv()`.
+  - PACKET_MMAP (TPACKET_V2) 4MB 2048-frame zero-copy circular ring buffer implemented in `nt-sniff-cpp.cpp` with in-kernel cBPF port filtering and automatic fallback to standard socket `recv()`.
   - Native `uninstall` action in service script features 3s SIGKILL escalation.
   - Cleaned up stuck background tasks and verified instantaneous uninstall/reinstall cycles.
   - `make -C agent test bundle`: Go agent binaries (`aarch64`, `x86_64`) built from source and packaged into `bootstrap/bundle.tar.gz` (36,987,722 bytes).
