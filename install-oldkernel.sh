@@ -31,6 +31,7 @@ WORKERS="${NT_WORKERS:-1}"   # PACKET_FANOUT workers (needs kernel>=3.1)
 SHIPPERS="${NT_SHIP_THREADS:-8}"  # concurrent hub POST threads
 KIT_URLS="${NT_HUB:-}"
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
+CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
 
 log()  { echo "[nt-legacy] $*"; }
 die()  { echo "[nt-legacy] FAIL: $*"; exit 1; }
@@ -40,6 +41,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --endpoint) ENDPOINT="$2"; shift 2 ;;
         --hub)      KIT_URLS="$2"; shift 2 ;;
+        --mode)     CAPTURE_MODE="$2"; shift 2 ;;
         --check)    MODE=check; shift ;;
         --uninstall) MODE=uninstall; shift ;;
         *) die "unknown arg: $1" ;;
