@@ -12,11 +12,11 @@
   - `pytest test_nt_control.py`: 4/4 tests PASS.
   - `python3 -m py_compile`: nt-sniff.py, nt-ship.py, nt-control.py, nt_control.py compiled cleanly.
   - `sh oldkernel/el68-smoke.sh`: PASS for downloader and python compile assertions (fixed shell operator precedence).
-  - `sh oldkernel/build-firstrun.sh`: bundle successfully built (114,174 bytes) with dual-path 802.1Q cBPF, MAX_FLOWS / MAX_QUEUE bounding, and mkstemp hardening.
-  - `sh bootstrap/package-oldkernel.sh`: verified extraction comparison against source files (BOOTSTRAP-PACKAGE PASS, bundle: 36,987,721 bytes).
+  - `sh oldkernel/build-firstrun.sh`: bundle successfully built (114,266 bytes) with dual-path 802.1Q cBPF, MAX_FLOWS / MAX_QUEUE bounding, mkstemp hardening, and --mode CLI argument support.
+  - `sh bootstrap/package-oldkernel.sh`: verified extraction comparison against source files (BOOTSTRAP-PACKAGE PASS, bundle: 36,987,722 bytes).
   - Native `uninstall` action in service script features 3s SIGKILL escalation.
   - Cleaned up stuck background tasks and verified instantaneous uninstall/reinstall cycles.
-  - `make -C agent test bundle`: Go agent binaries (`aarch64`, `x86_64`) built from source and packaged into `bootstrap/bundle.tar.gz` (36,987,721 bytes).
+  - `make -C agent test bundle`: Go agent binaries (`aarch64`, `x86_64`) built from source and packaged into `bootstrap/bundle.tar.gz` (36,987,722 bytes).
   - Modern Go agent (`networktracing.service`) installed via one-line bootstrap command and actively capturing live L7 traffic on VM. Fixed `kyanos-http` response status parsing (extracts 200, 404, 500 status codes, duration_ms, and req/resp byte sizes).
   - Synchronized `README.md` and `bundle/README.md` with explicit One-Line Fast Install & Uninstall commands for modern eBPF and legacy nodes.
   - Bootstrap distribution server active on port 30105 (`/healthz`).
