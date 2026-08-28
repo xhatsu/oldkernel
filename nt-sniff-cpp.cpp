@@ -266,7 +266,7 @@ static void emit_event(const Event &e) {
   if (e.has_status) std::cout << ",\"status\":" << e.status; else std::cout << ",\"status\":null";
   if (e.has_duration) std::cout << ",\"duration_ms\":" << e.duration_ms; else std::cout << ",\"duration_ms\":null";
   if (e.has_resp) std::cout << ",\"resp_bytes\":" << e.resp_bytes; else std::cout << ",\"resp_bytes\":null";
-  std::cout << "}\n"; std::cout.flush();
+  std::cout << "}\n";
 }
 
 static void flush_oldest(std::map<PacketKey, std::vector<Pending> > &pending) {
@@ -608,10 +608,14 @@ int main(int argc, char **argv) {
           hdr->tp_status = TP_STATUS_KERNEL; /* Return frame ownership to kernel */
           ring.frame_idx = (ring.frame_idx + 1) % ring.frame_nr;
         }
+        std::cout.flush();
       } else {
         if (pfd.revents & POLLIN) {
           ssize_t n = recv(fd, fallback_buf, 65536, 0);
-          if (n > 0) handle_packet(fallback_buf, (size_t)n, node, ports, flows, pending);
+          if (n > 0) {
+            handle_packet(fallback_buf, (size_t)n, node, ports, flows, pending);
+            std::cout.flush();
+          }
         }
       }
     }
@@ -619,6 +623,7 @@ int main(int argc, char **argv) {
     time_t now = time(NULL);
     if (now - last >= 1) {
       sweep(flows, pending, now);
+      std::cout.flush();
       last = now;
     }
   }

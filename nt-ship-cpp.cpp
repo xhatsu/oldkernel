@@ -103,12 +103,13 @@ int main(int argc,char **argv) {
     struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
     int rc = select(1, &r, NULL, NULL, &tv);
     if (rc > 0 && FD_ISSET(0, &r)) {
-      if (!std::getline(std::cin, line)) break;
-      if (!line.empty()) {
-        buf.push_back(line);
-        if (buf.size() >= MAX_QUEUE) {
+      while (running && std::cin && buf.size() < MAX_QUEUE) {
+        if (!std::getline(std::cin, line)) break;
+        if (!line.empty()) buf.push_back(line);
+        if (buf.size() >= MAX_BATCH) {
           send_batches(endpoint, node, spool_path, &buf, false);
         }
+        if (std::cin.rdbuf()->in_avail() <= 0) break;
       }
     }
     time_t now = time(NULL);
