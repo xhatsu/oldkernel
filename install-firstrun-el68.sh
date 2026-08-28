@@ -116,10 +116,17 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
     fi
 
     chmod 755 "$WORKDIR"/nt-*.py "$WORKDIR"/nt-run-cpp.sh 2>/dev/null || true
-    python -m py_compile "$WORKDIR/nt-sniff.py" 2>/dev/null \
-        || die "nt-sniff.py does not compile under node python"
-    python -m py_compile "$WORKDIR/nt-ship.py" 2>/dev/null \
-        || die "nt-ship.py does not compile under node python"
+    PYBIN=""
+    for c in python python2 python3; do
+        if have "$c"; then PYBIN=$(command -v "$c"); break; fi
+    done
+    if [ "$CAPTURE_MODE" != "cpp" ]; then
+        [ -n "$PYBIN" ] || die "python (2.6+) missing on target node — pass --mode cpp if g++ is available"
+        "$PYBIN" -m py_compile "$WORKDIR/nt-sniff.py" 2>/dev/null \
+            || die "nt-sniff.py does not compile under node python"
+        "$PYBIN" -m py_compile "$WORKDIR/nt-ship.py" 2>/dev/null \
+            || die "nt-ship.py does not compile under node python"
+    fi
     # version sentinel: reject stale pre-py2.6-fix kits (they py_compile fine
     # but crash on first packet — silent capture loss)
     grep -q "def b2i" "$WORKDIR/nt-sniff.py" \
@@ -163,13 +170,16 @@ case "$(uname -r)" in
 esac
 
 # C++ native mode uses the shipped binary; do not require Python 2.6.
-if [ "${NT_CAPTURE_MODE:-python}" = "cpp" ]; then
-    have g++ || die "NT_CAPTURE_MODE=cpp requires g++ on target"
-    have python || die "python shipper required on target"
+if [ "$CAPTURE_MODE" = "cpp" ]; then
+    have g++ || die "--mode cpp requires g++ on target node"
 else
-    have python || die "python (2.6+) required on the node"
-    python -c 'import sys; assert sys.version_info >= (2,6)' \
-        || die "python 2.6+ required"
+    PYBIN=""
+    for c in python python2 python3; do
+        if have "$c"; then PYBIN=$(command -v "$c"); break; fi
+    done
+    [ -n "$PYBIN" ] || die "python (2.6+) required on target node"
+    "$PYBIN" -c 'import sys; assert sys.version_info >= (2,6)' 2>/dev/null \
+        || die "python 2.6+ required on target node"
 fi
 
 [ -n "$ENDPOINT" ] || die "--endpoint http://hub:port required"
@@ -220,23 +230,26 @@ elif [ -n "${SELF:-}" ] && [ -f "$SELF" ]; then
 fi
 chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-control.py "$PREFIX"/nt_control.py "$PREFIX"/nt-run-cpp.sh "$PREFIX"/install*.sh 2>/dev/null || true
 
-# privilege model: copy the interpreter, grant IT cap_net_raw, run sniffer
-# as a locked account. Falls back to root when setcap/SELinux refuses.
+# privilege model: copy the interpreter or native binary, grant IT cap_net_raw
 SNIFF_AS=root
-PYBIN=$(command -v python)
+PYBIN=""
+for c in python python2 python3; do
+    if have "$c"; then PYBIN=$(command -v "$c"); break; fi
+done
 if have setcap && have useradd; then
     id "$SNIFF_USER" >/dev/null 2>&1 || useradd -r -s /sbin/nologin "$SNIFF_USER" 2>/dev/null || true
-    cp "$PYBIN" "$PREFIX/python-capnetraw" 2>/dev/null || true
-    # NOTE: chown BEFORE setcap — chown clears file capabilities
-    # (proven on el6: setcap-then-chown left getcap empty -> EPERM)
-    if [ -f "$PREFIX/python-capnetraw" ] \
-       && chown "$SNIFF_USER" "$PREFIX"/python-capnetraw 2>/dev/null \
-       && setcap cap_net_raw+ep "$PREFIX/python-capnetraw" 2>/dev/null; then
-        SNIFF_AS="$SNIFF_USER"
-        log "rootless mode: cap_net_raw on private interpreter, user=$SNIFF_USER"
-    else
-        rm -f "$PREFIX/python-capnetraw"
-        log "WARN: setcap path failed — sniffer will run as root"
+    if [ "$CAPTURE_MODE" != "cpp" ] && [ -n "$PYBIN" ]; then
+        cp "$PYBIN" "$PREFIX/python-capnetraw" 2>/dev/null || true
+        # NOTE: chown BEFORE setcap — chown clears file capabilities
+        if [ -f "$PREFIX/python-capnetraw" ] \
+           && chown "$SNIFF_USER" "$PREFIX"/python-capnetraw 2>/dev/null \
+           && setcap cap_net_raw+ep "$PREFIX/python-capnetraw" 2>/dev/null; then
+            SNIFF_AS="$SNIFF_USER"
+            log "rootless mode: cap_net_raw on private interpreter, user=$SNIFF_USER"
+        else
+            rm -f "$PREFIX/python-capnetraw"
+            log "WARN: setcap path failed — sniffer will run as root"
+        fi
     fi
 else
     log "WARN: setcap/useradd absent — sniffer will run as root"
@@ -263,14 +276,21 @@ fi
 
 # sniffer stdout must FEED the shipper's stdin; starting them separately
 # leaves events stranded in sniff.log (proven on el6). Build one pipeline.
-# Choose native C++ only when explicitly requested; Python remains default.
-CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
-# Native C++ builds from the copied source and uses the native C++ shipper.
-# The default capture mode remains Python for compatibility.
 if [ "$CAPTURE_MODE" = "cpp" ]; then
     CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
     (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
-    SNIFF_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS"
+    if [ -f "$PREFIX/nt-sniff-cpp" ] && have setcap && have useradd; then
+        chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
+        if setcap cap_net_raw+ep "$PREFIX/nt-sniff-cpp" 2>/dev/null; then
+            SNIFF_AS="$SNIFF_USER"
+            log "rootless mode: cap_net_raw on native C++ binary, user=$SNIFF_USER"
+        fi
+    fi
+    if [ "$SNIFF_AS" != root ]; then
+        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS'"
+    else
+        SNIFF_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS"
+    fi
     SHIP_CMD="exec $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --spool /var/lib/networktracing/sniff-spool.jsonl"
     log "native C++ capture + shipper selected"
 else
