@@ -14,12 +14,25 @@
 #include <signal.h>
 
 static const size_t MAX_BATCH = 400;
-static const size_t MAX_QUEUE = 128;
+static const size_t MAX_QUEUE = 4000;
 static const int FLUSH_SEC = 5;
 static const int RETRY_SEC = 60;
 static volatile sig_atomic_t running = 1;
 static void stop_signal(int) { running = 0; }
 static void logmsg(const std::string &s) { std::cerr << "nt-ship-cpp: " << s << std::endl; }
+static std::string jsonq(const std::string &s) {
+  std::string x = "\"";
+  for (size_t i = 0; i < s.size(); ++i) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == '\\' || c == '"') { x += '\\'; x += (char)c; }
+    else if (c == '\n') x += "\\n";
+    else if (c == '\r') x += "\\r";
+    else if (c == '\t') x += "\\t";
+    else if (c < 32) x += '?';
+    else x += (char)c;
+  }
+  return x + "\"";
+}
 static std::string shellq(const std::string &s) {
   std::string o = "'";
   for (size_t i=0;i<s.size();++i) { if (s[i]=='\'') o += "'\\''"; else o += s[i]; }
@@ -41,10 +54,14 @@ static std::string json_array(const std::vector<std::string> &a) {
 }
 static bool post(const std::string &endpoint, const std::string &node,
                  const std::vector<std::string> &batch) {
-  std::string body="{\"node\":\""+node+"\",\"events\":"+json_array(batch)+"}";
-  std::string code_file = "/tmp/nt_code." + number_string(getpid());
+  std::string body="{\"node\":"+jsonq(node)+",\"events\":"+json_array(batch)+"}";
+  char code_tmpl[] = "/tmp/nt_code_XXXXXX";
+  int tmp_fd = mkstemp(code_tmpl);
+  if (tmp_fd < 0) return false;
+  close(tmp_fd);
+  std::string code_file = code_tmpl;
   std::string cmd="curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- "+shellq(endpoint+"/api/ingest")+" > "+shellq(code_file);
-  FILE *fp=popen(cmd.c_str(),"w"); if(!fp)return false;
+  FILE *fp=popen(cmd.c_str(),"w"); if(!fp){ unlink(code_file.c_str()); return false; }
   fwrite(body.data(), 1, body.size(), fp);
   int rc=pclose(fp);
   std::string code;
@@ -87,7 +104,12 @@ int main(int argc,char **argv) {
     int rc = select(1, &r, NULL, NULL, &tv);
     if (rc > 0 && FD_ISSET(0, &r)) {
       if (!std::getline(std::cin, line)) break;
-      if (!line.empty()) buf.push_back(line);
+      if (!line.empty()) {
+        buf.push_back(line);
+        if (buf.size() >= MAX_QUEUE) {
+          send_batches(endpoint, node, spool_path, &buf, false);
+        }
+      }
     }
     time_t now = time(NULL);
     if (now - last >= FLUSH_SEC || buf.size() >= MAX_BATCH) {

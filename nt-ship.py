@@ -209,8 +209,6 @@ def main():
             break
     log("stopped (%d events pending on exit)" % len(buf))
 
-    log("stopped (%d events pending on exit)" % len(buf))
-
 
 def _spool_append(path, batch):
     d = os.path.dirname(path)

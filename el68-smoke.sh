@@ -22,7 +22,7 @@ python -c 'import sys; assert sys.version_info >= (2,6) and sys.version_info < (
     && ok "python version OK ($(python -V 2>&1))" \
     || bad "python not 2.6/2.7"
 
-have curl || have wget && ok "downloader present" || bad "no curl/wget"
+( have curl || have wget ) && ok "downloader present" || bad "no curl/wget"
 
 if have getenforce; then info "selinux=$(getenforce)"; else info "selinux absent/disabled"; fi
 

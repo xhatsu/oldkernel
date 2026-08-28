@@ -70,8 +70,8 @@ for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run
 done
 
 if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
-    WORKDIR=/tmp/ntkit
-    mkdir -p "$WORKDIR" || die "cannot create $WORKDIR"
+    WORKDIR=$(mktemp -d /tmp/ntkit.XXXXXX 2>/dev/null || mktemp -d -t 'ntkit')
+    [ -d "$WORKDIR" ] || die "cannot create temporary workdir"
 
     # --- source 2: embedded payload -------------------------------------
     SELF="$0"
@@ -138,8 +138,8 @@ if [ "$MODE" = "uninstall" ]; then
             [ "$p" = "$$" ] || kill "$p" 2>/dev/null || true
         done
     done
-    rm -f "$INIT" "$CONTROL_TOKEN_FILE" /var/run/networktracing-legacy.pid
-    rm -rf "$PREFIX" /tmp/ntkit
+    rm -f "$CONTROL_TOKEN_FILE" /var/run/networktracing-legacy.pid
+    rm -rf "$PREFIX" /tmp/ntkit*
     RESIDUE=""
     for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py"; do
         pgrep -f "$pattern" >/dev/null 2>&1 && RESIDUE="$RESIDUE procs-alive"
@@ -317,7 +317,15 @@ case "\$1" in
     stop)
         for pattern in "\$PREFIX/nt-sniff.py" "\$PREFIX/nt-sniff-cpp" "\$PREFIX/nt-ship.py"; do
             for p in \$(pgrep -f "\$pattern" 2>/dev/null || true); do
-                [ "\$p" = "\$\$" ] || kill "\$p" 2>/dev/null || true
+                if [ -n "\$p" ] && [ "\$p" != "\$\$" ]; then
+                    kill "\$p" 2>/dev/null || true
+                    _w=0
+                    while [ \$_w -lt 3 ] && kill -0 "\$p" 2>/dev/null; do
+                        sleep 1
+                        _w=\$((_w + 1))
+                    done
+                    kill -0 "\$p" 2>/dev/null && kill -9 "\$p" 2>/dev/null || true
+                fi
             done
         done
         rm -f "\$PIDFILE"

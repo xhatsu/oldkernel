@@ -43,9 +43,10 @@ static const size_t MAX_PENDING = 8192;
 static const size_t MAX_HEADER = 262144;
 static const unsigned FLOW_TTL = 300;
 static const unsigned PENDING_TTL = 5;
-static const unsigned ACCEPT = 0x40000;
+static const unsigned ACCEPT = 2048;
 static const int SO_ATTACH_FILTER_OLD = 26;
 static const unsigned short ETH_P_IP_HOST = 0x0800;
+static const unsigned short ETH_P_8021Q_HOST = 0x8100;
 
 static std::string trim(const std::string &s) {
   size_t a = 0, b = s.size();
@@ -218,9 +219,16 @@ static void sweep(std::map<std::string, Flow> &flows, std::map<PacketKey, std::v
   std::map<PacketKey, std::vector<Pending> >::iterator p, pn;
   for (p = pending.begin(); p != pending.end();) {
     pn = p; ++pn;
-    if (!p->second.empty() && current_ms - p->second[0].started_ms > (long long)PENDING_TTL * 1000LL) {
-      emit_event(p->second[0].ev); pending.erase(p);
+    size_t i = 0;
+    while (i < p->second.size()) {
+      if (current_ms - p->second[i].started_ms > (long long)PENDING_TTL * 1000LL) {
+        emit_event(p->second[i].ev);
+        p->second.erase(p->second.begin() + i);
+      } else {
+        ++i;
+      }
     }
+    if (p->second.empty()) pending.erase(p);
     p = pn;
   }
 }
@@ -277,7 +285,19 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     return true;
   }
   if (!dst_mon) return false;
-  std::string fk = key_string(a, sport, b, dport); Flow &fl = flows[fk]; fl.touched = now; fl.buf.append(payload, plen);
+  std::string fk = key_string(a, sport, b, dport);
+  if (flows.find(fk) == flows.end() && flows.size() >= MAX_FLOWS) {
+    time_t oldest_t = now + 1;
+    std::map<std::string, Flow>::iterator oldest_it = flows.begin();
+    for (std::map<std::string, Flow>::iterator fi = flows.begin(); fi != flows.end(); ++fi) {
+      if (fi->second.touched < oldest_t) {
+        oldest_t = fi->second.touched;
+        oldest_it = fi;
+      }
+    }
+    if (oldest_it != flows.end()) flows.erase(oldest_it);
+  }
+  Flow &fl = flows[fk]; fl.touched = now; fl.buf.append(payload, plen);
   if (fl.buf.size() > MAX_HEADER) { flows.erase(fk); return false; }
   while (true) {
     size_t start = find_http_start(fl.buf);
@@ -296,30 +316,71 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
 }
 
 static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
-  /* BPF is optional at startup: the parser still performs the same checks
-     after bind. This keeps the binary usable on kernels rejecting the
-     generated filter, while logging the degraded mode. */
-  std::vector<struct sock_filter> f; size_t i; unsigned reject = 0, accept;
-  /* Ethernet IPv4, TCP, then destination OR source monitored port. */
-  reject = 4 + (unsigned)ports.size() * 4 + 1; accept = reject + 1;
+  if (ports.empty()) return false;
+  std::vector<struct sock_filter> f; size_t i;
+  /* Dual-path cBPF: Path A (standard IPv4) and Path B (802.1Q VLAN tagged IPv4). */
+  unsigned N = (unsigned)ports.size();
+  unsigned reject = 11 + N * 4;
+  unsigned accept = reject + 1;
   struct sock_filter x;
 #define ADD(C,J,T,K) do { x.code=(C); x.jt=(J); x.jf=(T); x.k=(K); f.push_back(x); } while(0)
-  ADD(BPF_LD|BPF_H|BPF_ABS,0,0,12); ADD(BPF_JMP|BPF_JEQ|BPF_K,0,reject-2,ETH_P_IP_HOST);
-  ADD(BPF_LD|BPF_B|BPF_ABS,0,0,23); ADD(BPF_JMP|BPF_JEQ|BPF_K,0,reject-4,IPPROTO_TCP);
-  ADD(BPF_LD|BPF_B|BPF_MSH,0,0,14);
+  /* [0] Load EtherType at offset 12 */
+  ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 12);
+  /* [1] If standard IPv4 (0x0800), jump to Path A start (index 8 + 2*N) */
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, (unsigned)(6 + 2 * N), 0, ETH_P_IP_HOST);
+
+  /* --- Path B: 802.1Q VLAN (index 2) --- */
+  /* [2] If not 802.1Q (0x8100), reject */
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - 2 - 1), ETH_P_8021Q_HOST);
+  /* [3] Load encapsulated EtherType at offset 16 */
+  ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 16);
+  /* [4] If encapsulated != IPv4, reject */
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - 4 - 1), ETH_P_IP_HOST);
+  /* [5] Load IP protocol at offset 27 (23 + 4) */
+  ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 27);
+  /* [6] If not TCP, reject */
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - 6 - 1), IPPROTO_TCP);
+  /* [7] Load IHL at offset 18 (14 + 4) */
+  ADD(BPF_LD|BPF_B|BPF_MSH, 0, 0, 18);
+  /* Destination port checks for VLAN */
+  for (i = 0; i < ports.size(); ++i) {
+    ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 20);
+    unsigned jt = accept - (unsigned)f.size() - 1;
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, 0, ports[i]);
+  }
+  /* Source port checks for VLAN */
+  for (i = 0; i < ports.size(); ++i) {
+    ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 18);
+    unsigned jt = accept - (unsigned)f.size() - 1;
+    unsigned jf = (i < ports.size() - 1) ? 0 : (reject - (unsigned)f.size() - 1);
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
+  }
+
+  /* --- Path A: Standard IPv4 (index 8 + 2*N) --- */
+  /* Load IP protocol at offset 23 */
+  ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 23);
+  /* If not TCP, reject */
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), IPPROTO_TCP);
+  /* Load IHL at offset 14 */
+  ADD(BPF_LD|BPF_B|BPF_MSH, 0, 0, 14);
+  /* Destination port checks for standard IPv4 */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 16);
     unsigned jt = accept - (unsigned)f.size() - 1;
-    unsigned jf = 0;
-    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, 0, ports[i]);
   }
+  /* Source port checks for standard IPv4 */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 14);
     unsigned jt = accept - (unsigned)f.size() - 1;
     unsigned jf = (i < ports.size() - 1) ? 0 : (reject - (unsigned)f.size() - 1);
     ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
   }
-  ADD(BPF_RET|BPF_K,0,0,0); ADD(BPF_RET|BPF_K,0,0,ACCEPT);
+
+  /* [reject] Drop packet */
+  ADD(BPF_RET|BPF_K, 0, 0, 0);
+  /* [accept] Accept packet (2048 bytes) */
+  ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
 #undef ADD
   if (f.size() > 4096) return false;
   struct sock_fprog prog; prog.len = (unsigned short)f.size(); prog.filter = &f[0]; return setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER_OLD, &prog, sizeof(prog)) == 0;
