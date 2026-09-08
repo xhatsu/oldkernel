@@ -6,7 +6,8 @@
  * correlation -> JSONL stdout -> nt-ship.py.
  *
  * Build target: CentOS 6 / GCC 4.4, Linux 2.6.32. No third-party deps.
- * This is intentionally HTTP header-only. TLS remains ecapture's concern.
+ * SOAP body inspection is explicitly opt-in and bounded. TLS remains
+ * ecapture's concern.
  */
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -44,6 +45,9 @@ static const size_t MAX_FLOWS = 8192;
 static const size_t MAX_PENDING = 8192;
 static const size_t MAX_PENDING_PER_FLOW = 32;
 static const size_t MAX_HEADER = 262144;
+static const size_t MAX_WSSE_BODY_BYTES = 65536;
+static const size_t MAX_WSSE_BODY_FLOWS = 256;
+static const size_t MAX_WSSE_USERNAME = 200;
 static const size_t MAX_BATCH = 400;
 static const size_t MAX_QUEUE = 4000;
 static const int FLUSH_SEC = 5;
@@ -169,7 +173,20 @@ struct Event {
   bool has_status, has_duration, has_resp;
   Event() : ts(0), caller_port(0), dst_port(0), req_bytes(0), resp_bytes(0), status(0), duration_ms(0), has_status(false), has_duration(false), has_resp(false) {}
 };
-struct Flow { std::string buf; time_t touched; Flow() : touched(time(NULL)) {} };
+struct RequestMeta {
+  std::string content_type, transfer_encoding;
+  size_t content_length;
+  bool has_content_length;
+  RequestMeta() : content_length(0), has_content_length(false) {}
+};
+struct Flow {
+  std::string buf;
+  time_t touched;
+  Event event;
+  size_t body_goal;
+  bool awaiting_body;
+  Flow() : touched(time(NULL)), body_goal(0), awaiting_body(false) {}
+};
 struct Pending {
   Event ev;
   long long started_ms;
@@ -192,7 +209,22 @@ typedef FlowKey PacketKey;
 
 static void logmsg(const std::string &s) { fprintf(stderr, "nt-sniff-cpp: %s\n", s.c_str()); fflush(stderr); }
 
-static bool parse_request(const char *data, size_t len, Event *e) {
+static bool parse_decimal_size(const char *p, size_t n, size_t *out) {
+  while (n && isspace((unsigned char)*p)) { ++p; --n; }
+  while (n && isspace((unsigned char)p[n - 1])) --n;
+  if (!n) return false;
+  size_t value = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (p[i] < '0' || p[i] > '9') return false;
+    unsigned digit = (unsigned)(p[i] - '0');
+    if (value > (size_t)-1 / 10 || value * 10 > (size_t)-1 - digit) return false;
+    value = value * 10 + digit;
+  }
+  *out = value;
+  return true;
+}
+
+static bool parse_request(const char *data, size_t len, Event *e, RequestMeta *meta) {
   const char *end = data + len;
   const char *p = data;
   const char *eol = (const char *)memchr(p, '\n', end - p);
@@ -241,6 +273,12 @@ static bool parse_request(const char *data, size_t len, Event *e) {
         e->user_agent.assign(val_start, val_len);
       } else if (hname_len == 15 && !strncasecmp(p, "x-forwarded-for", 15)) {
         e->xff.assign(val_start, val_len);
+      } else if (meta && hname_len == 12 && !strncasecmp(p, "content-type", 12)) {
+        meta->content_type.assign(val_start, val_len);
+      } else if (meta && hname_len == 14 && !strncasecmp(p, "content-length", 14)) {
+        meta->has_content_length = parse_decimal_size(val_start, val_len, &meta->content_length);
+      } else if (meta && hname_len == 17 && !strncasecmp(p, "transfer-encoding", 17)) {
+        meta->transfer_encoding.assign(val_start, val_len);
       }
     }
     p = line_end + 1;
@@ -250,6 +288,236 @@ static bool parse_request(const char *data, size_t len, Event *e) {
   if (e->scheme.empty()) e->scheme = "none";
   if (e->trace_id.empty()) e->traceparent = make_traceparent(&e->trace_id);
   return true;
+}
+
+static bool is_wsse_namespace(const std::string &uri) {
+  return uri == "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" ||
+         uri == "http://schemas.xmlsoap.org/ws/2002/07/secext" ||
+         uri == "http://schemas.xmlsoap.org/ws/2002/12/secext" ||
+         uri == "http://schemas.xmlsoap.org/ws/2003/06/secext";
+}
+
+static bool is_soap_content_type(const std::string &value) {
+  std::string media = lower(value);
+  size_t semi = media.find(';');
+  if (semi != std::string::npos) media.erase(semi);
+  media = trim(media);
+  return media == "text/xml" || media == "application/xml" ||
+         media == "application/soap+xml" ||
+         (media.size() > 4 && media.compare(media.size() - 4, 4, "+xml") == 0);
+}
+
+static void split_qname(const std::string &name, std::string *prefix, std::string *local) {
+  size_t colon = name.find(':');
+  if (colon == std::string::npos) { prefix->clear(); *local = name; }
+  else { *prefix = name.substr(0, colon); *local = name.substr(colon + 1); }
+}
+
+static bool append_utf8(unsigned long cp, std::string *out) {
+  if (cp == 0 || cp > 0x10ffffUL || (cp >= 0xd800UL && cp <= 0xdfffUL)) return false;
+  if (cp < 0x80) out->push_back((char)cp);
+  else if (cp < 0x800) {
+    out->push_back((char)(0xc0 | (cp >> 6)));
+    out->push_back((char)(0x80 | (cp & 0x3f)));
+  } else if (cp < 0x10000) {
+    out->push_back((char)(0xe0 | (cp >> 12)));
+    out->push_back((char)(0x80 | ((cp >> 6) & 0x3f)));
+    out->push_back((char)(0x80 | (cp & 0x3f)));
+  } else {
+    out->push_back((char)(0xf0 | (cp >> 18)));
+    out->push_back((char)(0x80 | ((cp >> 12) & 0x3f)));
+    out->push_back((char)(0x80 | ((cp >> 6) & 0x3f)));
+    out->push_back((char)(0x80 | (cp & 0x3f)));
+  }
+  return true;
+}
+
+static bool xml_unescape(const std::string &text, std::string *out) {
+  for (size_t i = 0; i < text.size();) {
+    if (text[i] != '&') { out->push_back(text[i++]); continue; }
+    size_t semi = text.find(';', i + 1);
+    if (semi == std::string::npos || semi - i > 12) return false;
+    std::string ent = text.substr(i + 1, semi - i - 1);
+    if (ent == "amp") out->push_back('&');
+    else if (ent == "lt") out->push_back('<');
+    else if (ent == "gt") out->push_back('>');
+    else if (ent == "quot") out->push_back('"');
+    else if (ent == "apos") out->push_back('\'');
+    else if (!ent.empty() && ent[0] == '#') {
+      char *endp = NULL;
+      unsigned long cp = strtoul(ent.c_str() + ((ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')) ? 2 : 1),
+                                 &endp, (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')) ? 16 : 10);
+      if (!endp || *endp || !append_utf8(cp, out)) return false;
+    } else return false;
+    i = semi + 1;
+  }
+  return true;
+}
+
+static bool valid_utf8_username(const std::string &s) {
+  if (s.empty() || s.size() > MAX_WSSE_USERNAME * 4) return false;
+  size_t characters = 0;
+  for (size_t i = 0; i < s.size();) {
+    unsigned char c = (unsigned char)s[i];
+    unsigned long cp = c;
+    if (c < 0x80) { ++i; }
+    else {
+    size_t need = (c >= 0xc2 && c <= 0xdf) ? 1 :
+                  (c >= 0xe0 && c <= 0xef) ? 2 :
+                  (c >= 0xf0 && c <= 0xf4) ? 3 : 99;
+    if (need == 99 || i + need >= s.size()) return false;
+    for (size_t j = 1; j <= need; ++j)
+      if (((unsigned char)s[i + j] & 0xc0) != 0x80) return false;
+    if (need == 2 && c == 0xe0 && (unsigned char)s[i + 1] < 0xa0) return false;
+    if (need == 2 && c == 0xed && (unsigned char)s[i + 1] >= 0xa0) return false;
+    if (need == 3 && c == 0xf0 && (unsigned char)s[i + 1] < 0x90) return false;
+    if (need == 3 && c == 0xf4 && (unsigned char)s[i + 1] >= 0x90) return false;
+    cp = c & ((1U << (7 - need - 1)) - 1);
+    for (size_t j = 1; j <= need; ++j) cp = (cp << 6) | ((unsigned char)s[i + j] & 0x3f);
+    i += need + 1;
+    }
+    if (++characters > MAX_WSSE_USERNAME) return false;
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) ||
+        (cp >= 0xe000 && cp <= 0xf8ff) ||
+        (cp >= 0xf0000 && cp <= 0xffffd) ||
+        (cp >= 0x100000 && cp <= 0x10fffd) ||
+        (cp >= 0xfdd0 && cp <= 0xfdef) || (cp & 0xffffUL) >= 0xfffeUL ||
+        cp == 0x00ad || cp == 0x061c || cp == 0x06dd || cp == 0x070f ||
+        cp == 0x180e || (cp >= 0x200b && cp <= 0x200f) ||
+        (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2060 && cp <= 0x206f) ||
+        cp == 0xfeff) return false;
+  }
+  return true;
+}
+
+struct XmlFrame {
+  std::map<std::string, std::string> ns;
+  std::string qname, uri, local;
+};
+
+static bool parse_xml_name(const std::string &body, size_t limit, size_t *pos,
+                           std::string *name) {
+  size_t start = *pos;
+  while (*pos < limit) {
+    unsigned char c = (unsigned char)body[*pos];
+    if (!(isalnum(c) || c == '_' || c == '-' || c == '.' || c == ':')) break;
+    ++*pos;
+  }
+  if (*pos == start || *pos - start > 256) return false;
+  name->assign(body, start, *pos - start);
+  return true;
+}
+
+static std::string extract_wsse_username(const std::string &body) {
+  if (body.empty() || body.size() > MAX_WSSE_BODY_BYTES ||
+      body.find('\0') != std::string::npos) return "";
+  std::string lowered = lower(body);
+  if (lowered.find("<!doctype") != std::string::npos ||
+      lowered.find("<!entity") != std::string::npos) return "";
+
+  std::vector<XmlFrame> stack;
+  size_t token_depth = 0, username_depth = 0, pos = 0;
+  std::string token_uri, chars, result;
+  bool username_bad = false;
+  while (pos < body.size()) {
+    size_t lt = body.find('<', pos);
+    if (lt == std::string::npos) {
+      if (username_depth && !username_bad && !xml_unescape(body.substr(pos), &chars)) username_bad = true;
+      break; /* a bounded prefix is commonly incomplete */
+    }
+    if (username_depth && !username_bad && lt > pos &&
+        !xml_unescape(body.substr(pos, lt - pos), &chars)) username_bad = true;
+    if (chars.size() > MAX_WSSE_USERNAME * 4 + 2) { chars.clear(); username_bad = true; }
+
+    if (body.compare(lt, 4, "<!--") == 0) {
+      size_t end = body.find("-->", lt + 4); if (end == std::string::npos) break;
+      pos = end + 3; continue;
+    }
+    if (body.compare(lt, 9, "<![CDATA[") == 0) {
+      size_t end = body.find("]]>", lt + 9); if (end == std::string::npos) break;
+      if (username_depth && !username_bad) chars.append(body, lt + 9, end - lt - 9);
+      pos = end + 3; continue;
+    }
+    if (body.compare(lt, 2, "<?") == 0) {
+      size_t end = body.find("?>", lt + 2); if (end == std::string::npos) break;
+      pos = end + 2; continue;
+    }
+    if (body.compare(lt, 2, "<!") == 0) return "";
+
+    bool closing = (lt + 1 < body.size() && body[lt + 1] == '/');
+    size_t p = lt + (closing ? 2 : 1);
+    std::string qname;
+    if (!parse_xml_name(body, body.size(), &p, &qname)) break;
+    if (closing) {
+      while (p < body.size() && isspace((unsigned char)body[p])) ++p;
+      if (p >= body.size() || body[p] != '>') break;
+      if (stack.empty()) break;
+      std::string prefix, local; split_qname(qname, &prefix, &local);
+      XmlFrame &top = stack.back();
+      if (top.qname != qname || top.local != local) break;
+      size_t depth = stack.size();
+      if (username_depth == depth) {
+        std::string username = trim(chars);
+        if (!username_bad && valid_utf8_username(username) && result.empty()) result = username;
+        username_depth = 0; chars.clear(); username_bad = false;
+      }
+      if (token_depth == depth) { token_depth = 0; token_uri.clear(); }
+      stack.pop_back(); pos = p + 1;
+      if (!result.empty()) return result;
+      continue;
+    }
+
+    XmlFrame frame;
+    if (stack.size() >= 64) return "";
+    if (!stack.empty()) frame.ns = stack.back().ns;
+    bool self_closing = false, complete = false;
+    size_t attr_count = 0;
+    while (p < body.size()) {
+      while (p < body.size() && isspace((unsigned char)body[p])) ++p;
+      if (p >= body.size()) break;
+      if (body[p] == '>') { ++p; complete = true; break; }
+      if (body[p] == '/' && p + 1 < body.size() && body[p + 1] == '>') {
+        p += 2; self_closing = true; complete = true; break;
+      }
+      std::string aname;
+      if (!parse_xml_name(body, body.size(), &p, &aname)) break;
+      if (++attr_count > 128) return "";
+      while (p < body.size() && isspace((unsigned char)body[p])) ++p;
+      if (p >= body.size() || body[p++] != '=') break;
+      while (p < body.size() && isspace((unsigned char)body[p])) ++p;
+      if (p >= body.size() || (body[p] != '\'' && body[p] != '"')) break;
+      char quote = body[p++]; size_t value_start = p;
+      while (p < body.size() && body[p] != quote) ++p;
+      if (p >= body.size()) break;
+      std::string value;
+      if (!xml_unescape(body.substr(value_start, p - value_start), &value)) return "";
+      ++p;
+      if (aname == "xmlns") frame.ns[""] = value;
+      else if (aname.compare(0, 6, "xmlns:") == 0) frame.ns[aname.substr(6)] = value;
+      if (frame.ns.size() > 64) return "";
+    }
+    if (!complete) break;
+    std::string prefix, local; split_qname(qname, &prefix, &local);
+    std::map<std::string, std::string>::const_iterator ns = frame.ns.find(prefix);
+    frame.uri = (ns == frame.ns.end()) ? "" : ns->second;
+    frame.qname = qname;
+    frame.local = local;
+    stack.push_back(frame);
+    size_t depth = stack.size();
+    if (!token_depth && local == "UsernameToken" && is_wsse_namespace(frame.uri)) {
+      token_depth = depth; token_uri = frame.uri;
+    } else if (token_depth && depth == token_depth + 1 &&
+               local == "Username" && frame.uri == token_uri) {
+      username_depth = depth; chars.clear(); username_bad = false;
+    }
+    if (self_closing) {
+      if (username_depth == depth) username_depth = 0;
+      if (token_depth == depth) { token_depth = 0; token_uri.clear(); }
+      stack.pop_back();
+    }
+    pos = p;
+  }
+  return result;
 }
 
 static bool parse_response(const char *data, size_t len, int *status, unsigned *clen) {
@@ -402,6 +670,32 @@ static size_t find_http_start(const std::string &s) {
 }
 
 static bool g_monitored_ports[65536];
+static size_t g_wsse_body_bytes = 0;
+
+static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
+                          uint32_t d_ip, unsigned dport,
+                          std::map<PacketKey, std::vector<Pending> > &pending) {
+  PacketKey rk;
+  rk.s_ip = d_ip; rk.sport = (uint16_t)dport;
+  rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
+  if (pending.find(rk) == pending.end() && pending.size() >= MAX_PENDING) {
+    flush_oldest(pending);
+  }
+  std::vector<Pending> &queue = pending[rk];
+  if (queue.size() >= MAX_PENDING_PER_FLOW) {
+    emit_event(queue[0].ev);
+    queue.erase(queue.begin());
+  }
+  queue.push_back(Pending(e, now_ms()));
+}
+
+static size_t active_wsse_flows(const std::map<FlowKey, Flow> &flows) {
+  size_t count = 0;
+  std::map<FlowKey, Flow>::const_iterator it;
+  for (it = flows.begin(); it != flows.end(); ++it)
+    if (it->second.awaiting_body) ++count;
+  return count;
+}
 
 static bool handle_packet(const unsigned char *buf, size_t n, const std::string &node, const std::vector<unsigned> &ports,
                           std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending) {
@@ -470,7 +764,20 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   if (flows.find(fk) == flows.end() && flows.size() >= MAX_FLOWS) {
     flows.erase(flows.begin());
   }
-  Flow &fl = flows[fk]; fl.touched = now; fl.buf.append(payload, plen);
+  Flow &fl = flows[fk]; fl.touched = now;
+  if (fl.awaiting_body) {
+    size_t remaining = fl.body_goal > fl.buf.size() ? fl.body_goal - fl.buf.size() : 0;
+    if (remaining) fl.buf.append(payload, plen < remaining ? plen : remaining);
+    std::string username = extract_wsse_username(fl.buf);
+    if (!username.empty() || fl.buf.size() >= fl.body_goal) {
+      Event event = fl.event;
+      if (!username.empty()) { event.user = username; event.scheme = "wsse"; }
+      flows.erase(fk);
+      queue_request(event, s_ip, sport, d_ip, dport, pending);
+    }
+    return true;
+  }
+  fl.buf.append(payload, plen);
   if (fl.buf.size() > MAX_HEADER) { flows.erase(fk); return false; }
   while (true) {
     size_t start = find_http_start(fl.buf);
@@ -478,19 +785,29 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     if (start > 0) fl.buf.erase(0, start);
     size_t end = fl.buf.find("\r\n\r\n");
     if (end == std::string::npos) break;
-    Event e; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = ip_to_str(s_ip); e.caller_port = sport; e.dst_ip = ip_to_str(d_ip); e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
-    if (!parse_request(fl.buf.data(), end, &e)) { fl.buf.erase(0, end + 4); continue; }
+    Event e; RequestMeta meta; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = ip_to_str(s_ip); e.caller_port = sport; e.dst_ip = ip_to_str(d_ip); e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
+    if (!parse_request(fl.buf.data(), end, &e, &meta)) { fl.buf.erase(0, end + 4); continue; }
     fl.buf.erase(0, end + 4);
-    PacketKey rk; rk.s_ip = d_ip; rk.sport = (uint16_t)dport; rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
-    if (pending.find(rk) == pending.end() && pending.size() >= MAX_PENDING) {
-      flush_oldest(pending);
+    if (e.user == "-anonymous-" && g_wsse_body_bytes &&
+        is_soap_content_type(meta.content_type) && meta.has_content_length &&
+        meta.content_length > 0 &&
+        lower(meta.transfer_encoding).find("chunked") == std::string::npos &&
+        active_wsse_flows(flows) < MAX_WSSE_BODY_FLOWS) {
+      fl.event = e;
+      fl.awaiting_body = true;
+      fl.body_goal = meta.content_length < g_wsse_body_bytes ? meta.content_length : g_wsse_body_bytes;
+      if (fl.body_goal > MAX_WSSE_BODY_BYTES) fl.body_goal = MAX_WSSE_BODY_BYTES;
+      if (fl.buf.size() > fl.body_goal) fl.buf.resize(fl.body_goal);
+      std::string username = extract_wsse_username(fl.buf);
+      if (!username.empty() || fl.buf.size() >= fl.body_goal) {
+        Event event = fl.event;
+        if (!username.empty()) { event.user = username; event.scheme = "wsse"; }
+        flows.erase(fk);
+        queue_request(event, s_ip, sport, d_ip, dport, pending);
+      }
+      return true;
     }
-    std::vector<Pending> &queue = pending[rk];
-    if (queue.size() >= MAX_PENDING_PER_FLOW) {
-      emit_event(queue[0].ev);
-      queue.erase(queue.begin());
-    }
-    queue.push_back(Pending(e, now_ms()));
+    queue_request(e, s_ip, sport, d_ip, dport, pending);
   }
   if (fl.buf.empty()) {
     flows.erase(fk);
@@ -620,13 +937,57 @@ static bool setup_mmap_ring(int fd, MmapRing &mr) {
 
 static int run_fixture() {
   std::string req = "GET /api/items?x=1 HTTP/1.1\r\nHost: api.local\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nTraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\n\r\n";
-  Event e; e.ts = 1700000000; e.host = "cpp-node"; e.service = "port:8080"; e.caller = "10.0.0.9"; e.caller_port = 51000; e.dst_ip = "10.0.0.2"; e.dst_port = 8080; e.req_bytes = (unsigned)req.size(); parse_request(req.data(), req.size() - 4, &e); e.status = 200; e.has_status = true; e.duration_ms = 3; e.has_duration = true; e.resp_bytes = 42; e.has_resp = true; emit_event(e); return 0;
+  Event e; RequestMeta meta; e.ts = 1700000000; e.host = "cpp-node"; e.service = "port:8080"; e.caller = "10.0.0.9"; e.caller_port = 51000; e.dst_ip = "10.0.0.2"; e.dst_port = 8080; e.req_bytes = (unsigned)req.size(); parse_request(req.data(), req.size() - 4, &e, &meta); e.status = 200; e.has_status = true; e.duration_ms = 3; e.has_duration = true; e.resp_bytes = 42; e.has_resp = true; emit_event(e); return 0;
+}
+
+static int run_wsse_fixture() {
+  const char *namespaces[] = {
+    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
+    "http://schemas.xmlsoap.org/ws/2002/07/secext",
+    "http://schemas.xmlsoap.org/ws/2002/12/secext",
+    "http://schemas.xmlsoap.org/ws/2003/06/secext"
+  };
+  for (size_t i = 0; i < 4; ++i) {
+    std::string body = "<s:Envelope xmlns:s='urn:soap' xmlns:w='" + std::string(namespaces[i]) +
+      "'><s:Header><w:UsernameToken><w:Username>native.fixture</w:Username>"
+      "<w:Password>SENSITIVE_PASSWORD</w:Password></w:UsernameToken></s:Header>";
+    std::string user = extract_wsse_username(body);
+    if (user != "native.fixture") return 3;
+    std::cout << user << "\n";
+  }
+  std::string malicious = "<!DOCTYPE x [<!ENTITY pw 'secret'>]><w:UsernameToken xmlns:w='" +
+    std::string(namespaces[0]) + "'><w:Username>&pw;</w:Username></w:UsernameToken>";
+  if (!extract_wsse_username(malicious).empty()) return 4;
+  std::string wrong_ns = "<w:UsernameToken xmlns:w='urn:not-wsse'><w:Username>wrong</w:Username></w:UsernameToken>";
+  if (!extract_wsse_username(wrong_ns).empty()) return 5;
+  std::string unnamespaced = "<UsernameToken><Username>wrong</Username></UsernameToken>";
+  if (!extract_wsse_username(unnamespaced).empty()) return 6;
+  std::string escaped = "<w:UsernameToken xmlns:w='" + std::string(namespaces[0]) +
+    "'><w:Username>native&amp;fixture</w:Username>";
+  if (extract_wsse_username(escaped) != "native&fixture") return 7;
+  std::string too_long = "<w:UsernameToken xmlns:w='" + std::string(namespaces[0]) +
+    "'><w:Username>" + std::string(MAX_WSSE_USERNAME + 1, 'x') + "</w:Username>";
+  if (!extract_wsse_username(too_long).empty()) return 8;
+  return 0;
+}
+
+static bool parse_wsse_size(const char *value, size_t *result) {
+  if (!value || !*value) return false;
+  size_t n = 0;
+  if (!parse_decimal_size(value, strlen(value), &n) || n > MAX_WSSE_BODY_BYTES) return false;
+  *result = n;
+  return true;
 }
 
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
+  if (argc > 1 && !strcmp(argv[1], "--wsse-fixture")) return run_wsse_fixture();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
   std::string endpoint;
+  const char *wsse_env = getenv("NT_WSSE_BODY_BYTES");
+  if (wsse_env && !parse_wsse_size(wsse_env, &g_wsse_body_bytes)) {
+    fprintf(stderr, "wsse body bytes must be in range 0..65536\n"); return 2;
+  }
   for (i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i];
     else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
@@ -638,10 +999,16 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--endpoint") && i + 1 < argc) endpoint = argv[++i];
     else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i; /* ignored: 0 disk write */
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--wsse-body-bytes") && i + 1 < argc) {
+      if (!parse_wsse_size(argv[++i], &g_wsse_body_bytes)) {
+        fprintf(stderr, "wsse body bytes must be in range 0..65536\n"); return 2;
+      }
+    }
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [-j workers]\n");
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [-j workers] [--wsse-body-bytes 0..65536]\n");
       return 0;
     }
+    else { fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
   }
   if (ports.empty()) { ports.push_back(80); ports.push_back(8003); ports.push_back(8005); ports.push_back(8007); ports.push_back(8009); ports.push_back(8010); ports.push_back(8011); }
   (void)workers;
@@ -687,6 +1054,9 @@ int main(int argc, char **argv) {
     logmsg("PACKET_MMAP (TPACKET_V2) zero-copy ring enabled (4MB, 2048 frames)");
   } else {
     logmsg("WARN: PACKET_MMAP setup failed, falling back to standard socket recv");
+  }
+  if (g_wsse_body_bytes) {
+    logmsg("WSSE UsernameToken inspection enabled (bounded to " + number_string(g_wsse_body_bytes) + " bytes/request)");
   }
   if (!g_endpoint.empty()) {
     logmsg("single-binary in-memory mode: shipping directly to " + g_endpoint + " (0 disk I/O)");

@@ -37,16 +37,10 @@ int main(int argc, char **argv) {
     if (valid_port(p)) ports.push_back(p);
   }
   if (ports.empty()) {
-    ports.push_back(80);
     ports.push_back(8001);
-    ports.push_back(8003);
-    ports.push_back(8005);
-    ports.push_back(8007);
-    ports.push_back(8009);
-    ports.push_back(8010);
-    ports.push_back(8011);
   }
 
+  g_wsse_body_bytes = 16384;
   init_rng();
   memset(g_monitored_ports, 0, sizeof(g_monitored_ports));
   for (size_t k = 0; k < ports.size(); ++k) {
@@ -61,10 +55,7 @@ int main(int argc, char **argv) {
   }
 
   PcapFileHeader fh;
-  if (!f.read((char *)&fh, sizeof(fh))) {
-    std::cerr << "Failed to read PCAP header\n";
-    return 1;
-  }
+  if (!f.read((char *)&fh, sizeof(fh))) return 1;
 
   bool swap = (fh.magic == 0xd4c3b2a1);
   uint32_t linktype = fh.linktype;
@@ -81,9 +72,6 @@ int main(int argc, char **argv) {
   std::vector<unsigned char> eth_buf;
   size_t pkt_count = 0;
 
-  timeval t_start, t_end;
-  gettimeofday(&t_start, NULL);
-
   while (f) {
     PcapPacketHeader ph;
     if (!f.read((char *)&ph, sizeof(ph))) break;
@@ -99,7 +87,7 @@ int main(int argc, char **argv) {
     const unsigned char *pkt_ptr = &raw_buf[0];
     size_t pkt_len = incl_len;
 
-    if (linktype == 113) { // Linux cooked capture (SLL)
+    if (linktype == 113) {
       if (pkt_len < 16) continue;
       eth_buf.resize(14 + pkt_len - 16);
       memset(&eth_buf[0], 0, 12);
@@ -115,14 +103,5 @@ int main(int argc, char **argv) {
 
   flush_all_pending(pending);
   std::cout.flush();
-
-  gettimeofday(&t_end, NULL);
-  double elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_usec - t_start.tv_usec) / 1e6;
-
-  std::cerr << "CPP PCAP Engine Run:"
-            << " Packets=" << pkt_count
-            << " Time=" << elapsed << "s"
-            << " Rate=" << (long)(pkt_count / (elapsed > 0 ? elapsed : 0.001)) << " pkts/s\n";
-
   return 0;
 }

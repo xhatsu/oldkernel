@@ -178,6 +178,11 @@ Validates Hub connectivity, network interface, and dependencies without modifyin
 sudo sh install-oldkernel.sh --check --endpoint http://$HUB:30102
 ```
 
+The installed process tree is fail-closed behind `taskset`: it can execute on
+only one logical CPU and inherits finite memory, descriptor, output-file, and
+core-dump limits. The installer selects the first CPU in its allowed cpuset;
+set `NT_CPU_CORE=N` to choose another allowed core. `taskset` is mandatory.
+
 ### 2. Production Installation (Python Mode)
 Installs the standard Python 2.6 capture pipeline:
 ```sh
@@ -237,7 +242,7 @@ sudo sh install-oldkernel.sh --uninstall
 
 ## Operational Notes & Hardening
 
-- **WSSE is explicitly opt-in (Python mode only):** The default `0` byte
+- **WSSE is explicitly opt-in:** The default `0` byte
   window is strictly header-only. To inspect the beginning of XML/SOAP bodies,
   install with `NT_WSSE_BODY_BYTES=16384` or
   `--wsse-body-bytes 16384`. Accepted values are `0..65536`. Only OASIS 2004
@@ -246,10 +251,9 @@ sudo sh install-oldkernel.sh --uninstall
   nonces, and timestamps are discarded. Body buffering is additionally capped
   at 256 concurrent flows (16 MiB at the maximum window). Requests need an XML
   content type and `Content-Length`; chunked SOAP bodies remain anonymous.
-- **C++03 remains header-only:** The native C++ sniffer does not implement body
-  capture or WSSE parsing. The installer rejects a non-zero WSSE window in C++
-  mode instead of implying support. Use Python mode when WSSE attribution is
-  required.
+- **Python/C++03 parity:** Both capture modes enforce the same bounded WSSE
+  body window, namespace allowlist, `Content-Length` requirement, concurrent
+  flow ceiling, and secret-scrubbing contract.
 - **Network Outage Resilience:** When the Hub is unreachable, events are automatically spooled to `/var/lib/networktracing/sniff-spool.jsonl`. Once connectivity is restored, the shipper drains the spool with backoff retry.
 - **Memory & Flow Bounds:** The in-memory TCP flow table is hard-capped at 8,192 concurrent flows with a 300-second TTL sweep.
 - **Reconfiguring Monitored Ports:** To monitor new ports, re-run the installer with the updated `NT_PORTS` list:

@@ -21,6 +21,14 @@ assert e['source_probe'] == 'pcap-http-cpp'
 assert len(e) == 24
 print('Sniffer ASAN fixture: PASS (contract fields: 24)')
 
+wsse_raw = subprocess.check_output([str(out_sniff), '--wsse-fixture'], text=True)
+assert wsse_raw.splitlines() == ['native.fixture'] * 4
+assert 'SENSITIVE_PASSWORD' not in wsse_raw
+bad = subprocess.run([str(out_sniff), '--wsse-body-bytes', '65537'],
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+assert bad.returncode == 2
+print('Sniffer bounded WSSE fixture: PASS (4 namespaces, DTD rejection, bounds)')
+
 # 2. Test Shipper under AddressSanitizer & UndefinedBehaviorSanitizer
 src_ship = Path(__file__).with_name('nt-ship-cpp.cpp')
 out_ship = Path('/tmp/nt-ship-cpp-edge-test')

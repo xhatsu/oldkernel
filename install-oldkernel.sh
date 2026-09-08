@@ -18,7 +18,8 @@
 #   sh install-oldkernel.sh --uninstall
 #
 # Env overrides: NT_IFACE=eth1 NT_PORTS=80,... NT_HUB=http://HUB:30105/oldkernel
-#                NT_WSSE_BODY_BYTES=0..65536 (Python mode only; default 0)
+#                NT_WSSE_BODY_BYTES=0..65536 (Python/C++ modes; default 0)
+#                NT_CPU_CORE=N (default: first CPU allowed for the installer)
 set -u
 
 PREFIX=/opt/networktracing-legacy
@@ -34,6 +35,7 @@ KIT_URLS="${NT_HUB:-}"
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
 WSSE_BODY_BYTES="${NT_WSSE_BODY_BYTES:-0}"
+CPU_CORE="${NT_CPU_CORE:-}"
 
 log()  { echo "[nt-legacy] $*"; }
 die()  { echo "[nt-legacy] FAIL: $*"; exit 1; }
@@ -56,10 +58,10 @@ case "$WSSE_BODY_BYTES" in
 esac
 [ "$WSSE_BODY_BYTES" -le 65536 ] \
     || die "WSSE body byte window must be in range 0..65536"
-if [ "$CAPTURE_MODE" = "cpp" ] && [ "$WSSE_BODY_BYTES" -ne 0 ]; then
-    die "WSSE body capture is supported only in Python mode; C++03 remains header-only"
-fi
-
+[ "$WORKERS" = 1 ] || {
+    log "WARN: NT_WORKERS=$WORKERS overridden to 1 by the host safety boundary"
+    WORKERS=1
+}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SCRIPT_DIR=""
 
 have_root() { [ "$(id -u)" = "0" ]; }
@@ -79,7 +81,7 @@ fetch() { # fetch <url> <dest>
 #   3. fetched from the hub bootstrap server (--hub / derived from endpoint)
 # Uninstall never needs the kit.
 need_kit=0
-for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh; do
+for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh; do
     [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$f" ] || need_kit=1
 done
 
@@ -110,10 +112,11 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         sed -n '/^#__CPP_B64__$/,/^#__END_CPP__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-sniff-cpp.cpp" 2>/dev/null
         sed -n '/^#__CPP_MAKE_B64__$/,/^#__END_CPP_MAKE__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/Makefile" 2>/dev/null
         sed -n '/^#__CPP_RUN_B64__$/,/^#__END_CPP_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-run-cpp.sh" 2>/dev/null
+        sed -n '/^#__RESOURCE_GUARD_B64__$/,/^#__END_RESOURCE_GUARD__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-resource-guard.sh" 2>/dev/null
     fi
 
     # --- source 3: hub bootstrap server ---------------------------------
-    if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ] || [ ! -s "$WORKDIR/nt-sniff-cpp.cpp" ] || [ ! -s "$WORKDIR/Makefile" ]; then
+    if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ] || [ ! -s "$WORKDIR/nt-sniff-cpp.cpp" ] || [ ! -s "$WORKDIR/Makefile" ] || [ ! -s "$WORKDIR/nt-resource-guard.sh" ]; then
         if [ -z "$KIT_URLS" ] && [ -n "$ENDPOINT" ]; then
             HUBHOST=$(printf %s "$ENDPOINT" | sed -n 's#^\(https\?://[^/:]*\).*$#\1#p')
             [ -n "$HUBHOST" ] && KIT_URLS="$HUBHOST:30105/oldkernel"
@@ -121,13 +124,13 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         [ -n "$KIT_URLS" ] || die "kit files missing, no embedded payload, cannot derive hub URL — pass --hub http://HUB:30105/oldkernel"
         log "first run: fetching kit from $KIT_URLS -> $WORKDIR"
         have curl || have wget || die "neither curl nor wget present and no embedded payload"
-        for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
+        for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
             fetch "$KIT_URLS/$f" "$WORKDIR/$f.new" || die "cannot download $f from $KIT_URLS"
             mv "$WORKDIR/$f.new" "$WORKDIR/$f"
         done
     fi
 
-    chmod 755 "$WORKDIR"/nt-*.py "$WORKDIR"/nt-run-cpp.sh 2>/dev/null || true
+    chmod 755 "$WORKDIR"/nt-*.py "$WORKDIR"/nt-run-cpp.sh "$WORKDIR"/nt-resource-guard.sh 2>/dev/null || true
     PYBIN=""
     for c in python python2 python3; do
         if have "$c"; then PYBIN=$(command -v "$c"); break; fi
@@ -203,6 +206,19 @@ fi
 
 [ -n "$ENDPOINT" ] || die "--endpoint http://hub:port required"
 
+# Runtime containment is mandatory. Pick the first CPU from the installer's
+# allowed cpuset unless explicitly selected, then prove it is bindable before
+# making any host changes. Missing taskset therefore fails closed.
+have taskset || die "taskset required for the one-core runtime safety boundary"
+if [ -z "$CPU_CORE" ]; then
+    CPU_CORE=$(awk '/^Cpus_allowed_list:/ { gsub(/[,-].*/, "", $2); print $2; exit }' /proc/self/status 2>/dev/null)
+fi
+case "$CPU_CORE" in
+    ''|*[!0-9]*) die "cannot select an allowed CPU core (set NT_CPU_CORE=N)" ;;
+esac
+taskset -c "$CPU_CORE" true >/dev/null 2>&1 \
+    || die "CPU core $CPU_CORE is outside this host/process cpuset"
+
 if have curl; then
     PROBE=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
         -d '{"node":"legacy-compat-probe","events":[]}' \
@@ -243,7 +259,7 @@ rm -f "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship-cpp"
 
 mkdir -p "$PREFIX" || die "mkdir $PREFIX failed"
 # Python control client is bundled for CentOS 6.x nodes.
-for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh; do
+for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh; do
     [ -f "$SCRIPT_DIR/$f" ] || die "bundle incomplete: missing $f"
 done
 cp "$SCRIPT_DIR"/nt-sniff.py "$PREFIX/"
@@ -254,6 +270,7 @@ cp "$SCRIPT_DIR"/nt-ship-cpp.cpp "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-sniff-cpp.cpp "$PREFIX/"
 cp "$SCRIPT_DIR"/Makefile "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-run-cpp.sh "$PREFIX/"
+cp "$SCRIPT_DIR"/nt-resource-guard.sh "$PREFIX/"
 if [ -f "$SCRIPT_DIR/install-oldkernel.sh" ]; then
     cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install-oldkernel.sh"
     cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install.sh"
@@ -261,7 +278,7 @@ elif [ -n "${SELF:-}" ] && [ -f "$SELF" ]; then
     cp "$SELF" "$PREFIX/install-oldkernel.sh"
     cp "$SELF" "$PREFIX/install.sh"
 fi
-chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-control.py "$PREFIX"/nt_control.py "$PREFIX"/nt-run-cpp.sh "$PREFIX"/install*.sh 2>/dev/null || true
+chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-control.py "$PREFIX"/nt_control.py "$PREFIX"/nt-run-cpp.sh "$PREFIX"/nt-resource-guard.sh "$PREFIX"/install*.sh 2>/dev/null || true
 
 # privilege model: copy the interpreter or native binary, grant IT cap_net_raw
 SNIFF_AS=root
@@ -324,9 +341,9 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
         fi
     fi
     if [ "$SNIFF_AS" != root ]; then
-        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT' >>\$PREFIX/sniff.log 2>&1"
+        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --wsse-body-bytes $WSSE_BODY_BYTES' >>\$PREFIX/sniff.log 2>&1"
     else
-        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT >>\$PREFIX/sniff.log 2>&1"
+        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --wsse-body-bytes $WSSE_BODY_BYTES >>\$PREFIX/sniff.log 2>&1"
     fi
     log "native C++ single-binary capture + shipping selected"
 else
@@ -358,6 +375,7 @@ PREFIX=$PREFIX
 SNIFF_USER=$SNIFF_AS
 export NT_SHIP_THREADS=$SHIPPERS
 export NT_WSSE_BODY_BYTES=$WSSE_BODY_BYTES
+CPU_CORE=$CPU_CORE
 PIDFILE=/var/run/networktracing-legacy.pid
 CONTROL_FILE=/var/lib/networktracing/remote-desired.json
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
@@ -374,7 +392,8 @@ case "\$1" in
             export NT_CONTROL_RUN="\$CONTROL_RUN"
             export NT_NODE_NAME="\${NT_NODE_NAME:-\$(hostname -s)}"
         fi
-        nohup sh -c "$RUN_CMD" >/dev/null 2>&1 &
+        # Fail closed behind one inherited CPU affinity and finite host limits.
+        nohup "\$PREFIX/nt-resource-guard.sh" "\$CPU_CORE" sh -c "$RUN_CMD" >/dev/null 2>&1 &
         echo \$! > "\$PIDFILE"
         sleep 1
         pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null || { echo "sniffer failed to start"; exit 1; }
@@ -463,8 +482,9 @@ if ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-c
 fi
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
+log "Safety: cpu=$CPU_CORE (one logical core), memory=256MiB, fds=1024, output-file=32MiB, core-dumps=off"
 if [ "$WSSE_BODY_BYTES" -ne 0 ]; then
-    log "WSSE UsernameToken inspection: Python-only, bounded to $WSSE_BODY_BYTES bytes/request"
+    log "WSSE UsernameToken inspection: bounded to $WSSE_BODY_BYTES bytes/request"
 else
     log "WSSE UsernameToken inspection: disabled (header-only default)"
 fi

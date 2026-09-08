@@ -89,9 +89,12 @@ def test_offline_python(pcap_path, ports, wsse_bytes):
         "sample": out[0] if out else None
     }
 
-def test_offline_cpp(pcap_path, ports):
+def test_offline_cpp(pcap_path, ports, wsse_bytes=0):
     t0 = time.time()
-    cmd = [os.path.join(OLD_DIR, "pcap_test_cpp"), pcap_path] + [str(p) for p in ports]
+    cmd = [os.path.join(OLD_DIR, "pcap_test_cpp"), pcap_path]
+    if wsse_bytes:
+        cmd += ["--wsse-body-bytes", str(wsse_bytes)]
+    cmd += [str(p) for p in ports]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     elapsed = time.time() - t0
     lines = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
@@ -105,6 +108,8 @@ def test_offline_cpp(pcap_path, ports):
         "services": sorted(list(set(e["service"] for e in events))),
         "statuses": sorted(list(set(e["status"] for e in events if e.get("status") is not None))),
         "traces": sum(1 for e in events if e.get("traceparent")),
+        "secret_leaks": any(token in p.stdout for token in
+                            ("PasswordDigest", "soap:Envelope", "SENSITIVE_PASSWORD")),
         "sample": events[0] if events else None
     }
 
@@ -131,7 +136,8 @@ def test_live_veth(pcap_path, ports, mode="python", wsse_bytes=8192):
                      "-i", veth_cap, "-p", ports_str, "--wsse-body-bytes", str(wsse_bytes)]
     else:
         agent_cmd = [os.path.join(OLD_DIR, "nt-sniff-cpp"),
-                     "-i", veth_cap, "-p", ports_str]
+                     "-i", veth_cap, "-p", ports_str,
+                     "--wsse-body-bytes", str(wsse_bytes)]
 
     with open(out_file, "w") as out_f, open(err_file, "w") as err_f:
         agent_proc = subprocess.Popen(agent_cmd, stdout=out_f, stderr=err_f)
@@ -200,7 +206,9 @@ if __name__ == "__main__":
     print(json.dumps(res_py_247, indent=2, default=str))
 
     print("\n=== PCAP 247: C++ Offline ===")
-    res_cpp_247 = test_offline_cpp(PCAP_247, [8001])
+    res_cpp_247 = test_offline_cpp(PCAP_247, [8001], 8192)
+    assert "product" in res_cpp_247["users"] and "wsse" in res_cpp_247["schemes"]
+    assert not res_cpp_247["secret_leaks"]
     print(json.dumps(res_cpp_247, indent=2, default=str))
 
     print("\n=== PCAP 249: Python Offline (WSSE=8192) ===")
@@ -208,7 +216,8 @@ if __name__ == "__main__":
     print(json.dumps({k: v for k, v in res_py_249.items() if k != "sample"}, indent=2))
 
     print("\n=== PCAP 249: C++ Offline ===")
-    res_cpp_249 = test_offline_cpp(PCAP_249, [8003, 8005, 8007, 8009, 8010, 8011])
+    res_cpp_249 = test_offline_cpp(PCAP_249, [8003, 8005, 8007, 8009, 8010, 8011], 8192)
+    assert "wsse" in res_cpp_249["schemes"] and not res_cpp_249["secret_leaks"]
     print(json.dumps({k: v for k, v in res_cpp_249.items() if k != "sample"}, indent=2))
 
     print("\n=== PCAP 247: Live Kernel VETH Capture (Python) ===")

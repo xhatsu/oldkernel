@@ -22,16 +22,22 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
    verify its route with `ip route get`. Linux routes requests to its own
    interface address over `lo`; use real ingress or an isolated namespace/veth
    fixture when the configured interface itself must be exercised.
+7. **Host Resource Safety**: Installed runtime processes must launch through
+   `nt-resource-guard.sh`. The full process tree is pinned to one allowed
+   logical CPU and bounded to 256 MiB address space, 1,024 file descriptors,
+   32 MiB per output file, zero core dumps, and (where `/bin/sh` supports it)
+   64 processes. Startup must fail closed when CPU affinity cannot be enforced.
 
 ## WSSE Capture State (2026-09-08)
-- Python capture is header-only by default. `NT_WSSE_BODY_BYTES` or
+- Both Python and C++03 capture are header-only by default. `NT_WSSE_BODY_BYTES` or
   `--wsse-body-bytes` explicitly enables a bounded `0..65536` byte SOAP prefix
   window, with at most 256 body-buffering flows.
 - Only namespaced OASIS 2004 and legacy 2002/07, 2002/12, or 2003/06
   UsernameToken usernames may become event `user` plus `scheme=wsse`.
   Credential material and SOAP bodies never enter event JSON or logs.
-- C++03 remains header-only and the installer rejects WSSE body configuration
-  in native mode.
+- C++03 matches the Python opt-in WSSE contract: bounded `Content-Length` XML
+  prefixes, 256 concurrent body flows, supported namespace validation, and no
+  credential/body material in events or logs.
 
 ## Sample PCAP Validation (2026-09-08)
 - PCAP test runner `test_pcap_suite.py` validates `nt-sniff.py` and `nt-sniff-cpp`
@@ -39,4 +45,3 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 - Converts Linux cooked `sll` (linktype 113) to Ethernet frames for native injection.
 - Validates W3C traceparents, Basic auth, WSSE UsernameToken extraction, response
   correlation (status/duration/resp_bytes), and secret scrubbing.
-

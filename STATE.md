@@ -2,6 +2,44 @@
 
 # STATE.md — Current Project State & Memory
 
+## Native C++03 WSSE Body Capture (2026-09-08)
+- `nt-sniff-cpp` now accepts `NT_WSSE_BODY_BYTES` and
+  `--wsse-body-bytes 0..65536`, remaining header-only by default.
+- Anonymous XML requests with a positive `Content-Length` may buffer a bounded
+  SOAP prefix; chunked requests, DTD/entities, unsupported or missing WSSE
+  namespaces, invalid/control-character usernames, and overflow body flows
+  remain anonymous. Basic authentication continues to take precedence.
+- The dependency-free C++03 XML scanner implements scoped namespace bindings,
+  four approved WSSE namespace URIs, bounded UTF-8 username normalization, and
+  extra depth/attribute/namespace ceilings. Only the username is copied into
+  the sanitized event; body and credential material are discarded.
+- Installer native mode now passes the configured body window instead of
+  rejecting it. The PCAP harness supports the same option.
+- Verification: 22 pytest-compatible tests, optimized native builds/fixtures,
+  and ASAN+UBSAN fixtures passed. With an 8192-byte window, sample PCAP 247
+  produced 200 C++ events with `product/wsse`; PCAP 249 produced 11,394 C++
+  events with Basic+WSSE identities. All had traceparents and no body/secret
+  markers in native JSONL.
+
+## Runtime Host Safety Boundary (2026-09-08)
+- Every installed sniffer/shipper pipeline now starts through
+  `nt-resource-guard.sh`; startup fails closed when `taskset` is missing or the
+  chosen CPU is outside the service cpuset.
+- The complete descendant process tree is pinned to one logical CPU, runs at
+  nice level 10, and inherits hard limits of 256 MiB virtual memory, 1,024 file
+  descriptors, 32 MiB per regular output file, and zero-byte core dumps.
+  EL6 `/bin/sh` additionally enforces a 64-process ceiling.
+- The installer automatically chooses the first allowed CPU, supports a
+  validated `NT_CPU_CORE=N`, and forces Python PACKET_FANOUT workers to one.
+- `test_resource_guard.py` exercises the actual kernel affinity/resource
+  limits and verifies that installer startup is routed through the guard.
+- Verification: 22 pytest-compatible tests passed (including the loopback
+  shipper test); native fixture, ASAN+UBSAN edge tests, and the CentOS runbook
+  passed. Offline Python/C++ processing of both sample PCAPs produced the
+  established 200/218 and 11,216/12,441 event counts with full traceparents.
+  The EL6 smoke probe correctly failed target-only checks on this Linux 6.8,
+  Python 3 sandbox (kernel/Python version, setcap, and AF_PACKET).
+
 ## Current State Summary
 - **Git Branch**: `main`, up to date with `origin/main` (latest commit `c6d8781 update test scripts`).
 - **Conflict Resolution**: Successfully resolved binary merge conflict in `nt-sniff-cpp`, rebuilt native binaries via `make clean && make`, and regenerated `install-firstrun-el68.sh`.
@@ -85,7 +123,7 @@
   `ntsniff`, on `enp0s6`/18080 with Hub endpoint `http://0.0.0.0:30102`.
 
 ## WSSE / Active OTelTrace Integration (2026-09-08)
-- `nt-sniff.py` remains header-only by default. Python mode can opt in with a
+- Both capture modes remain header-only by default and can opt in with a
   validated `NT_WSSE_BODY_BYTES` / `--wsse-body-bytes` window from 1 to 65536
   bytes. At most 256 requests may buffer SOAP prefixes concurrently.
 - The incremental namespace-aware parser accepts OASIS 2004 and legacy
@@ -94,9 +132,10 @@
   passwords/digests, nonces, and timestamps are discarded before JSONL output.
 - XML bodies require `Content-Length`; chunked encoding, DTD/entity input,
   unsupported/unnamespaced tags, over-window usernames, and excess concurrent
-  body flows remain anonymous. C++03 capture remains explicitly header-only.
+  body flows remain anonymous. The C++03 parser additionally caps XML depth,
+  attributes, and namespace bindings inside each bounded prefix.
 - Installer configuration and the embedded first-run payload carry the bounded
-  Python setting. Focused tests cover opt-in/default behavior, split bodies,
+  setting to both capture modes. Focused tests cover opt-in/default behavior, split bodies,
   all supported namespaces, bounds, and secret hygiene.
 - Final verification: 18 pytest tests passed; the optimized C++03 fixture and
   ASAN+UBSAN edge suite passed; POSIX `dash -n`, Python compilation, and
@@ -119,12 +158,12 @@
   - `tcpdump_10.240.147.247.pcap` (557 KB, 1,272 packets):
     - Port 8001 SOAP WSSE service (`/PRODUCT_SERVICE/bpm/product/PromotionDetailService`).
     - Python agent (`--wsse-body-bytes 8192`): 200 events emitted, 100% traceparent correlation, extracted WSSE username `product` (`scheme=wsse`), correlated status 200 and response bytes.
-    - C++ agent: 218 events emitted in 0.007s (~178k pkts/s), status 200, traceparents, header-only default (`user=-anonymous-`).
+    - C++ agent (`--wsse-body-bytes 8192`): 200 events emitted with 100% traceparents, extracted WSSE username `product` (`scheme=wsse`), and correlated status 200.
     - Live kernel VETH capture (`nt_inj0` -> `nt_cap0` via raw socket): both Python and C++ captured live packets and produced valid JSONL.
   - `tcpdump_10.240.147.249.pcap` (82.9 MB, 149,263 packets):
     - Multi-service traffic across ports 8003, 8005, 8007, 8009, 8010, 8011.
     - Python agent: 11,216 events in 4.6s (32,347 pkts/s), extracted 21 distinct usernames across Basic auth (`vtp`, `myViettel`, `webadmin`) and WSSE (`bccs2.0`, `cc2.0`, `sale`, etc.), status codes 200/302/304/404/500, 100% traceparent coverage.
-    - C++ agent: 12,441 events in 0.35s (430,229 pkts/s), extracted Basic auth identities (`vtp`, `myViettel`), full status correlation.
+    - C++ agent (`--wsse-body-bytes 8192`): 11,394 events with full traceparents, Basic and WSSE identities (`bccs2.0`, `sale`, etc.), and status correlation.
   - Secret hygiene: Zero password tokens (`ViettelCC@123`, `PasswordDigest`, XML bodies) leaked into output JSONL. Test harness: `test_pcap_suite.py`.
 
 ## Real Agent Live Ingress Testing (2026-09-08)
@@ -134,9 +173,33 @@
     - Service running rootless as `ntsniff` with `cap_net_raw` file capabilities.
     - Basic auth request: `realagentuser` captured and delivered to Hub `/api/v1/users` (status `Active`).
     - SOAP WSSE request: trace `abcdef0123456789abcdef0123456789` captured with `user="real.agent.wsse.user"`, `scheme="wsse"`, status 200, duration 217ms. Correlated in Hub with Java OTLP child span in multi-tier waterfall.
-  - **C++03 Native Mode Live Test**:
-    - Service installed and running rootless in native single-binary mode (`--mode cpp`, memory 932 KB).
-    - Basic auth request: `cppagentuser` captured and recorded in Hub `/api/v1/users` (status `Active`) and trace `22223333444455556666777788889999` with status 200, duration 3ms, and `source_probe="pcap-http-cpp"`.
-  - Cleanup: test namespace `nt_client` and `ntv0` removed; service cleanly re-installed and running on host interface `enp0s6`.
+  - **C++03 Native Mode Live Test (with WSSE body inspection enabled)**:
+    - Service installed and running rootless in native single-binary mode (`--mode cpp`, memory 920 KB, bounded to 16,384 body bytes).
+    - Live OASIS 2004 WSSE request: trace `c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9` captured with `user="cpp.wsse.live.user"`, `scheme="wsse"`, status 200, duration 40ms, linked with Java OTLP child span in Hub.
+    - Live legacy 2002/07 WSSE request: trace `d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8` captured with `user="cpp.wsse.legacy.user"`, `scheme="wsse"`, status 200, duration 26ms, linked with Java OTLP child span in Hub.
+    - Basic auth request: `cpp.basic.user` captured and recorded in Hub `/api/v1/users` (status `Active`) and trace `e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7` with status 200.
+    - Sample PCAP verification (`tcpdump_10.240.147.247.pcap`): C++ sniffer extracts `product` (`scheme=wsse`) from real SOAP envelopes across all 200 HTTP transactions.
+    - Secret hygiene: verified zero tokens, passwords, or nonces leaked into trace attributes or logs.
+  - Cleanup: test namespace `nt_client` and `ntv0` removed; service cleanly re-installed in C++ mode on host interface `enp0s6`.
+
+## 100 TPS Load Benchmark (2026-09-08)
+- Measured live agent resource consumption under sustained 100 TPS load:
+  - **HTTP Basic Auth (100 TPS exact, 1,000 requests / 10.07s)**:
+    - **C++ Native Agent (`nt-sniff-cpp`)**:
+      - Average CPU: **4.96%** of 1 core (peak: 4.99%).
+      - Resident Memory (RSS): **7.84 MB** (down from initial 12.7 MB, zero leaks).
+      - Drops: 0 kernel drops, 100% captured and shipped.
+    - **Python Agent (`nt-sniff.py` + `nt-ship.py`)**:
+      - Average CPU: **9.94%** of 1 core (peak: 9.94%).
+      - Resident Memory (RSS): **23.31 MB** total.
+      - Drops: 0 kernel drops.
+  - **SOAP WSSE XML Inspection (1,018 requests, 66 TPS sustained)**:
+    - **C++ Native Agent**:
+      - Average CPU: **5.59%** of 1 core (peak: 9.97%).
+      - Resident Memory (RSS): **8.45 MB** peak.
+    - **Python Agent**:
+      - Average CPU: **14.89%** of 1 core (peak: 14.89%).
+      - Resident Memory (RSS): **24.47 MB** peak.
+  - Benchmarking tools: `measure_usage.py`, `run_100tps_benchmark.py`.
 
 
