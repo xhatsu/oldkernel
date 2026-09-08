@@ -1,3 +1,5 @@
+> **Port migration:** The active hub is OTelTrace on `0.0.0.0:30102`. The former NetworkTracing hub on `:31115` is legacy and is not used.
+
 # oldkernel/ — NetworkTracing Kit for CentOS 6.x / Kernel 2.6.32
 
 Passive HTTP/SOAP capture kit designed for legacy enterprise nodes that **cannot run modern eBPF tools** (no eBPF, no systemd, Python 2.6 stdlib only).
@@ -41,6 +43,7 @@ Impact             : 100% passive packet capture; zero application code changes;
  │        · Per-flow TCP reassembly (8k flows, 5-min TTL, 256KB header cap)│
  │        · Fast HTTP/1.x request header parser & \r\n\r\n framing         │
  │        · Basic-auth user extraction (never extracts/emits passwords)    │
+ │        · Optional bounded WSSE UsernameToken username extraction         │
  │        · Response head correlation (status code, duration_ms)           │
  │        · JSONL event stream ──── stdout                                 │
  │              │                                                          │
@@ -55,7 +58,7 @@ Impact             : 100% passive packet capture; zero application code changes;
  └────────────────────────────────────┬────────────────────────────────────┘
                                       │ HTTP POST (plain JSON)
                                       ▼
-                        NETWORKTRACING HUB (:31115)
+                        NETWORKTRACING HUB (:30102)
                     /api/ingest ──► Dashboard / Users / Violations
                     (Events tagged source_probe="pcap-http" or "pcap-http-cpp")
 ```
@@ -94,7 +97,7 @@ Impact             : 100% passive packet capture; zero application code changes;
 
 ### The Command
 ```sh
-curl -sSf http://$HUB:30105/oldkernel/install-firstrun-el68.sh | sudo sh -s -- --endpoint http://$HUB:31115
+curl -sSf http://$HUB:30105/oldkernel/install-firstrun-el68.sh | sudo sh -s -- --endpoint http://$HUB:30102
 ```
 
 ### What Happens Under the Hood (Step-by-Step)
@@ -172,21 +175,21 @@ sudo sh el68-smoke.sh
 ### 1. Non-Destructive Preflight Check
 Validates Hub connectivity, network interface, and dependencies without modifying system files:
 ```sh
-sudo sh install-oldkernel.sh --check --endpoint http://$HUB:31115
+sudo sh install-oldkernel.sh --check --endpoint http://$HUB:30102
 ```
 
 ### 2. Production Installation (Python Mode)
 Installs the standard Python 2.6 capture pipeline:
 ```sh
 sudo NT_IFACE=eth0 NT_PORTS=80,8003,8005,8009,8010 \
-  sh install-oldkernel.sh --endpoint http://$HUB:31115
+  sh install-oldkernel.sh --endpoint http://$HUB:30102
 ```
 
 ### 3. Native C++ Mode Installation
 For high-throughput environments (>1,000 requests/sec), compile and run native C++ binaries:
 ```sh
 sudo NT_CAPTURE_MODE=cpp NT_IFACE=eth0 NT_PORTS=80,8003,8005,8009,8010 \
-  sh install-oldkernel.sh --endpoint http://$HUB:31115
+  sh install-oldkernel.sh --endpoint http://$HUB:30102
 ```
 
 ### 4. Verification & Live Event Proof
@@ -202,9 +205,24 @@ Send a test request with Basic auth:
 curl -sS -u testuser:secretpass http://127.0.0.1:8010/api/health
 ```
 
+That curl only proves capture when the agent monitors `lo`. Linux routes a
+host's request to its own non-loopback address through `lo` as well. Confirm
+the actual path before testing an interface such as `eth0`:
+
+```sh
+TARGET_IP=10.0.0.35
+ip route get "$TARGET_IP"
+```
+
+If it reports `local ... dev lo`, generate traffic from another host. For a
+fully local and deterministic fallback, create a temporary network namespace
+and veth pair, bind the agent to the host veth endpoint, and send the request
+from the namespace. This exercises non-loopback ingress without changing the
+application; remove the namespace and host veth after the test.
+
 Query the Hub to verify receipt:
 ```sh
-curl -fsS "http://$HUB:31115/api/events?limit=10&q=testuser"
+curl -fsS "http://$HUB:30102/api/events?limit=10&q=testuser"
 ```
 *(Confirmed: Username `testuser` is extracted; password `secretpass` is never logged or transmitted).*
 
@@ -219,12 +237,28 @@ sudo sh install-oldkernel.sh --uninstall
 
 ## Operational Notes & Hardening
 
+- **WSSE is explicitly opt-in (Python mode only):** The default `0` byte
+  window is strictly header-only. To inspect the beginning of XML/SOAP bodies,
+  install with `NT_WSSE_BODY_BYTES=16384` or
+  `--wsse-body-bytes 16384`. Accepted values are `0..65536`. Only OASIS 2004
+  and legacy 2002/07, 2002/12, and 2003/06 namespaced `UsernameToken/Username`
+  values are emitted as `user` with `scheme=wsse`; bodies, passwords/digests,
+  nonces, and timestamps are discarded. Body buffering is additionally capped
+  at 256 concurrent flows (16 MiB at the maximum window). Requests need an XML
+  content type and `Content-Length`; chunked SOAP bodies remain anonymous.
+- **C++03 remains header-only:** The native C++ sniffer does not implement body
+  capture or WSSE parsing. The installer rejects a non-zero WSSE window in C++
+  mode instead of implying support. Use Python mode when WSSE attribution is
+  required.
 - **Network Outage Resilience:** When the Hub is unreachable, events are automatically spooled to `/var/lib/networktracing/sniff-spool.jsonl`. Once connectivity is restored, the shipper drains the spool with backoff retry.
 - **Memory & Flow Bounds:** The in-memory TCP flow table is hard-capped at 8,192 concurrent flows with a 300-second TTL sweep.
 - **Reconfiguring Monitored Ports:** To monitor new ports, re-run the installer with the updated `NT_PORTS` list:
   ```sh
-  sudo NT_PORTS=80,8010,8080 sh install-oldkernel.sh --endpoint http://$HUB:31115
+  sudo NT_PORTS=80,8010,8080 sh install-oldkernel.sh --endpoint http://$HUB:30102
   ```
+- **Response-loss fallback:** A request is retained for response enrichment,
+  but is emitted after five seconds if the response is filtered or split.
+  Stop/restart also drains all retained requests before closing the shipper.
 - **Updating the Bundle:** After making changes to any `.py` or `.cpp` source files, rebuild the self-contained installer bundle:
   ```sh
   sh build-firstrun.sh

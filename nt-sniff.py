@@ -8,19 +8,23 @@ extracts Basic-auth usernames (same semantics as nt_authlib.extract),
 emits NetworkTracing event JSONL on stdout.
 
 TLS is NOT readable (by design — that tier stays on the eBPF agent).
-SOAP WSSE usernames are NOT extracted (product decision: Basic-only).
+SOAP WSSE UsernameToken extraction is available only when explicitly enabled
+with NT_WSSE_BODY_BYTES or --wsse-body-bytes. The default remains header-only.
 
 Performance:
-  * kernel BPF filter (SO_ATTACH_FILTER): only IPv4/TCP requests destined
-    to monitored ports are copied up — responses/noise never reach python
-  * HEADER-ONLY capture: events emit at \r\n\r\n; bodies are not buffered
+  * kernel BPF filter (SO_ATTACH_FILTER): IPv4/TCP requests and responses
+    for monitored ports are copied up; unrelated traffic stays in kernel
+  * HEADER-ONLY by default; opt-in WSSE parsing has strict per-flow/global bounds
   * PACKET_FANOUT (-j N): N forked workers share the NIC across cores
 Usage:  python nt-sniff.py [-i eth0] [-p 80,8003,...] [-j workers]
+                           [--wsse-body-bytes 0..65536]
 Stdout: one JSON event per line -> pipe into nt-ship.py.
 """
 from __future__ import print_function
 
 import base64, binascii, errno, json, os, signal, socket, struct, sys, time
+import unicodedata
+from xml.parsers import expat
 
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
@@ -44,6 +48,16 @@ METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 MAX_FLOWS = 8192            # concurrent tracked half-flows (per direction)
 MAX_HDRS = 262144           # max bytes buffered waiting for \r\n\r\n
 FLOW_TTL = 300              # seconds before idle flow buffers are dropped
+MAX_WSSE_BODY_BYTES = 65536 # hard ceiling even if configuration is larger
+MAX_WSSE_BODY_FLOWS = 256   # at most 16 MiB of opt-in body buffers globally
+MAX_WSSE_USERNAME = 200
+
+WSSE_NAMESPACES = set((
+    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
+    "http://schemas.xmlsoap.org/ws/2002/07/secext",
+    "http://schemas.xmlsoap.org/ws/2002/12/secext",
+    "http://schemas.xmlsoap.org/ws/2003/06/secext",
+))
 
 
 def log(msg):
@@ -53,9 +67,8 @@ def log(msg):
 
 # ---------------------------------------------------------------- perf: cBPF
 # Attach a classic BPF program so the KERNEL drops everything that is not
-# IPv4 TCP destined TO a monitored port. Requests alone drive events
-# (header-only capture); responses, ACKs and unrelated traffic never get
-# copied to userspace at all.
+# IPv4 TCP to or from a monitored port. Request headers drive events and
+# response headers enrich them; unrelated traffic never reaches userspace.
 SO_ATTACH_FILTER = 26
 
 def build_bpf(ports):
@@ -177,11 +190,25 @@ def apply_fanout(sock, group_id):
         return False
 
 
+def parse_wsse_body_bytes(value):
+    """Validate the opt-in body window without allowing unbounded buffers."""
+    try:
+        size = int(value or 0)
+    except (TypeError, ValueError):
+        raise SystemExit("wsse body bytes must be an integer")
+    if size < 0 or size > MAX_WSSE_BODY_BYTES:
+        raise SystemExit("wsse body bytes must be in range 0..%d" %
+                         MAX_WSSE_BODY_BYTES)
+    return size
+
+
 def parse_args(argv):
     iface = None
     ports = [80, 8003, 8005, 8007, 8009, 8010, 8011]
     verbose = False
     workers = 1
+    wsse_body_bytes = parse_wsse_body_bytes(
+        os.environ.get("NT_WSSE_BODY_BYTES", "0"))
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -209,25 +236,36 @@ def parse_args(argv):
                 raise SystemExit("invalid worker count")
         elif a == "-v":
             verbose = True
+        elif a == "--wsse-body-bytes":
+            if i + 1 >= len(argv):
+                raise SystemExit("--wsse-body-bytes requires a byte count")
+            i += 1
+            wsse_body_bytes = parse_wsse_body_bytes(argv[i])
         elif a in ("-h", "--help"):
             print(__doc__); raise SystemExit(0)
         else:
             raise SystemExit("unknown arg: %s" % a)
         i += 1
-    return iface, set(ports), verbose, workers
+    return iface, set(ports), verbose, workers, wsse_body_bytes
 
 
 class Flow(object):
-    __slots__ = ("buf", "hdrs", "touched")
+    __slots__ = ("buf", "hdrs", "touched", "event", "body_goal",
+                 "head_bytes")
     def __init__(self):
         self.buf = bytearray()
-        self.hdrs = {}
+        self.hdrs = None
         self.touched = time.time()
+        self.event = None
+        self.body_goal = 0
+        self.head_bytes = 0
 
 
 # ------------------------------------------------- response correlation ----
 PENDING_TTL = 5.0        # flush unmatched requests after this many seconds
 PENDING_MAX = 8192       # hard cap; overflow flushes oldest first
+PENDING_PER_FLOW = 32    # bound a single pipelined/hostile keep-alive flow
+SWEEP_INTERVAL = 1.0     # honor PENDING_TTL even when the socket goes idle
 
 # pending[(src_ip, sport, dst_ip, dport)]  -- key is the RESPONSE tuple:
 # server->client. Value: [event, req_ts]. A list per key handles HTTP
@@ -239,15 +277,17 @@ def pending_del(rk):
     pending.pop(rk, None)
 
 
-def pending_pop(rk, out):
+def pending_pop(rk, out, pending_tbl=None):
     """Flush the oldest pending event for this response tuple (FIN/RST or
     overflow path). Emits whatever the event has — status stays null."""
-    lst = pending.get(rk)
+    if pending_tbl is None:
+        pending_tbl = pending
+    lst = pending_tbl.get(rk)
     if not lst:
         return None
     ev, _ = lst.pop(0)
     if not lst:
-        pending_del(rk)
+        pending_tbl.pop(rk, None)
     out.append(ev)
     return ev
 
@@ -275,6 +315,30 @@ def parse_response_head(payload):
                 pass
             break
     return st, clen
+
+
+def correlate_response(pending_tbl, rk, payload, now, out):
+    """Attach one response head to the oldest request on a connection.
+
+    HTTP/1.1 pipelining can leave several requests queued for the same
+    four-tuple.  Consume exactly one entry; deleting the whole key here loses
+    every request after the first response.
+    """
+    st, clen = parse_response_head(payload)
+    if st is None:
+        return False
+    ent = pending_tbl.get(rk)
+    if not ent:
+        return False
+    ev, started = ent.pop(0)
+    if not ent:
+        pending_tbl.pop(rk, None)
+    ev["status"] = st
+    ev["duration_ms"] = max(0, int((now - started) * 1000))
+    if clen is not None:
+        ev["resp_bytes"] = clen
+    out.append(ev)
+    return True
 
 
 def valid_port(p):
@@ -307,6 +371,106 @@ def basic_user(value):
     elif scheme == "bearer":
         return None, "bearer"
     return None, None
+
+
+def normalize_wsse_username(value):
+    """Return a small, printable username or None; never return token data."""
+    if value is None:
+        return None
+    try:
+        username = value.strip()
+    except Exception:
+        return None
+    if not username or len(username) > MAX_WSSE_USERNAME:
+        return None
+    for char in username:
+        if unicodedata.category(char).startswith("C"):
+            return None
+    return username
+
+
+def extract_wsse_username(body):
+    """Parse a bounded, possibly partial SOAP prefix and return only Username.
+
+    Expat is run incrementally so a UsernameToken in the SOAP Header can be
+    recognized without retaining or requiring the complete request body.
+    DTD/entity declarations are rejected before parsing.
+    """
+    if not body or len(body) > MAX_WSSE_BODY_BYTES or b"\x00" in body:
+        return None
+    lowered = bytes(body).lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        return None
+
+    state = {"stack": [], "token_depth": 0, "username_depth": 0,
+             "chars": [], "too_long": False, "result": None}
+
+    def split_name(name):
+        if "}" not in name:
+            return "", name
+        return name.rsplit("}", 1)
+
+    def start(name, attrs):
+        namespace, local_name = split_name(name)
+        state["stack"].append((namespace, local_name))
+        depth = len(state["stack"])
+        if (not state["token_depth"] and local_name == "UsernameToken" and
+                namespace in WSSE_NAMESPACES):
+            state["token_depth"] = depth
+        elif (state["token_depth"] and
+              depth == state["token_depth"] + 1 and
+              local_name == "Username" and
+              namespace == state["stack"][state["token_depth"] - 1][0]):
+            state["username_depth"] = depth
+            state["chars"] = []
+            state["too_long"] = False
+
+    def chars(value):
+        if not state["username_depth"] or state["too_long"]:
+            return
+        state["chars"].append(value)
+        if sum([len(part) for part in state["chars"]]) > MAX_WSSE_USERNAME + 2:
+            state["chars"] = []
+            state["too_long"] = True
+
+    def end(name):
+        depth = len(state["stack"])
+        if state["username_depth"] == depth:
+            if not state["too_long"] and state["result"] is None:
+                state["result"] = normalize_wsse_username(
+                    u"".join(state["chars"]))
+            state["username_depth"] = 0
+            state["chars"] = []
+        if state["token_depth"] == depth:
+            state["token_depth"] = 0
+        if state["stack"]:
+            state["stack"].pop()
+
+    try:
+        parser = expat.ParserCreate(None, "}")
+        if hasattr(parser, "returns_unicode"):
+            parser.returns_unicode = True
+        parser.StartElementHandler = start
+        parser.CharacterDataHandler = chars
+        parser.EndElementHandler = end
+        if (hasattr(parser, "SetParamEntityParsing") and
+                hasattr(expat, "XML_PARAM_ENTITY_PARSING_NEVER")):
+            parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+        parser.Parse(bytes(body), False)
+    except (expat.ExpatError, ValueError, TypeError):
+        # A bounded prefix is commonly incomplete. A username fully closed
+        # before the truncation point is still safe to use.
+        pass
+    return state["result"]
+
+
+def is_soap_content_type(value):
+    if not value:
+        return False
+    media_type = value.split(";", 1)[0].strip().lower()
+    return (media_type in ("text/xml", "application/xml",
+                           "application/soap+xml") or
+            media_type.endswith("+xml"))
 
 
 def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
@@ -366,18 +530,55 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     return ev if (dport in ports or h.get("_method")) else None
 
 
+def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
+    """Discard capture buffers, then emit/queue the sanitized event only."""
+    dst_ip, dport, src_ip, sport = meta
+    ev = fl.event
+    flows.pop(key, None)
+    if not ev:
+        return
+    ev["req_bytes"] = fl.head_bytes
+    if pending_tbl is None:
+        out.append(ev)
+        return
+    rk = (dst_ip, dport, src_ip, sport)
+    ent = pending_tbl.get(rk)
+    if ent is None:
+        if len(pending_tbl) >= PENDING_MAX:
+            _flush_oldest_pending(pending_tbl, out)
+        ent = pending_tbl[rk] = []
+    elif len(ent) >= PENDING_PER_FLOW:
+        pending_pop(rk, out, pending_tbl)
+        ent = pending_tbl.get(rk)
+        if ent is None:
+            ent = pending_tbl[rk] = []
+    ent.append([ev, now if now is not None else time.time()])
+
+
+def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
+    """Append no more than body_goal bytes and finish as soon as possible."""
+    remaining = fl.body_goal - len(fl.buf)
+    if remaining > 0 and payload:
+        fl.buf.extend(bytearray(payload[:remaining]))
+    username = extract_wsse_username(fl.buf)
+    if username:
+        fl.event["user"] = username
+        fl.event["scheme"] = "wsse"
+    if username or len(fl.buf) >= fl.body_goal:
+        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
+        return True
+    return False
+
+
 def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
-                   pending_tbl=None, now=None):
+                   pending_tbl=None, now=None, wsse_body_bytes=0):
     """Feed one direction's payload; emit finished events to out(list).
 
-    HEADER-ONLY capture: the request event is built the moment \\r\\n\\r\\n is
-    seen. With response correlation enabled (pending_tbl), the finished
-    event goes into the pending table instead of out — it is emitted when
-    the matching response head arrives, or on TTL/teardown fallback.
-    Request bodies are NOT buffered — Basic auth (all we mine) rides headers,
-    so body bytes cost memory and delay events for zero information. A later
-    segment on the same connection simply fails the request-line check and
-    is discarded."""
+    Bodies are ignored unless wsse_body_bytes is non-zero. In opt-in mode,
+    only XML requests with Content-Length are inspected, each buffer is
+    bounded by wsse_body_bytes, and only a recognized WSSE username reaches
+    the event. The body and all other UsernameToken material are discarded.
+    """
     dst_ip, dport, src_ip, sport = meta
     if not valid_port(dport) or not valid_port(sport):
         return
@@ -388,8 +589,12 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
         if len(flows) > MAX_FLOWS:
             enforce_limit(flows, time.time())
     fl.touched = time.time()
-    fl.buf.extend(bytearray(payload))
 
+    if fl.event is not None:
+        _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now)
+        return
+
+    fl.buf.extend(bytearray(payload))
     idx = fl.buf.find(b"\r\n\r\n")
     if idx < 0:
         if len(fl.buf) > MAX_HDRS:
@@ -399,12 +604,11 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
     lines = head.replace(b"\r\n", b"\n").split(b"\n")
     hdrs = {}
     first = lines[0].strip().split()
-    if len(first) >= 2 and first[0] in [
-            m.encode() for m in METHODS]:
+    if len(first) >= 2 and first[0] in [m.encode() for m in METHODS]:
         hdrs["_method"] = first[0].decode("ascii", "replace")
         hdrs["_path"] = first[1].decode("ascii", "replace")
     else:
-        flows.pop(key, None)       # not a request start
+        flows.pop(key, None)
         return
     for ln in lines[1:]:
         if b":" not in ln:
@@ -414,23 +618,32 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             "ascii", "replace")] = kv.strip().decode(
                 "utf-8", "replace")[:180]
     fl.hdrs = hdrs
-    ev = finish_event(fl, key, dst_ip, dport, src_ip, sport,
-                      ports, node_host)
-    del flows[key]
-    if not ev:
+    fl.event = finish_event(fl, key, dst_ip, dport, src_ip, sport,
+                            ports, node_host)
+    if not fl.event:
+        flows.pop(key, None)
         return
-    ev["req_bytes"] = idx + 4          # captured request head + terminator
-    if pending_tbl is None:
-        out.append(ev)                 # correlation disabled (legacy path)
+    fl.head_bytes = idx + 4
+    initial_body = bytes(fl.buf[idx + 4:])
+    fl.buf = bytearray()
+
+    if (fl.event.get("user") or not wsse_body_bytes or
+            not is_soap_content_type(hdrs.get("content-type"))):
+        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
         return
-    # queue for response correlation; key is the RESPONSE tuple
-    rk = (dst_ip, dport, src_ip, sport)
-    ent = pending_tbl.get(rk)
-    if ent is None:
-        if len(pending_tbl) >= PENDING_MAX:
-            _flush_oldest_pending(pending_tbl, out)
-        ent = pending_tbl[rk] = []
-    ent.append([ev, now if now is not None else time.time()])
+    try:
+        content_length = int(hdrs.get("content-length", ""))
+    except (TypeError, ValueError):
+        content_length = 0
+    active_body_flows = sum([1 for candidate in flows.values()
+                             if candidate.event is not None and
+                             candidate.body_goal > 0])
+    if (content_length <= 0 or active_body_flows >= MAX_WSSE_BODY_FLOWS or
+            "chunked" in hdrs.get("transfer-encoding", "").lower()):
+        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
+        return
+    fl.body_goal = min(content_length, wsse_body_bytes, MAX_WSSE_BODY_BYTES)
+    _try_wsse_body(flows, key, fl, initial_body, meta, out, pending_tbl, now)
 
 
 def sweep_idle(flows, now):
@@ -450,17 +663,32 @@ def _flush_oldest_pending(pending_tbl, out):
         if oldest_ts is None or ts < oldest_ts:
             oldest_key, oldest_ts = rk, ts
     if oldest_key is not None:
-        pending_pop(oldest_key, out)
+        pending_pop(oldest_key, out, pending_tbl)
 
 
 def sweep_pending(pending_tbl, now, out):
     """TTL flush: emit requests whose responses never showed up."""
-    stale = []
-    for rk, lst in pending_tbl.items():
-        if now - lst[0][1] > PENDING_TTL:
-            stale.append(rk)
-    for rk in stale:
-        pending_pop(rk, out)
+    for rk in list(pending_tbl.keys()):
+        lst = pending_tbl.get(rk)
+        while lst and now - lst[0][1] > PENDING_TTL:
+            pending_pop(rk, out, pending_tbl)
+            lst = pending_tbl.get(rk)
+
+
+def drain_pending(pending_tbl, out):
+    """Emit every captured request before capture shutdown.
+
+    Responses are optional enrichment. A stop/restart must not discard a
+    request merely because its response was filtered, split, or still in
+    flight when the process received SIGTERM.
+    """
+    for rk in list(pending_tbl.keys()):
+        while pending_tbl.get(rk):
+            pending_pop(rk, out, pending_tbl)
+
+
+def maintenance_due(now, last_sweep):
+    return now - last_sweep >= SWEEP_INTERVAL
 
 
 def enforce_limit(flows, now):
@@ -497,17 +725,22 @@ def _control_config():
 def _run_control_tick(ports, iface, run_dir, client):
     reply = client.poll()
     if not reply:
-        return ports, iface, False, "poll failed"
+        return ports, iface, None, "poll failed"
     desired = reply.get("desired") or {}
+    state = dict(desired)
     generation = desired.get("generation", 0)
-    restart_requested = False
+    control_action = None
+    stop_requested = False
     if desired.get("ports"):
         new_ports = set(desired["ports"])
         if new_ports != ports:
             ports = new_ports
+            control_action = "restart"
     if desired.get("iface"):
-        iface = desired["iface"]
-    nt_control.write_state(os.path.join(run_dir, "remote-desired.json"), desired, "restart required")
+        new_iface = desired["iface"]
+        if new_iface != iface:
+            iface = new_iface
+            control_action = "restart"
     for task in reply.get("tasks", []):
         action = task.get("action")
         if action == "health":
@@ -516,28 +749,49 @@ def _run_control_tick(ports, iface, run_dir, client):
         elif action in ("restart", "reload", "set_ports"):
             message = "accepted; capture restart requested"
             status = "done"
-            restart_requested = True
+            control_action = "restart"
             if action == "set_ports":
                 args = task.get("args") or {}
                 if args.get("ports"):
                     ports = set(args["ports"])
-                    nt_control.write_state(os.path.join(run_dir, "remote-desired.json"),
-                                           {"ports": sorted(ports), "mode": "python",
-                                            "generation": generation}, message)
+                    state.update({"ports": sorted(ports), "mode": "python",
+                                  "generation": generation})
         elif action == "stop":
             message = "stop requested"
             status = "done"
-            restart_requested = False
+            stop_requested = True
         else:
             message = "unsupported by direct sniffer"
             status = "failed"
         client.report(task.get("id"), status, message)
-    client.heartbeat(generation, "restart required" if restart_requested else "poll ok")
-    return ports, iface, restart_requested, "poll ok"
+    if stop_requested:
+        control_action = "stop"
+    applied = ("stop requested" if control_action == "stop" else
+               "restart required" if control_action == "restart" else
+               "poll ok")
+    nt_control.write_state(os.path.join(run_dir, "remote-desired.json"),
+                           state, applied)
+    client.heartbeat(generation, applied)
+    return ports, iface, control_action, applied
+
+
+def _restart_args(script, iface, ports, verbose, workers, wsse_body_bytes=0):
+    """Build a fresh argv for an in-place re-exec after a control update."""
+    # Preserve unbuffered JSONL delivery; the installer starts Python with -u.
+    args = [sys.executable, "-u", os.path.abspath(script)]
+    if iface:
+        args.extend(["-i", iface])
+    args.extend(["-p", ",".join([str(p) for p in sorted(ports)])])
+    args.extend(["-j", str(workers)])
+    if wsse_body_bytes:
+        args.extend(["--wsse-body-bytes", str(wsse_body_bytes)])
+    if verbose:
+        args.append("-v")
+    return args
 
 
 def main():
-    iface, ports, verbose, workers = parse_args(sys.argv[1:])
+    iface, ports, verbose, workers, wsse_body_bytes = parse_args(sys.argv[1:])
     node_host = socket.gethostname().split(".")[0]
     control_client = None
     endpoint, token, control_node, control_run, control_interval = _control_config()
@@ -594,6 +848,9 @@ def main():
     control_next = time.time()
     log("listening on %s ports=%s pid=%d" %
         (iface or "<all>", sorted(ports), os.getpid()))
+    if wsse_body_bytes:
+        log("WSSE UsernameToken inspection enabled (bounded to %d bytes/request)" %
+            wsse_body_bytes)
 
     # fork extra capture workers AFTER fanout attach; WITHOUT a working
     # fanout group every process would receive EVERY packet (duplicates),
@@ -615,6 +872,26 @@ def main():
     dbg_rx = 0
     dbg_last = time.time()
     while running[0]:
+        # Poll independently of socket idle time. A busy monitored interface
+        # may never raise socket.timeout, but control changes must still apply.
+        if control_client is not None and time.time() >= control_next:
+            try:
+                ports, iface, control_action, control_status = _run_control_tick(
+                    ports, iface, control_run, control_client)
+                log("remote control: %s" % control_status)
+                if control_action == "restart":
+                    args = _restart_args(sys.argv[0], iface, ports,
+                                         verbose, workers, wsse_body_bytes)
+                    log("remote control: re-executing capture with updated configuration")
+                    s.close()
+                    os.execv(sys.executable, args)
+                elif control_action == "stop":
+                    log("remote control: stop requested; exiting")
+                    running[0] = False
+                    continue
+            except Exception as e:
+                log("WARN: remote control tick failed (%s)" % nt_control.safe_message(e))
+            control_next = time.time() + control_interval
         try:
             pkt = s.recv(65535)
             dbg_rx += 1
@@ -622,22 +899,11 @@ def main():
                 log("DEBUG rx=%d" % dbg_rx)
                 dbg_last = time.time()
         except socket.timeout:
-            if control_client is not None and time.time() >= control_next:
-                try:
-                    ports, iface, restart_requested, control_status = _run_control_tick(
-                        ports, iface, control_run, control_client)
-                    log("remote control: %s" % control_status)
-                    if restart_requested:
-                        log("remote control: restart required; exiting for SysV wrapper")
-                        running[0] = False
-                except Exception as e:
-                    log("WARN: remote control tick failed (%s)" % nt_control.safe_message(e))
-                control_next = time.time() + control_interval
             if dbg:
                 log("DEBUG timeout rx=%d" % dbg_rx)
                 dbg_last = time.time()
             now = time.time()
-            if now - last_sweep > 30:
+            if maintenance_due(now, last_sweep):
                 sweep_idle(flows, now)
                 out_s = []
                 sweep_pending(pending, now, out_s)
@@ -688,16 +954,7 @@ def main():
             # client_port) == (src, sport, dst, dport) OF THIS response pkt
             rk = (src_ip, sport, dst_ip, dport)
             if payload[:5] == b"HTTP/":
-                st, clen = parse_response_head(payload)
-                ent = pending.get(rk)
-                if ent is not None:
-                    ev = ent[0][0]
-                    ev["status"] = st
-                    ev["duration_ms"] = int((now - ent[0][1]) * 1000)
-                    if clen is not None:
-                        ev["resp_bytes"] = clen
-                    pending_del(rk)
-                    out.append(ev)
+                correlate_response(pending, rk, payload, now, out)
             elif flags & 0x05:                      # FIN|RST: flush unmatched
                 ev = pending_pop(rk, out)
         # ---------------- REQUEST direction (client -> server) -----------
@@ -708,14 +965,15 @@ def main():
             key = (src_ip, sport, dst_ip, dport)
             handle_payload(flows, key, None, payload,
                            (dst_ip, dport, src_ip, sport),
-                           ports, node_host, out, pending, now)
+                           ports, node_host, out, pending, now,
+                           wsse_body_bytes)
         if out:
             w = sys.stdout.write
             for ev in out:
                 w(json.dumps(ev) + "\n")
             sys.stdout.flush()
 
-        if now - last_sweep > 5.0:
+        if maintenance_due(now, last_sweep):
             sweep_idle(flows, now)
             out_s = []
             sweep_pending(pending, now, out_s)
@@ -725,7 +983,13 @@ def main():
                 sys.stdout.flush()
             last_sweep = now
 
-    log("stopped")
+    out_s = []
+    drain_pending(pending, out_s)
+    for ev in out_s:
+        sys.stdout.write(json.dumps(ev) + "\n")
+    if out_s:
+        sys.stdout.flush()
+    log("stopped (%d pending requests flushed)" % len(out_s))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+> **Port migration:** The active hub is OTelTrace on `0.0.0.0:30102`. The former NetworkTracing hub on `:31115` is legacy and is not used.
+
 # CentOS 6.7 / Linux 2.6.32 real-node test procedure
 
 This procedure tests the legacy passive capture kit on a real CentOS 6.7 node. It is intentionally destructive only to the NetworkTracing test installation under `/opt/networktracing-legacy`, its SysV init entry, the test spool, and the test traffic generated for this procedure.
@@ -29,7 +31,7 @@ Run these commands on the CentOS node as an unprivileged login user first:
 ```sh
 export HUB_HOST=10.0.0.35                 # replace with the real hub address
 export HUB_BOOTSTRAP=http://$HUB_HOST:30105/oldkernel
-export HUB_ENDPOINT=http://$HUB_HOST:31115
+export HUB_ENDPOINT=http://$HUB_HOST:30102
 export TEST_PORT=31299
 export TEST_NODE=$(hostname -s)
 export TEST_DIR=/tmp/networktracing-el67-test
@@ -40,7 +42,7 @@ Use a dedicated test port. Do not point the test server at an application port c
 On the hub, confirm the actual address and health before touching the node:
 
 ```sh
-curl -fsS http://127.0.0.1:31115/healthz
+curl -fsS http://127.0.0.1:30102/healthz
 curl -fsS http://127.0.0.1:30105/healthz
 curl -fsS -X POST -H 'Content-Type: application/json' \
   -d '{"node":"centos6-preflight","events":[]}' \
@@ -76,7 +78,7 @@ mkdir -p "$TEST_DIR/baseline"
   awk 'NR <= 8 {print}' /proc/net/route
   ps -eo pid,ppid,user,stat,args
   netstat -lnt 2>/dev/null || true
-  netstat -ln 2>/dev/null | grep -E ':30105|:31115|:31299' || true
+  netstat -ln 2>/dev/null | grep -E ':30105|:30102|:31299' || true
 } > "$TEST_DIR/baseline/system.txt" 2>&1
 ```
 

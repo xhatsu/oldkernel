@@ -10,14 +10,15 @@
 # fetched automatically from the hub bootstrap server:
 #
 #   curl -sSf http://HUB:30105/oldkernel/install-oldkernel.sh | sh -s -- \
-#        --endpoint http://HUB:31115
+#        --endpoint http://HUB:30102
 #
 # Local bundle usage:
-#   sh install-oldkernel.sh --endpoint http://hub:31115
+#   sh install-oldkernel.sh --endpoint http://hub:30102
 #   sh install-oldkernel.sh --check [--endpoint ...]
 #   sh install-oldkernel.sh --uninstall
 #
-# Env overrides: NT_IFACE=eth1  NT_PORTS=80,...  NT_HUB=http://HUB:30105/oldkernel
+# Env overrides: NT_IFACE=eth1 NT_PORTS=80,... NT_HUB=http://HUB:30105/oldkernel
+#                NT_WSSE_BODY_BYTES=0..65536 (Python mode only; default 0)
 set -u
 
 PREFIX=/opt/networktracing-legacy
@@ -32,6 +33,7 @@ SHIPPERS="${NT_SHIP_THREADS:-8}"  # concurrent hub POST threads
 KIT_URLS="${NT_HUB:-}"
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
+WSSE_BODY_BYTES="${NT_WSSE_BODY_BYTES:-0}"
 
 log()  { echo "[nt-legacy] $*"; }
 die()  { echo "[nt-legacy] FAIL: $*"; exit 1; }
@@ -42,11 +44,21 @@ while [ $# -gt 0 ]; do
         --endpoint) ENDPOINT="$2"; shift 2 ;;
         --hub)      KIT_URLS="$2"; shift 2 ;;
         --mode)     CAPTURE_MODE="$2"; shift 2 ;;
+        --wsse-body-bytes) WSSE_BODY_BYTES="$2"; shift 2 ;;
         --check)    MODE=check; shift ;;
         --uninstall) MODE=uninstall; shift ;;
         *) die "unknown arg: $1" ;;
     esac
 done
+
+case "$WSSE_BODY_BYTES" in
+    ''|*[!0-9]*) die "WSSE body byte window must be an integer 0..65536" ;;
+esac
+[ "$WSSE_BODY_BYTES" -le 65536 ] \
+    || die "WSSE body byte window must be in range 0..65536"
+if [ "$CAPTURE_MODE" = "cpp" ] && [ "$WSSE_BODY_BYTES" -ne 0 ]; then
+    die "WSSE body capture is supported only in Python mode; C++03 remains header-only"
+fi
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SCRIPT_DIR=""
 
@@ -139,7 +151,14 @@ fi
 # ---------------------------------------------------------------- uninstall
 if [ "$MODE" = "uninstall" ]; then
     log "stopping service..."
-    [ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1 || true
+    if [ -x "$INIT" ]; then
+        if have service; then
+            service networktracing-legacy stop >/dev/null 2>&1 || true
+        fi
+        # Also invoke the script directly: an older install may have been
+        # started outside the service manager, leaving it unaware of PIDs.
+        "$INIT" stop >/dev/null 2>&1 || true
+    fi
     if have chkconfig; then chkconfig networktracing-legacy off >/dev/null 2>&1 || true; fi
     rm -f "$INIT"
     for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py"; do
@@ -189,7 +208,7 @@ if have curl; then
         -d '{"node":"legacy-compat-probe","events":[]}' \
         "$ENDPOINT/api/ingest" 2>/dev/null) || PROBE=""
     case "$PROBE" in
-        *'"ok"'*) log "hub protocol OK ($ENDPOINT)" ;;
+        *'"ok"'*|*'"success"'*) log "hub protocol OK ($ENDPOINT)" ;;
         "") die "hub $ENDPOINT unreachable" ;;
         *)  log "WARN: unexpected hub reply '$PROBE' — continuing" ;;
     esac
@@ -209,7 +228,12 @@ have_root || die "must run as root (try: sudo sh $0 ...)"
 
 # ---------------------------------------------------------------- install
 # Stop existing service and terminate any old running processes
-[ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1 || true
+if [ -x "$INIT" ]; then
+    if have service; then
+        service networktracing-legacy stop >/dev/null 2>&1 || true
+    fi
+    "$INIT" stop >/dev/null 2>&1 || true
+fi
 for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-ship-cpp"; do
     for p in $(pgrep -f "$pattern" 2>/dev/null || true); do
         [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null || true
@@ -307,9 +331,9 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     log "native C++ single-binary capture + shipping selected"
 else
     if [ "$SNIFF_AS" != root ]; then
-        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS'"
+        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES'"
     else
-        SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS"
+        SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES"
     fi
     SHIP_CMD="exec python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
@@ -333,6 +357,7 @@ cat > "$INIT" <<EOF
 PREFIX=$PREFIX
 SNIFF_USER=$SNIFF_AS
 export NT_SHIP_THREADS=$SHIPPERS
+export NT_WSSE_BODY_BYTES=$WSSE_BODY_BYTES
 PIDFILE=/var/run/networktracing-legacy.pid
 CONTROL_FILE=/var/lib/networktracing/remote-desired.json
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
@@ -340,7 +365,7 @@ CONTROL_RUN=/var/lib/networktracing
 
 case "\$1" in
     start)
-        if pgrep -f "\\\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\\\$PREFIX/nt-sniff-cpp" >/dev/null; then
+        if pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null; then
             echo "already running"; exit 0
         fi
         if [ -s "\$CONTROL_TOKEN_FILE" ]; then
@@ -418,11 +443,18 @@ if have systemctl; then
     systemctl daemon-reload 2>/dev/null || true
 fi
 
-"$INIT" start || {
+if have service; then
+    service networktracing-legacy start
+    START_RC=$?
+else
+    "$INIT" start
+    START_RC=$?
+fi
+if [ "$START_RC" -ne 0 ]; then
     [ -f "$PREFIX/sniff.log" ] && { echo "--- $PREFIX/sniff.log ---"; cat "$PREFIX/sniff.log"; }
     [ -f "$PREFIX/ship.log" ] && { echo "--- $PREFIX/ship.log ---"; cat "$PREFIX/ship.log"; }
     die "service failed to start"
-}
+fi
 sleep 2
 if ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-cpp" >/dev/null; then
     [ -f "$PREFIX/sniff.log" ] && { echo "--- $PREFIX/sniff.log ---"; cat "$PREFIX/sniff.log"; }
@@ -431,6 +463,11 @@ if ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-c
 fi
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
+if [ "$WSSE_BODY_BYTES" -ne 0 ]; then
+    log "WSSE UsernameToken inspection: Python-only, bounded to $WSSE_BODY_BYTES bytes/request"
+else
+    log "WSSE UsernameToken inspection: disabled (header-only default)"
+fi
 log "Logs: $PREFIX/sniff.log $PREFIX/ship.log"
 log "Uninstall: sudo -n sh $PREFIX/install-oldkernel.sh --uninstall"
 log "       or: sudo -n service networktracing-legacy uninstall"

@@ -1,3 +1,5 @@
+> **Port migration:** The active hub is OTelTrace on `0.0.0.0:30102`. The former NetworkTracing hub on `:31115` is legacy and is not used.
+
 # DEBUG-NOTES.md — handoff for the next agent working on a real 2.6.32 VM
 
 **Audience:** an agent (or human) with root SSH on an actual CentOS 6.8 /
@@ -42,7 +44,7 @@ commands, and acceptance criteria.
 ### Step 0 — get kit + smoke
 
 ```sh
-HUB=<hub-ip>          # NetworkTracing hub running :30105 bootstrap + :31115 ingest
+HUB=<hub-ip>          # NetworkTracing hub running :30105 bootstrap + :30102 ingest
 mkdir -p /tmp/ntkit && cd /tmp/ntkit
 for f in el68-smoke.sh nt-sniff.py nt-ship.py install-oldkernel.sh README.md DEBUG-NOTES.md; do
   curl -sSf http://$HUB:30105/oldkernel/$f -o $f || wget -q http://$HUB:30105/oldkernel/$f -O $f
@@ -102,9 +104,9 @@ timing (slow first flush), note it; FLUSH_SEC=5 in nt-ship.py is tunable.
 ### Step 3 — shipper against the real hub
 
 ```sh
-cat /tmp/cap.jsonl | sudo python nt-ship.py --endpoint http://$HUB:31115 \
+cat /tmp/cap.jsonl | sudo python nt-ship.py --endpoint http://$HUB:30102 \
     --spool /var/lib/networktracing/spool.jsonl ; echo rc=$?
-curl -s "http://$HUB:31115/api/events?limit=50" | grep pcap-http
+curl -s "http://$HUB:30102/api/events?limit=50" | grep pcap-http
 ```
 
 Then the resilience path (spool+retry):
@@ -116,15 +118,15 @@ echo '{"ts":1,"method":"GET","path":"/spool-test","user":"u1","scheme":"basic","
 sleep 8; ls -la /tmp/sp.jsonl                 # events must be ON DISK
 kill %1
 # then recover through the good endpoint:
-python nt-ship.py --endpoint http://$HUB:31115 --spool /tmp/sp.jsonl < /dev/null
-curl -s "http://$HUB:31115/api/events?limit=10" | grep spool-test
+python nt-ship.py --endpoint http://$HUB:30102 --spool /tmp/sp.jsonl < /dev/null
+curl -s "http://$HUB:30102/api/events?limit=10" | grep spool-test
 ```
 
 ### Step 4 — full install/uninstall lifecycle
 
 ```sh
-sudo sh install-oldkernel.sh --check --endpoint http://$HUB:31115
-sudo sh install-oldkernel.sh     --endpoint http://$HUB:31115
+sudo sh install-oldkernel.sh --check --endpoint http://$HUB:30102
+sudo sh install-oldkernel.sh     --endpoint http://$HUB:30102
 service networktracing-legacy status
 # generate traffic on a monitored port, confirm in hub
 sudo sh install-oldkernel.sh --uninstall        # must exit 0 with "verified clean"
@@ -150,7 +152,7 @@ import sys, types, urllib.request
 u2 = types.ModuleType("urllib2")
 u2.Request = urllib.request.Request; u2.urlopen = urllib.request.urlopen
 sys.modules["urllib2"] = u2
-sys.argv = ["nt-ship.py", "--endpoint", "http://HUB:31115", "--spool", "/tmp/sp"]
+sys.argv = ["nt-ship.py", "--endpoint", "http://HUB:30102", "--spool", "/tmp/sp"]
 import importlib.util
 spec = importlib.util.spec_from_file_location("ntship", "nt-ship.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -195,4 +197,5 @@ bytes straight into `handle_payload`; see git history message
 | 2026-08-26 | **CAPTURE CEILING MEASURED** (testVM1, java app port 8010, connection-per-request): sustained delivery tops out at ~720 events/s regardless of offered load. 48 rps = 100% capture; 500 rps = 96%; 1500 rps = 48%; 3000 rps = 24%. Extrapolated: 10k rps would lose >90% of events | python AF_PACKET userspace loop is the bottleneck (kernel drops overflow). For >1k rps on el6: needs kernel BPF filter (SO_ATTACH_FILTER) + PACKET_FANOUT multi-process capture + C/Go rewriter, or move tier to eBPF-capable kernel |
 | 2026-08-26 | **PERFORMANCE PASS** (all measured on testVM1): (1) nt-sniff now attaches a kernel cBPF filter (SO_ATTACH_FILTER via libc/ctypes — python setsockopt can't carry the sock_fprog pointer) accepting ONLY IPv4/TCP requests destined to monitored ports; response/noise packets never reach userspace. Program verified against a mini-interpreter incl. ihl-variable offsets. (2) HEADER-ONLY capture: events emit at \r\n\r\n, bodies no longer buffered (state-machine removed) — kills body-wait latency and per-flow memory. (3) Hot loop uses precompiled struct.Struct.unpack_from (no slice copies, no ord()). (4) PACKET_FANOUT (-j N) implemented but DISABLED on el6 — fanout needs kernel>=3.1, code auto-falls back to single process to avoid duplicates. (5) SO_RCVBUF raised (el6 caps ~250KB without sysctl). (6) nt-ship now ships CONCURRENTLY: NT_SHIP_THREADS poster threads pull 400-event batches from a Queue; sequential posting was a hard ~1000 ev/s ceiling at ~300-500ms hub latency | combined effect: capture throughput roughly doubled (~1.4k ev/s sustained observed); at 10k rps burst capture rose 14%→28% with NT_SHIP_THREADS=8. Remaining walls: python per-packet parse cost (single core), pipe capacity, and hub ingest latency × thread count. For true 10k rps on el6: libpcap/PACKET_RX_RING rewrite in C/Go + fanout, or move tier to eBPF-capable kernel |
 | 2026-08-26 | ops note: pkill/pgrep -f patterns self-match the invoking shell's cmdline if the pattern string appears in it — killed our own SSH sessions twice during testing | use `[n]t-sniff`-style brackets or kill by PID |
-| 2026-08-26 | **first-run installer built**: hub mirrors can lag behind fixes (stale nt-sniff.py crashed the first-run install), so `build-firstrun.sh` now produces `install-firstrun-el68.sh` — a single self-contained file with the patched sniffer+shipper embedded as base64. Kit resolution order: local bundle → embedded payload → hub download. Verified on bare VM dir: install → service running rootless → `firstrunuser` event end-to-end in hub | rebuild after every kit change: `sh build-firstrun.sh`; one-liner: `curl -sSf http://HUB:30105/oldkernel/install-firstrun-el68.sh \| sh -s -- --endpoint http://HUB:31115` (once uploaded to hub) |
+| 2026-08-26 | **first-run installer built**: hub mirrors can lag behind fixes (stale nt-sniff.py crashed the first-run install), so `build-firstrun.sh` now produces `install-firstrun-el68.sh` — a single self-contained file with the patched sniffer+shipper embedded as base64. Kit resolution order: local bundle → embedded payload → hub download. Verified on bare VM dir: install → service running rootless → `firstrunuser` event end-to-end in hub | rebuild after every kit change: `sh build-firstrun.sh`; one-liner: `curl -sSf http://HUB:30105/oldkernel/install-firstrun-el68.sh \| sh -s -- --endpoint http://HUB:30102` (once uploaded to hub) |
+| 2026-09-08 | Host-local requests to the host's own `enp0s6` address resolve through `lo`, so they cannot validate an `enp0s6` packet socket. A namespace/veth ingress request to the existing Java listener proved capture, response correlation, shipper flush, and hub principal attribution. Also found the Python idle branch swept five-second pending requests only every 30 seconds, Python/C++ shutdown discarded pending response correlations, and direct init-script startup left systemd's service state stale on this host. | unified Python maintenance sweeps at one second, drain pending requests on Python/C++ shutdown, start/stop through the platform `service` wrapper with SysV fallback, accept the hub's `status=success` handshake, added focused regressions, and documented route verification plus namespace/veth fallback |

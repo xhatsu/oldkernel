@@ -18,3 +18,25 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 3. **Command Execution Safeguard**: Set execution timers to detect and retry frozen commands.
 4. **Testing Mandate**: Always run test suites and fixtures before concluding tasks.
 5. **State Tracking**: Maintain `AGENTS.md` and `STATE.md` with project state and architecture memory.
+6. **Live Capture Proof**: Before treating a local curl as a NIC capture test,
+   verify its route with `ip route get`. Linux routes requests to its own
+   interface address over `lo`; use real ingress or an isolated namespace/veth
+   fixture when the configured interface itself must be exercised.
+
+## WSSE Capture State (2026-09-08)
+- Python capture is header-only by default. `NT_WSSE_BODY_BYTES` or
+  `--wsse-body-bytes` explicitly enables a bounded `0..65536` byte SOAP prefix
+  window, with at most 256 body-buffering flows.
+- Only namespaced OASIS 2004 and legacy 2002/07, 2002/12, or 2003/06
+  UsernameToken usernames may become event `user` plus `scheme=wsse`.
+  Credential material and SOAP bodies never enter event JSON or logs.
+- C++03 remains header-only and the installer rejects WSSE body configuration
+  in native mode.
+
+## Sample PCAP Validation (2026-09-08)
+- PCAP test runner `test_pcap_suite.py` validates `nt-sniff.py` and `nt-sniff-cpp`
+  against real capture files in `~/Viettel/Data` (`tcpdump_*.pcap`).
+- Converts Linux cooked `sll` (linktype 113) to Ethernet frames for native injection.
+- Validates W3C traceparents, Basic auth, WSSE UsernameToken extraction, response
+  correlation (status/duration/resp_bytes), and secret scrubbing.
+

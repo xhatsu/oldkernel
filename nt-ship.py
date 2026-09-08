@@ -89,7 +89,11 @@ def main():
     # independent batches multiply that by NT_SHIP_THREADS
     q = Queue.Queue(maxsize=128)
     spool_lock = threading.Lock()
-    nthreads = int(os.environ.get("NT_SHIP_THREADS", "4"))
+    try:
+        nthreads = int(os.environ.get("NT_SHIP_THREADS", "4"))
+    except ValueError:
+        nthreads = 4
+    nthreads = max(1, min(nthreads, 32))
 
     def poster():
         while True:
@@ -143,7 +147,11 @@ def main():
             q.put(buf[:MAX_BATCH])
             del buf[:MAX_BATCH]
 
-    # stdin closed (sniffer stopped) — drain in-memory queue
+    # stdin closed (sniffer stopped) — enqueue the final partial batch before
+    # waiting for poster threads. Previously every shutdown lost 1..399 events.
+    if buf:
+        q.put(buf[:])
+        buf = []
     q.join()
     log("stopped (%d events pending on exit)" % len(buf))
 

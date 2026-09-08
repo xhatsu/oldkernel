@@ -42,6 +42,7 @@ static void stop_signal(int) { g_running = 0; }
 
 static const size_t MAX_FLOWS = 8192;
 static const size_t MAX_PENDING = 8192;
+static const size_t MAX_PENDING_PER_FLOW = 32;
 static const size_t MAX_HEADER = 262144;
 static const size_t MAX_BATCH = 400;
 static const size_t MAX_QUEUE = 4000;
@@ -357,6 +358,15 @@ static void flush_oldest(std::map<PacketKey, std::vector<Pending> > &pending) {
     pending.erase(it);
   }
 }
+static void flush_all_pending(std::map<PacketKey, std::vector<Pending> > &pending) {
+  std::map<PacketKey, std::vector<Pending> >::iterator p;
+  for (p = pending.begin(); p != pending.end(); ++p) {
+    for (size_t i = 0; i < p->second.size(); ++i) {
+      emit_event(p->second[i].ev);
+    }
+  }
+  pending.clear();
+}
 static void sweep(std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending, time_t now) {
   std::map<FlowKey, Flow>::iterator f, fn;
   for (f = flows.begin(); f != flows.end();) {
@@ -472,8 +482,15 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     if (!parse_request(fl.buf.data(), end, &e)) { fl.buf.erase(0, end + 4); continue; }
     fl.buf.erase(0, end + 4);
     PacketKey rk; rk.s_ip = d_ip; rk.sport = (uint16_t)dport; rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
-    if (pending.size() >= MAX_PENDING) flush_oldest(pending);
-    pending[rk].push_back(Pending(e, now_ms()));
+    if (pending.find(rk) == pending.end() && pending.size() >= MAX_PENDING) {
+      flush_oldest(pending);
+    }
+    std::vector<Pending> &queue = pending[rk];
+    if (queue.size() >= MAX_PENDING_PER_FLOW) {
+      emit_event(queue[0].ev);
+      queue.erase(queue.begin());
+    }
+    queue.push_back(Pending(e, now_ms()));
   }
   if (fl.buf.empty()) {
     flows.erase(fk);
@@ -743,6 +760,11 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  /* A response is optional enrichment. Preserve requests still awaiting a
+   * response when SIGTERM/restart ends capture. */
+  flush_all_pending(pending);
+  if (g_endpoint.empty()) std::cout.flush();
 
   if (!g_endpoint.empty() && !g_ship_buf.empty()) {
     send_batches(g_endpoint, g_ship_node, &g_ship_buf, true);
