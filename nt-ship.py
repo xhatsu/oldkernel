@@ -318,6 +318,10 @@ def main():
             i += 1; endpoint = argv[i].rstrip("/")
         elif a == "--spool":
             i += 1; spool = argv[i]
+        elif a == "--ship-rate-kbps":
+            i += 1; os.environ["NT_SHIP_RATE_KBPS"] = argv[i]
+        elif a == "--stats-interval-sec":
+            i += 1; os.environ["NT_STATS_INTERVAL_SEC"] = argv[i]
         elif a in ("-h", "--help"):
             print(__doc__); raise SystemExit(0)
         else:

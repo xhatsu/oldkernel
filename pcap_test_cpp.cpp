@@ -32,7 +32,12 @@ int main(int argc, char **argv) {
   }
   const char *pcap_file = argv[1];
   std::vector<unsigned> ports;
+  g_wsse_body_bytes = 16384;
   for (int i = 2; i < argc; ++i) {
+    if (!strcmp(argv[i], "--wsse-body-bytes") && i + 1 < argc) {
+      g_wsse_body_bytes = (size_t)atoi(argv[++i]);
+      continue;
+    }
     unsigned p = (unsigned)atoi(argv[i]);
     if (valid_port(p)) ports.push_back(p);
   }
@@ -40,7 +45,6 @@ int main(int argc, char **argv) {
     ports.push_back(8001);
   }
 
-  g_wsse_body_bytes = 16384;
   init_rng();
   memset(g_monitored_ports, 0, sizeof(g_monitored_ports));
   for (size_t k = 0; k < ports.size(); ++k) {
@@ -98,7 +102,9 @@ int main(int argc, char **argv) {
       pkt_len = eth_buf.size();
     }
 
-    handle_packet(pkt_ptr, pkt_len, node, ports, flows, pending);
+    time_t pcap_now = (time_t)ph.ts_sec;
+    long long pcap_mono_now = (long long)ph.ts_sec * 1000LL + (long long)ph.ts_usec / 1000LL;
+    handle_packet(pkt_ptr, pkt_len, node, ports, flows, pending, pcap_now, pcap_mono_now);
   }
 
   flush_incomplete_wsse(flows, pending);

@@ -14,6 +14,7 @@ spec.loader.exec_module(nt_sniff)
 
 def test_offline_python(pcap_path, ports, wsse_bytes):
     flows = {}
+    resp_flows = {}
     pending = {}
     out = []
     ports_set = set(ports)
@@ -38,42 +39,9 @@ def test_offline_python(pcap_path, ports, wsse_bytes):
 
             # SLL (113) vs Ethernet (1)
             if linktype == 113:
-                if len(raw) < 16 + 20: continue
-                proto = struct.unpack("!H", raw[14:16])[0]
-                if proto != 0x0800: continue
-                ip = raw[16:]
-            elif linktype == 1:
-                if len(raw) < 14 + 20: continue
-                proto = struct.unpack("!H", raw[12:14])[0]
-                if proto != 0x0800: continue
-                ip = raw[14:]
-            else:
-                continue
-
-            if (ip[0] >> 4) != 4 or ip[9] != 6: continue
-            ihl = (ip[0] & 0x0f) * 4
-            if len(ip) < ihl + 20: continue
-            tcp = ip[ihl:ihl+20]
-            sp, dp = struct.unpack("!HH", tcp[:4])
-            doff = (tcp[12] >> 4) * 4
-            pay = ip[ihl+doff:]
-            flags = tcp[13]
-            src_ip = ".".join(map(str, ip[12:16]))
-            dst_ip = ".".join(map(str, ip[16:20]))
-
-            if sp in ports_set and dp not in ports_set:
-                rk = (src_ip, sp, dst_ip, dp)
-                if pay[:5] == b"HTTP/":
-                    nt_sniff.correlate_response(pending, rk, pay, now, out)
-                elif flags & 0x05:
-                    nt_sniff.pending_pop(rk, out, pending)
-            elif dp in ports_set:
-                if flags & 0x05:
-                    rk = (dst_ip, dp, src_ip, sp)
-                    nt_sniff.pending_pop(rk, out, pending)
-                key = (src_ip, sp, dst_ip, dp)
-                nt_sniff.handle_payload(flows, key, None, pay, (dst_ip, dp, src_ip, sp),
-                                        ports_set, node_host, out, pending, now, wsse_bytes)
+                if len(raw) < 16: continue
+                raw = b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb" + raw[14:16] + raw[16:]
+            nt_sniff.process_packet(raw, ports_set, node_host, flows, resp_flows, pending, out, now, wsse_bytes)
 
     nt_sniff.drain_incomplete_wsse(flows, out, pending, time.time())
     nt_sniff.drain_pending(pending, out)
@@ -222,10 +190,13 @@ if __name__ == "__main__":
     assert "wsse" in res_cpp_249["schemes"] and not res_cpp_249["secret_leaks"]
     print(json.dumps({k: v for k, v in res_cpp_249.items() if k != "sample"}, indent=2))
 
-    print("\n=== PCAP 247: Live Kernel VETH Capture (Python) ===")
-    res_live_py = test_live_veth(PCAP_247, [8001], mode="python", wsse_bytes=8192)
-    print(json.dumps(res_live_py, indent=2))
+    try:
+        print("\n=== PCAP 247: Live Kernel VETH Capture (Python) ===")
+        res_live_py = test_live_veth(PCAP_247, [8001], mode="python", wsse_bytes=8192)
+        print(json.dumps(res_live_py, indent=2))
 
-    print("\n=== PCAP 247: Live Kernel VETH Capture (C++) ===")
-    res_live_cpp = test_live_veth(PCAP_247, [8001], mode="cpp")
-    print(json.dumps(res_live_cpp, indent=2))
+        print("\n=== PCAP 247: Live Kernel VETH Capture (C++) ===")
+        res_live_cpp = test_live_veth(PCAP_247, [8001], mode="cpp")
+        print(json.dumps(res_live_cpp, indent=2))
+    except PermissionError as ex:
+        print("Live Kernel VETH test skipped (unprivileged environment):", ex)

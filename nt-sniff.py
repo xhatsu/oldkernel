@@ -262,16 +262,71 @@ def parse_args(argv):
     return iface, set(ports), verbose, workers, wsse_body_bytes
 
 
+HTTP_STATE_HEADER = 0
+HTTP_STATE_BODY = 1
+HTTP_STATE_CHUNK = 2
+HTTP_STATE_CLOSE_BODY = 3
+
+MAX_OOO_SEGMENTS = 4
+MAX_OOO_BYTES = 16384
+MAX_TOTAL_BUFFER_BYTES = 16 * 1024 * 1024
+
+
+def seq_diff(a, b):
+    diff = (a - b) & 0xFFFFFFFF
+    if diff >= 0x80000000:
+        diff -= 0x100000000
+    return diff
+
+
+def is_method_or_prefix(payload):
+    if not payload:
+        return False
+    p = bytes(payload[:8])
+    for m in (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"PATCH ", b"HEAD ", b"OPTIONS "):
+        check_len = min(len(p), len(m))
+        if p[:check_len] == m[:check_len]:
+            return True
+    return False
+
+
+def find_http_start(buf):
+    b = bytes(buf)
+    best = -1
+    for m in (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"PATCH ", b"HEAD ", b"OPTIONS "):
+        pos = b.find(m)
+        if pos != -1 and (best == -1 or pos < best):
+            best = pos
+    return best
+
+
 class Flow(object):
-    __slots__ = ("buf", "hdrs", "touched", "event", "body_goal",
-                 "head_bytes")
+    __slots__ = ("next_seq", "has_seq", "is_broken", "touched", "first_byte_ts",
+                 "buf", "ooo", "state", "body_remaining", "chunk_remaining",
+                 "chunk_reading_len", "chunk_reading_trailer", "awaiting_wsse", "wsse_event", "wsse_buf",
+                 "wsse_goal", "event", "hdrs", "head_bytes", "body_goal")
+
     def __init__(self):
-        self.buf = bytearray()
-        self.hdrs = None
+        self.next_seq = 0
+        self.has_seq = False
+        self.is_broken = False
         self.touched = time.time()
+        self.first_byte_ts = 0.0
+        self.buf = bytearray()
+        self.ooo = []
+        self.state = HTTP_STATE_HEADER
+        self.body_remaining = 0
+        self.chunk_remaining = 0
+        self.chunk_reading_len = True
+        self.chunk_reading_trailer = False
+        self.awaiting_wsse = False
+        self.wsse_event = None
+        self.wsse_buf = bytearray()
+        self.wsse_goal = 0
         self.event = None
-        self.body_goal = 0
+        self.hdrs = None
         self.head_bytes = 0
+        self.body_goal = 0
 
 
 # ------------------------------------------------- response correlation ----
@@ -306,19 +361,26 @@ def pending_pop(rk, out, pending_tbl=None):
 
 
 def parse_response_head(payload):
-    """First line 'HTTP/1.x NNN ...' -> (status_int|None, content_len|None).
-    Only looks at what's in this segment; headers fit one segment for all
-    realistic API responses."""
+    """First line 'HTTP/1.x NNN ...' -> (status_int|None, content_len|None, head_end_idx|None, is_chunked, is_close)."""
     try:
-        head = payload.split(b"\r\n\r\n", 1)[0]
+        raw = bytes(payload)
+        idx = raw.find(b"\r\n\r\n")
+        if idx < 0:
+            return None, None, None, False, False
+        head = raw[:idx]
         lines = head.replace(b"\r\n", b"\n").split(b"\n")
         first = lines[0].split()
         if len(first) < 2 or not first[0].startswith(b"HTTP/"):
-            return None, None
+            return None, None, idx + 4, False, False
         st = int(first[1])
     except (ValueError, IndexError):
-        return None, None
+        return None, None, None, False, False
     clen = None
+    is_chunked = False
+    is_close = False
+    is_http_10 = first[0].startswith(b"HTTP/1.0")
+    conn_close = False
+    conn_keep_alive = False
     for ln in lines[1:]:
         low = ln.lower()
         if low.startswith(b"content-length:"):
@@ -326,19 +388,222 @@ def parse_response_head(payload):
                 clen = int(ln.split(b":", 1)[1].strip())
             except ValueError:
                 pass
+        elif low.startswith(b"transfer-encoding:"):
+            if b"chunked" in low:
+                is_chunked = True
+        elif low.startswith(b"connection:"):
+            if b"close" in low:
+                conn_close = True
+            elif b"keep-alive" in low:
+                conn_keep_alive = True
+    if is_http_10 and not conn_keep_alive:
+        is_close = True
+    elif conn_close:
+        is_close = True
+    return st, clen, idx + 4, is_chunked, is_close
+
+
+def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, flags=0, is_truncated=False):
+    if flags & 0x02 and seq is not None:
+        rfl = resp_flows[rk] = Flow()
+        rfl.has_seq = True
+        rfl.next_seq = (seq + 1) & 0xFFFFFFFF
+        rfl.touched = now
+        return
+
+    rfl = resp_flows.get(rk)
+    if rfl is None:
+        rfl = Flow()
+        resp_flows[rk] = rfl
+    rfl.touched = now
+
+    plen = len(payload) if payload else 0
+    if plen > 0:
+        if seq is None:
+            rfl.buf.extend(payload)
+        else:
+            if not rfl.has_seq:
+                if (plen >= 5 and payload[:5] == b"HTTP/") or (plen < 5 and b"HTTP/".startswith(payload)):
+                    rfl.has_seq = True
+                    rfl.next_seq = seq
+                    rfl.is_broken = False
+                else:
+                    if len(rfl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
+                        if not any(s == seq for s, _ in rfl.ooo):
+                            rfl.ooo.append((seq, bytes(payload)))
+                    return
+
+            diff = seq_diff(seq, rfl.next_seq)
+            if diff == 0:
+                if is_truncated:
+                    rfl.is_broken = True
+                else:
+                    rfl.buf.extend(payload)
+                    rfl.next_seq = (rfl.next_seq + plen) & 0xFFFFFFFF
+                    drained = True
+                    while drained and rfl.ooo:
+                        drained = False
+                        for i, (oseq, odata) in enumerate(rfl.ooo):
+                            odiff = seq_diff(oseq, rfl.next_seq)
+                            if odiff == 0:
+                                rfl.buf.extend(odata)
+                                rfl.next_seq = (rfl.next_seq + len(odata)) & 0xFFFFFFFF
+                                rfl.ooo.pop(i)
+                                drained = True
+                                break
+                            elif odiff < 0:
+                                o_overlap = -odiff
+                                if o_overlap < len(odata):
+                                    rfl.buf.extend(odata[o_overlap:])
+                                    rfl.next_seq = (rfl.next_seq + len(odata) - o_overlap) & 0xFFFFFFFF
+                                rfl.ooo.pop(i)
+                                drained = True
+                                break
+            elif diff < 0:
+                overlap = -diff
+                if overlap < plen and not is_truncated:
+                    rfl.buf.extend(payload[overlap:])
+                    rfl.next_seq = (rfl.next_seq + plen - overlap) & 0xFFFFFFFF
+            else:
+                if len(rfl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
+                    if not any(s == seq for s, _ in rfl.ooo):
+                        rfl.ooo.append((seq, bytes(payload)))
+                else:
+                    rfl.is_broken = True
+
+    # Parse complete responses from reassembled buffer using HTTP framing
+    while rfl.buf and not rfl.is_broken:
+        if rfl.state == HTTP_STATE_HEADER:
+            st, clen, head_len, is_chunked, is_close = parse_response_head(rfl.buf)
+            if st is None:
+                if head_len is not None:
+                    del rfl.buf[:head_len]
+                break
+
+            if 100 <= st <= 199 and st != 101:
+                del rfl.buf[:head_len]
+                continue
+
+            ent = pending_tbl.get(rk)
+            is_head = False
+            if ent:
+                ev, started = ent.pop(0)
+                if not ent:
+                    pending_tbl.pop(rk, None)
+                if ev.get("method") == "HEAD":
+                    is_head = True
+                ev["status"] = st
+                ev["duration_ms"] = max(0, int((now - started) * 1000))
+                if clen is not None:
+                    ev["resp_bytes"] = clen
+                out.append(ev)
+
+            del rfl.buf[:head_len]
+
+            if is_head or st == 204 or st == 304:
+                rfl.state = HTTP_STATE_HEADER
+            elif is_chunked:
+                rfl.state = HTTP_STATE_CHUNK
+                rfl.chunk_reading_len = True
+                rfl.chunk_reading_trailer = False
+                rfl.chunk_remaining = 0
+            elif clen is not None:
+                if clen > 0:
+                    rfl.state = HTTP_STATE_BODY
+                    rfl.body_remaining = clen
+                else:
+                    rfl.state = HTTP_STATE_HEADER
+            else:
+                rfl.state = HTTP_STATE_CLOSE_BODY
+            continue
+
+        if rfl.state == HTTP_STATE_BODY:
+            if not rfl.buf:
+                break
+            to_consume = min(len(rfl.buf), rfl.body_remaining)
+            del rfl.buf[:to_consume]
+            rfl.body_remaining -= to_consume
+            if rfl.body_remaining == 0:
+                rfl.state = HTTP_STATE_HEADER
+            continue
+
+        if rfl.state == HTTP_STATE_CHUNK:
+            if not rfl.buf:
+                break
+            if rfl.chunk_reading_trailer:
+                if len(rfl.buf) >= 2 and rfl.buf[:2] == b"\r\n":
+                    del rfl.buf[:2]
+                    rfl.chunk_reading_trailer = False
+                    rfl.state = HTTP_STATE_HEADER
+                    continue
+                tr_end = rfl.buf.find(b"\r\n\r\n")
+                if tr_end != -1:
+                    del rfl.buf[:tr_end + 4]
+                    rfl.chunk_reading_trailer = False
+                    rfl.state = HTTP_STATE_HEADER
+                    continue
+                if len(rfl.buf) > MAX_HDRS:
+                    rfl.buf = bytearray()
+                    rfl.is_broken = True
+                break
+            if rfl.chunk_reading_len:
+                crlf = rfl.buf.find(b"\r\n")
+                if crlf == -1:
+                    if len(rfl.buf) > 64:
+                        rfl.buf = bytearray()
+                        rfl.is_broken = True
+                    break
+                line = bytes(rfl.buf[:crlf]).strip()
+                semi = line.find(b";")
+                hex_str = line[:semi].strip() if semi != -1 else line
+                try:
+                    chunk_len = int(hex_str, 16)
+                except ValueError:
+                    rfl.buf = bytearray()
+                    rfl.is_broken = True
+                    break
+                del rfl.buf[:crlf + 2]
+                if chunk_len == 0:
+                    rfl.chunk_reading_trailer = True
+                    continue
+                else:
+                    rfl.chunk_remaining = chunk_len + 2
+                    rfl.chunk_reading_len = False
+            else:
+                to_consume = min(len(rfl.buf), rfl.chunk_remaining)
+                del rfl.buf[:to_consume]
+                rfl.chunk_remaining -= to_consume
+                if rfl.chunk_remaining == 0:
+                    rfl.chunk_reading_len = True
+            continue
+
+        if rfl.state == HTTP_STATE_CLOSE_BODY:
+            del rfl.buf[:]
             break
-    return st, clen
+
+    if flags & 0x05:
+        resp_flows.pop(rk, None)
+        pending_pop(rk, out, pending_tbl)
 
 
-def correlate_response(pending_tbl, rk, payload, now, out):
+def correlate_response(pending_tbl, rk, payload, now, out, resp_flows=None, seq=None, flags=0, is_truncated=False):
     """Attach one response head to the oldest request on a connection.
 
     HTTP/1.1 pipelining can leave several requests queued for the same
-    four-tuple.  Consume exactly one entry; deleting the whole key here loses
+    four-tuple. Consume exactly one entry; deleting the whole key here loses
     every request after the first response.
     """
-    st, clen = parse_response_head(payload)
-    if st is None:
+    if resp_flows is not None:
+        handle_response(resp_flows, rk, payload, now, out, pending_tbl,
+                        seq=seq, flags=flags, is_truncated=is_truncated)
+        return True
+    res = parse_response_head(payload)
+    if res[0] is None:
+        return False
+    st, clen, head_len = res[0], res[1], res[2]
+    if 100 <= st <= 199 and st != 101:
+        if head_len is not None and len(payload) > head_len:
+            return correlate_response(pending_tbl, rk, payload[head_len:], now, out)
         return False
     ent = pending_tbl.get(rk)
     if not ent:
@@ -550,7 +815,8 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
 def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
     """Discard capture buffers, then emit/queue the sanitized event only."""
     dst_ip, dport, src_ip, sport = meta
-    ev = fl.event
+    ev = fl.wsse_event if fl.awaiting_wsse else fl.event
+    fl.awaiting_wsse = False
     flows.pop(key, None)
     if not ev:
         return
@@ -569,136 +835,434 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
         ent = pending_tbl.get(rk)
         if ent is None:
             ent = pending_tbl[rk] = []
-    ent.append([ev, now if now is not None else time.time()])
+    started = fl.first_byte_ts if fl.first_byte_ts > 0 else (now if now is not None else time.time())
+    ent.append([ev, started])
+
+
+def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_tbl, now):
+    dst_ip, dport, src_ip, sport = meta
+    if not ev:
+        return
+    ev["req_bytes"] = head_bytes
+    if pending_tbl is None:
+        out.append(ev)
+        return
+    rk = (dst_ip, dport, src_ip, sport)
+    ent = pending_tbl.get(rk)
+    if ent is None:
+        if len(pending_tbl) >= PENDING_MAX:
+            _flush_oldest_pending(pending_tbl, out)
+        ent = pending_tbl[rk] = []
+    elif len(ent) >= PENDING_PER_FLOW:
+        pending_pop(rk, out, pending_tbl)
+        ent = pending_tbl.get(rk)
+        if ent is None:
+            ent = pending_tbl[rk] = []
+    started = first_byte_ts if first_byte_ts > 0 else (now if now is not None else time.time())
+    ent.append([ev, started])
 
 
 def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
     """Append no more than body_goal bytes and finish as soon as possible."""
-    remaining = fl.body_goal - len(fl.buf)
+    remaining = fl.wsse_goal - len(fl.wsse_buf)
     if remaining > 0 and payload:
-        fl.buf.extend(bytearray(payload[:remaining]))
-    username = extract_wsse_username(fl.buf)
+        copy_len = min(remaining, len(payload))
+        fl.wsse_buf.extend(bytearray(payload[:copy_len]))
+    username = extract_wsse_username(fl.wsse_buf)
     if username:
-        fl.event["wsse_user"] = username
-        fl.event["user"] = username
-        fl.event["scheme"] = "wsse"
-    if username or len(fl.buf) >= fl.body_goal:
-        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
+        fl.wsse_event["wsse_user"] = username
+        fl.wsse_event["user"] = username
+        fl.wsse_event["scheme"] = "wsse"
+    if username or len(fl.wsse_buf) >= fl.wsse_goal:
+        _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
+                                 meta, out, pending_tbl, now)
+        fl.awaiting_wsse = False
         return True
     return False
 
 
 def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
-                   pending_tbl=None, now=None, wsse_body_bytes=0):
-    """Feed one direction's payload; emit finished events to out(list).
-
-    Bodies are ignored unless wsse_body_bytes is non-zero. In opt-in mode,
-    only XML requests with Content-Length are inspected, each buffer is
-    bounded by wsse_body_bytes, and only a recognized WSSE username reaches
-    the event. The body and all other UsernameToken material are discarded.
-    """
+                   pending_tbl=None, now=None, wsse_body_bytes=0,
+                   seq=None, flags=0, is_truncated=False):
     dst_ip, dport, src_ip, sport = meta
     if not valid_port(dport) or not valid_port(sport):
         return
+    if now is None:
+        now = time.time()
+
+    # SYN handling: reset flow and start sequence tracking
+    if flags & 0x02 and seq is not None:
+        fl = flows.get(key)
+        if fl is not None and fl.awaiting_wsse and fl.wsse_event:
+            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
+                                     meta, out, pending_tbl, now)
+        rk = (dst_ip, dport, src_ip, sport)
+        if pending_tbl is not None:
+            ent = pending_tbl.pop(rk, None)
+            if ent:
+                for pev, _ in ent:
+                    out.append(pev)
+        if rev_key is not None and rev_key in flows:
+            flows.pop(rev_key, None)
+        fl = Flow()
+        fl.has_seq = True
+        fl.next_seq = (seq + 1) & 0xFFFFFFFF
+        fl.touched = now
+        fl.first_byte_ts = 0.0
+        flows[key] = fl
+        return
+
     fl = flows.get(key)
     if fl is None:
         fl = Flow()
         flows[key] = fl
         if len(flows) > MAX_FLOWS:
-            enforce_limit(flows, time.time())
-    fl.touched = time.time()
+            enforce_limit(flows, now)
+    fl.touched = now
 
-    if (fl.event is not None and fl.event.get("basic_user") and
-            any(payload.startswith(method.encode("ascii") + b" ")
-                for method in METHODS)):
-        # A new keep-alive request started before the bounded WSSE window
-        # completed. Preserve the Basic event, then parse the new request.
-        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
-        handle_payload(flows, key, rev_key, payload, meta, ports, node_host,
-                       out, pending_tbl, now, wsse_body_bytes)
-        return
-    if fl.event is not None:
-        _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now)
-        return
+    # Check keep-alive request transition while waiting for body in direct test feed mode
+    if seq is None and fl.awaiting_wsse and payload and is_method_or_prefix(payload):
+        _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
+                                 meta, out, pending_tbl, now)
+        fl.awaiting_wsse = False
+        fl.state = HTTP_STATE_HEADER
+        fl.buf = bytearray()
 
-    fl.buf.extend(bytearray(payload))
-    idx = fl.buf.find(b"\r\n\r\n")
-    if idx < 0:
-        if len(fl.buf) > MAX_HDRS:
-            flows.pop(key, None)
-        return
-    head = bytes(fl.buf[:idx])
-    lines = head.replace(b"\r\n", b"\n").split(b"\n")
-    hdrs = {}
-    first = lines[0].strip().split()
-    if len(first) >= 2 and first[0] in [m.encode() for m in METHODS]:
-        hdrs["_method"] = first[0].decode("ascii", "replace")
-        hdrs["_path"] = first[1].decode("ascii", "replace")
-    else:
-        flows.pop(key, None)
-        return
-    for ln in lines[1:]:
-        if b":" not in ln:
+    plen = len(payload) if payload else 0
+    if plen > 0:
+        if seq is None:
+            fl.buf.extend(payload)
+        else:
+            if not fl.has_seq:
+                if is_method_or_prefix(payload):
+                    fl.has_seq = True
+                    fl.next_seq = seq
+                    fl.is_broken = False
+                else:
+                    if len(fl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
+                        if not any(s == seq for s, _ in fl.ooo):
+                            fl.ooo.append((seq, bytes(payload)))
+                    return
+
+            diff = seq_diff(seq, fl.next_seq)
+            if diff == 0:
+                if is_truncated:
+                    fl.is_broken = True
+                else:
+                    fl.buf.extend(payload)
+                    fl.next_seq = (fl.next_seq + plen) & 0xFFFFFFFF
+                    drained = True
+                    while drained and fl.ooo:
+                        drained = False
+                        for i, (oseq, odata) in enumerate(fl.ooo):
+                            odiff = seq_diff(oseq, fl.next_seq)
+                            if odiff == 0:
+                                fl.buf.extend(odata)
+                                fl.next_seq = (fl.next_seq + len(odata)) & 0xFFFFFFFF
+                                fl.ooo.pop(i)
+                                drained = True
+                                break
+                            elif odiff < 0:
+                                o_overlap = -odiff
+                                if o_overlap < len(odata):
+                                    fl.buf.extend(odata[o_overlap:])
+                                    fl.next_seq = (fl.next_seq + len(odata) - o_overlap) & 0xFFFFFFFF
+                                fl.ooo.pop(i)
+                                drained = True
+                                break
+            elif diff < 0:
+                overlap = -diff
+                if overlap < plen and not is_truncated:
+                    fl.buf.extend(payload[overlap:])
+                    fl.next_seq = (fl.next_seq + plen - overlap) & 0xFFFFFFFF
+            else:
+                if len(fl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
+                    if not any(s == seq for s, _ in fl.ooo):
+                        fl.ooo.append((seq, bytes(payload)))
+                else:
+                    fl.is_broken = True
+
+    # HTTP framing state machine
+    while len(fl.buf) > 0 and not fl.is_broken:
+        if fl.state == HTTP_STATE_HEADER:
+            if not fl.first_byte_ts:
+                fl.first_byte_ts = now
+
+            idx = fl.buf.find(b"\r\n\r\n")
+            if idx < 0:
+                if len(fl.buf) > MAX_HDRS:
+                    fl.buf = bytearray()
+                    fl.is_broken = True
+                break
+            start = find_http_start(fl.buf)
+            if start < 0 or start > idx:
+                del fl.buf[:idx + 4]
+                continue
+            if start > 0:
+                del fl.buf[:start]
+                idx -= start
+
+            head = bytes(fl.buf[:idx])
+            lines = head.replace(b"\r\n", b"\n").split(b"\n")
+            first = lines[0].strip().split()
+            if len(first) < 2 or first[0].decode("ascii", "replace") not in METHODS:
+                del fl.buf[:idx + 4]
+                continue
+            hdrs = {}
+            hdrs["_method"] = first[0].decode("ascii", "replace")
+            hdrs["_path"] = first[1].decode("ascii", "replace")
+            for ln in lines[1:]:
+                if b":" not in ln:
+                    continue
+                kn, kv = ln.split(b":", 1)
+                hdrs[kn.strip().lower().decode("ascii", "replace")] = kv.strip().decode("utf-8", "replace")[:180]
+            fl.hdrs = hdrs
+            fl.event = finish_event(fl, key, dst_ip, dport, src_ip, sport, ports, node_host)
+            fl.head_bytes = idx + 4
+            del fl.buf[:idx + 4]
+
+            if not fl.event:
+                continue
+
+            try:
+                content_length = int(hdrs.get("content-length", "0"))
+            except (ValueError, TypeError):
+                content_length = 0
+            te = hdrs.get("transfer-encoding", "").lower()
+            is_chunked = "chunked" in te
+
+            if content_length > 0 and is_chunked:
+                fl.buf = bytearray()
+                fl.is_broken = True
+                break
+
+            active_body_flows = sum(1 for cand in flows.values() if cand.awaiting_wsse or (cand.event is not None and getattr(cand, "body_goal", 0) > 0))
+            wsse_eligible = (wsse_body_bytes > 0 and
+                             is_soap_content_type(hdrs.get("content-type")) and
+                             content_length > 0 and
+                             not is_chunked and
+                             active_body_flows < MAX_WSSE_BODY_FLOWS)
+
+            if wsse_eligible:
+                fl.awaiting_wsse = True
+                fl.wsse_event = fl.event
+                fl.wsse_buf = bytearray()
+                fl.wsse_goal = min(content_length, wsse_body_bytes, MAX_WSSE_BODY_BYTES)
+            else:
+                _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+            fl.event = None
+
+            if content_length > 0:
+                fl.state = HTTP_STATE_BODY
+                fl.body_remaining = content_length
+            elif is_chunked:
+                fl.state = HTTP_STATE_CHUNK
+                fl.chunk_reading_len = True
+                fl.chunk_reading_trailer = False
+                fl.chunk_remaining = 0
+            else:
+                fl.state = HTTP_STATE_HEADER
+                fl.first_byte_ts = now if fl.buf else 0.0
             continue
-        kn, kv = ln.split(b":", 1)
-        hdrs[kn.strip().lower().decode(
-            "ascii", "replace")] = kv.strip().decode(
-                "utf-8", "replace")[:180]
-    fl.hdrs = hdrs
-    fl.event = finish_event(fl, key, dst_ip, dport, src_ip, sport,
-                            ports, node_host)
-    if not fl.event:
+
+        elif fl.state == HTTP_STATE_BODY:
+            if not fl.buf:
+                break
+            to_consume = min(len(fl.buf), fl.body_remaining)
+            if fl.awaiting_wsse:
+                wsse_need = fl.wsse_goal - len(fl.wsse_buf)
+                if wsse_need > 0:
+                    copy_len = min(to_consume, wsse_need)
+                    fl.wsse_buf.extend(fl.buf[:copy_len])
+                username = extract_wsse_username(fl.wsse_buf)
+                if username or len(fl.wsse_buf) >= fl.wsse_goal:
+                    ev = fl.wsse_event
+                    if username:
+                        ev["wsse_user"] = username
+                        ev["user"] = username
+                        ev["scheme"] = "wsse"
+                    _emit_request_to_pending(ev, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+                    fl.awaiting_wsse = False
+
+            del fl.buf[:to_consume]
+            fl.body_remaining -= to_consume
+            if fl.body_remaining == 0:
+                if fl.awaiting_wsse:
+                    _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+                    fl.awaiting_wsse = False
+                fl.state = HTTP_STATE_HEADER
+                fl.first_byte_ts = now if fl.buf else 0.0
+            continue
+
+        elif fl.state == HTTP_STATE_CHUNK:
+            if not fl.buf:
+                break
+            if fl.chunk_reading_trailer:
+                if len(fl.buf) >= 2 and fl.buf[:2] == b"\r\n":
+                    del fl.buf[:2]
+                    fl.chunk_reading_trailer = False
+                    fl.state = HTTP_STATE_HEADER
+                    fl.first_byte_ts = now if fl.buf else 0.0
+                    continue
+                tr_end = fl.buf.find(b"\r\n\r\n")
+                if tr_end != -1:
+                    del fl.buf[:tr_end + 4]
+                    fl.chunk_reading_trailer = False
+                    fl.state = HTTP_STATE_HEADER
+                    fl.first_byte_ts = now if fl.buf else 0.0
+                    continue
+                if len(fl.buf) > MAX_HDRS:
+                    fl.buf = bytearray()
+                    fl.is_broken = True
+                break
+            if fl.chunk_reading_len:
+                crlf = fl.buf.find(b"\r\n")
+                if crlf < 0:
+                    if len(fl.buf) > 64:
+                        fl.buf = bytearray()
+                        fl.state = HTTP_STATE_HEADER
+                        fl.first_byte_ts = now if fl.buf else 0.0
+                    break
+                line = bytes(fl.buf[:crlf]).strip()
+                semi = line.find(b";")
+                hex_str = line[:semi].strip() if semi != -1 else line
+                try:
+                    chunk_len = int(hex_str, 16)
+                except ValueError:
+                    fl.buf = bytearray()
+                    fl.state = HTTP_STATE_HEADER
+                    fl.first_byte_ts = now if fl.buf else 0.0
+                    break
+                del fl.buf[:crlf + 2]
+                if chunk_len == 0:
+                    fl.chunk_reading_trailer = True
+                    continue
+                else:
+                    fl.chunk_remaining = chunk_len + 2
+                    fl.chunk_reading_len = False
+            else:
+                to_consume = min(len(fl.buf), fl.chunk_remaining)
+                del fl.buf[:to_consume]
+                fl.chunk_remaining -= to_consume
+                if fl.chunk_remaining == 0:
+                    fl.chunk_reading_len = True
+            continue
+
+    if flags & 0x05:
+        if fl.awaiting_wsse and fl.wsse_event:
+            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+            fl.awaiting_wsse = False
         flows.pop(key, None)
-        return
-    fl.head_bytes = idx + 4
-    initial_body = bytes(fl.buf[idx + 4:])
-    fl.buf = bytearray()
-
-    if (not wsse_body_bytes or
-            not is_soap_content_type(hdrs.get("content-type"))):
-        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
-        return
-    try:
-        content_length = int(hdrs.get("content-length", ""))
-    except (TypeError, ValueError):
-        content_length = 0
-    active_body_flows = sum([1 for candidate in flows.values()
-                             if candidate.event is not None and
-                             candidate.body_goal > 0])
-    if (content_length <= 0 or active_body_flows >= MAX_WSSE_BODY_FLOWS or
-            "chunked" in hdrs.get("transfer-encoding", "").lower()):
-        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
-        return
-    fl.body_goal = min(content_length, wsse_body_bytes, MAX_WSSE_BODY_BYTES)
-    _try_wsse_body(flows, key, fl, initial_body, meta, out, pending_tbl, now)
+    elif seq is None and fl.state == HTTP_STATE_HEADER and not fl.buf and not fl.ooo and not fl.awaiting_wsse:
+        flows.pop(key, None)
 
 
-def sweep_idle(flows, now, out=None, pending_tbl=None):
+def sweep_idle(flows, now, out=None, pending_tbl=None, resp_flows=None):
     stale = []
     for k, fl in flows.items():
         if now - fl.touched > FLOW_TTL:
             stale.append(k)
     for k in stale:
         fl = flows.get(k)
-        if (out is not None and fl is not None and fl.event is not None and
-                fl.event.get("basic_user")):
-            src_ip, sport, dst_ip, dport = k
-            _emit_request(flows, k, fl, (dst_ip, dport, src_ip, sport),
-                          out, pending_tbl, now)
-        else:
-            flows.pop(k, None)
+        if fl is not None and fl.awaiting_wsse and fl.wsse_event is not None:
+            if out is not None:
+                src_ip, sport, dst_ip, dport = k
+                _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
+                                         (dst_ip, dport, src_ip, sport),
+                                         out, pending_tbl, now)
+            fl.awaiting_wsse = False
+        flows.pop(k, None)
+    if resp_flows is not None:
+        rstale = [k for k, rfl in resp_flows.items() if now - rfl.touched > FLOW_TTL]
+        for k in rstale:
+            resp_flows.pop(k, None)
 
 
 def drain_incomplete_wsse(flows, out, pending_tbl, now=None):
-    """Fall back to the retained pre-WSSE identity during clean shutdown."""
+    """Fall back to emitting the request event if WSSE inspection was incomplete."""
+    if now is None:
+        now = time.time()
     for key in list(flows.keys()):
         fl = flows.get(key)
-        if (fl is None or fl.event is None or
-                not fl.event.get("basic_user")):
+        if fl is None:
             continue
-        src_ip, sport, dst_ip, dport = key
-        _emit_request(flows, key, fl, (dst_ip, dport, src_ip, sport),
-                      out, pending_tbl, now)
+        if fl.awaiting_wsse and fl.wsse_event is not None:
+            src_ip, sport, dst_ip, dport = key
+            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
+                                     (dst_ip, dport, src_ip, sport),
+                                     out, pending_tbl, now)
+            fl.awaiting_wsse = False
+        flows.pop(key, None)
+
+
+def process_packet(pkt, ports, node_host, flows, resp_flows, pending_tbl, out, now=None, wsse_body_bytes=0):
+    n = len(pkt)
+    if n < 34:
+        return False
+    if now is None:
+        now = time.time()
+    off = 14
+    etype = struct.unpack("!H", pkt[12:14])[0]
+    if etype == ETH_P_VLAN:
+        if n < 38:
+            return False
+        etype = struct.unpack("!H", pkt[16:18])[0]
+        off = 18
+    elif etype != ETH_P_IP:
+        return False
+
+    ip0 = b2i(pkt[off])
+    if (ip0 >> 4) != 4 or b2i(pkt[off + 9]) != 6:
+        return False
+    ihl = (ip0 & 0x0F) * 4
+    if ihl < 20 or n < off + ihl + 20:
+        return False
+
+    frag = struct.unpack("!H", pkt[off + 6:off + 8])[0]
+    if frag & 0x1FFF:
+        return False
+
+    ip_total_len = struct.unpack("!H", pkt[off + 2:off + 4])[0]
+    is_truncated = False
+    if ip_total_len > 0:
+        if ip_total_len < ihl + 20:
+            return False
+        if n - off < ip_total_len:
+            is_truncated = True
+        elif n - off > ip_total_len:
+            n = off + ip_total_len
+
+    src_ip = socket.inet_ntoa(pkt[off + 12:off + 16])
+    dst_ip = socket.inet_ntoa(pkt[off + 16:off + 20])
+    tcp_off = off + ihl
+    sport, dport = struct.unpack("!HH", pkt[tcp_off:tcp_off + 4])
+    seq = struct.unpack("!I", pkt[tcp_off + 4:tcp_off + 8])[0]
+    doff_byte = b2i(pkt[tcp_off + 12])
+    doff = (doff_byte >> 4) * 4
+    if doff < 20 or n < tcp_off + doff:
+        return False
+
+    flags = b2i(pkt[tcp_off + 13])
+    pay_start = tcp_off + doff
+    payload = pkt[pay_start:n] if n > pay_start else b""
+
+    # Response direction: Server -> Client
+    if sport in ports and dport not in ports:
+        rk = (src_ip, sport, dst_ip, dport)
+        handle_response(resp_flows, rk, payload, now, out, pending_tbl,
+                        seq=seq, flags=flags, is_truncated=is_truncated)
+        return True
+
+    # Request direction: Client -> Server
+    elif dport in ports:
+        key = (src_ip, sport, dst_ip, dport)
+        meta = (dst_ip, dport, src_ip, sport)
+        handle_payload(flows, key, None, payload, meta, ports, node_host, out,
+                       pending_tbl, now, wsse_body_bytes,
+                       seq=seq, flags=flags, is_truncated=is_truncated)
+        return True
+
+    return False
 
 
 def _flush_oldest_pending(pending_tbl, out):
@@ -882,6 +1446,7 @@ def main():
     ntoa = socket.inet_ntoa
 
     flows = {}
+    resp_flows = {}
     running = [True]
     stats_interval = stats_interval_seconds()
     stats_state = {"packets_total": 0, "packet_bytes_total": 0,
@@ -1005,7 +1570,7 @@ def main():
             now = time.time()
             if maintenance_due(now, last_sweep):
                 out_s = []
-                sweep_idle(flows, now, out_s, pending)
+                sweep_idle(flows, now, out_s, pending, resp_flows)
                 sweep_pending(pending, now, out_s)
                 write_events(out_s)
                 last_sweep = now
@@ -1014,62 +1579,17 @@ def main():
             if e.errno == errno.EINTR:
                 continue
             raise
-        n = len(pkt)
-        if n < 34:
-            continue
-        out = []
-        off = 14                      # ethernet header
-        etype = u16(pkt, 12)[0]
-        if etype == ETH_P_VLAN:
-            etype = u16(pkt, 16)[0]
-            off = 18
-        elif etype != ETH_P_IP:
-            continue                  # with BPF attached this is rare
-        ip0 = ub(pkt, off)[0]
-        if ip0 >> 4 != 4 or ub(pkt, off + 9)[0] != 6:   # IPv4 TCP only
-            continue
-        ihl = (ip0 & 0x0F) * 4
-        frag = u16(pkt, off + 6)[0]
-        if frag & 0x1FFF:                         # non-first fragment
-            continue
-        src_ip = ntoa(pkt[off + 12:off + 16])
-        dst_ip = ntoa(pkt[off + 16:off + 20])
-        tcp_off = off + ihl
-        sport, dport = uh(pkt, tcp_off)
-        doff_flags = ub(pkt, tcp_off + 12)
-        doff = (doff_flags[0] >> 4) * 4
-        pay_start = tcp_off + doff
-        if n <= pay_start:
-            continue                              # no payload in segment
-        payload = pkt[pay_start:]
-        flags = doff_flags[1]
-        now = time.time()
 
-        # ---------------- RESPONSE direction (server -> client) ----------
-        if sport in ports and dport not in ports:
-            # pending key was stored as (server_ip, server_port, client_ip,
-            # client_port) == (src, sport, dst, dport) OF THIS response pkt
-            rk = (src_ip, sport, dst_ip, dport)
-            if payload[:5] == b"HTTP/":
-                correlate_response(pending, rk, payload, now, out)
-            elif flags & 0x05:                      # FIN|RST: flush unmatched
-                ev = pending_pop(rk, out)
-        # ---------------- REQUEST direction (client -> server) -----------
-        elif dport in ports:
-            if flags & 0x05:                      # teardown w/o response seen
-                rk = (dst_ip, dport, src_ip, sport)
-                pending_pop(rk, out)
-            key = (src_ip, sport, dst_ip, dport)
-            handle_payload(flows, key, None, payload,
-                           (dst_ip, dport, src_ip, sport),
-                           ports, node_host, out, pending, now,
-                           wsse_body_bytes)
+        now = time.time()
+        out = []
+        process_packet(pkt, ports, node_host, flows, resp_flows, pending,
+                       out, now, wsse_body_bytes)
         if out:
             write_events(out)
 
         if maintenance_due(now, last_sweep):
             out_s = []
-            sweep_idle(flows, now, out_s, pending)
+            sweep_idle(flows, now, out_s, pending, resp_flows)
             sweep_pending(pending, now, out_s)
             write_events(out_s)
             last_sweep = now

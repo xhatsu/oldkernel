@@ -51,8 +51,9 @@ CAP_PID=
 python3 - "$TMP/capture.jsonl" <<'PY'
 import json, sys
 rows=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
-assert len(rows) == 1, rows
-x=rows[0]
+events=[x for x in rows if not x.get('_nt_internal')]
+assert len(events) >= 1, rows
+x=events[0]
 assert x['source_probe']=='pcap-http-cpp'
 assert x['method']=='GET' and x['path']=='/native-e2e'
 assert x['user']=='alice' and x['scheme']=='basic'

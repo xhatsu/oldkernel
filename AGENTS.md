@@ -92,3 +92,26 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 - Converts Linux cooked `sll` (linktype 113) to Ethernet frames for native injection.
 - Validates W3C traceparents, Basic auth, WSSE UsernameToken extraction, response
   correlation (status/duration/resp_bytes), and secret scrubbing.
+
+## Dual-Mode Test & Verification State (2026-09-09)
+- Both C++ mode (`nt-sniff-cpp | nt-ship-cpp`) and Python mode (`nt-sniff.py | nt-ship.py`)
+  fully validated across all unit, contract, ASAN/UBSAN, offline PCAP, and live kernel capture tests.
+- `nt-ship.py` supports `--ship-rate-kbps` and `--stats-interval-sec` for full CLI option
+  parity with `nt-ship-cpp`.
+- Live service validated in both Python mode and C++ mode under the real `nt-resource-guard.sh`
+  and SysV supervisor, confirming rootless execution (`ntsniff`), 256 MiB address space bounds,
+  and zero credential exposure. Production runs in native C++ mode on `enp0s6:18080`.
+
+## Capture & Parser Hardening State (2026-09-09)
+- **TCP Stream Reassembly**: Modular sequence-difference arithmetic (`seq_diff`), duplicate segment suppression, retransmission overlap trimming, and bounded out-of-order segment queues (up to 4 segments / 16 KiB per flow) implemented in both C++ (`nt-sniff-cpp.cpp`) and Python (`nt-sniff.py`).
+- **HTTP Request & Response Framing**: Explicit state machines (`HTTP_STATE_HEADER`, `HTTP_STATE_BODY`, `HTTP_STATE_CHUNK`, `HTTP_STATE_CLOSE_BODY`) on both request and response paths. Eliminates body scanning for fake status lines, parses chunk extensions/trailers, respects HEAD request bodyless responses (RFC 7230 §3.3.3), and drops desynchronizing requests with conflicting Content-Length + chunked encoding.
+- **Symmetrical Memory Accounting**: Symmetrical tracking via `flow_bytes_add()` and `flow_bytes_sub()` across all buffers (`buf`, `wsse_buf`, `ooo`) against `MAX_TOTAL_BUFFER_BYTES` (16 MiB) and `MAX_FLOW_BUFFER_BYTES` (64 KiB). Flow creation triggers oldest flow eviction.
+- **Pending FIFO Leak Remediation**: Monotonic `req_id` and generation tracking per pending request; lazy reconciliation in `g_pending_fifo` prevents stale request leaks and avoids corrupting queue order.
+- **Keep-Alive Timing Precision**: Request start timestamp reset at request boundaries (`first_byte_mono_ms` reset on `HTTP_STATE_HEADER`), avoiding latency inflation across idle gaps.
+- **Connection Generations**: Client SYN increments flow generation, purges stale pending requests for that 4-tuple, and cleans up stale response flows, preventing cross-connection correlation errors.
+- **Shipping Concurrency**: Thread-safe asynchronous stats upload via `g_pending_stats_body` and worker thread; `signal(SIGPIPE, SIG_IGN)` and mutex guards prevent capture stalls and race conditions.
+- **Informational Response Handling**: Server response reassembly ignores `100 Continue`, `102 Processing`, and `103 Early Hints`, keeping requests pending until final status (>= 200 or 101) arrives.
+- **Incomplete SOAP Preservation**: Incomplete WSSE requests without Basic auth fallback are safely emitted upon stream close or timeout instead of being discarded.
+- **Dual-Engine Synthetic Regression Suite (`test_synthetic_harness.py`)**: 32/32 PASS across both C++ and Python engines covering 16 distinct edge cases.
+- **PCAP Verification Parity**: Offline PCAP 247 yields 109 events with 100% traceparent correlation, duration 112ms, and status 200 in both Python and C++; PCAP 249 yields 6,204 events in both Python and C++ with exact username, scheme, and status parity.
+

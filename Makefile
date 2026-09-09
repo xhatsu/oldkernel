@@ -1,7 +1,7 @@
 # GCC 4.4 / CentOS 6 compatible: C++03, gnu++03 or gnu++98.
 CXX ?= g++
 CXXSTD ?= $(shell $(CXX) -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
-CXXFLAGS ?= -O2 -Wall -Wextra $(CXXSTD) -pthread
+CXXFLAGS ?= -O2 -Wall -Wextra $(CXXSTD) -pthread -lrt
 
 .PHONY: all cpp cpp-ship cpp-debug fixture pcap-fixture clean
 

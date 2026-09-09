@@ -1,2 +1,42 @@
-*__pycache__/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
+# Pytest / coverage test artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# C / C++ build & test binaries (keep tracked precompiled nt-sniff-cpp and nt-ship-cpp)
+*.o
+*.obj
+*.so
+*.a
+pcap_test_cpp
+nt-sniff-cpp-debug
+/tmp/
+
+# Temporary test logs, captures, and process tracking
+*.log
+*.pid
+*.tmp
+*.tmp.*
+*.jsonl
+*.out
+core
+core.*
+
+# Editor and OS metadata
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local scratch and agent metadata
+scratch/
+.agents/
+.codex/

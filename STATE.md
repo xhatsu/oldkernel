@@ -3,6 +3,45 @@
 
 # STATE.md — Current Project State & Memory
 
+## Capture & Parser Hardening: Dual-Engine Retransmission, Body Framing, Timing & Memory Remediation (2026-09-09)
+- Hardened both C++ (`nt-sniff-cpp.cpp`) and Python (`nt-sniff.py`) capture engines against network packet loss, TCP retransmissions, embedded HTTP bodies, informational 1xx responses, incomplete SOAP requests, response body fabrication, keep-alive latency drift, stale connection generations, and memory accounting leaks:
+  1. **Strict Response Body Framing**: Eliminated `rfl.buf.find("HTTP/")` body scanning. Implemented explicit response states (`HTTP_STATE_HEADER`, `HTTP_STATE_BODY`, `HTTP_STATE_CHUNK`, `HTTP_STATE_CLOSE_BODY`) consuming Content-Length, chunk extensions/trailers, and close-delimited bodies. Bounded HEAD requests and 1xx/204/304 bodyless responses per RFC 7230 §3.3.3.
+  2. **Symmetrical Memory Accounting**: Added `flow_bytes_add()` and `flow_bytes_sub()` tracking all buffers (`buf`, `wsse_buf`, `ooo`) symmetrically against `MAX_TOTAL_BUFFER_BYTES` (16 MiB) and `MAX_FLOW_BUFFER_BYTES` (64 KiB). Response flows trigger `evict_oldest_flow_if_needed()`.
+  3. **Pending FIFO Leak Remediation**: Monotonic `req_id` and generation tracking per pending request; lazy reconciliation in `g_pending_fifo` cleans up matched and expired entries without unbounded growth.
+  4. **Keep-Alive Timing Precision**: `first_byte_mono_ms` set strictly on request arrival in `HTTP_STATE_HEADER` and reset to `mono_now` (if pipelined data remains) or `0` on completion, preventing idle gaps from skewing subsequent request latency.
+  5. **Connection Generation Isolation**: Client SYN increments flow generation, purges stale pending requests for that 4-tuple, and resets response flow, preventing cross-connection correlation misalignment.
+  6. **Smuggling Prevention**: Conflicting `Content-Length` and `Transfer-Encoding: chunked` headers are rejected as broken flows per RFC 7230 §3.3.3. Full chunk trailer sections (`\r\n\r\n`) are framed.
+  7. **Shipping Concurrency**: Thread-safe asynchronous stats upload via `g_pending_stats_body` and `ship_worker_thread`. Unconditional `signal(SIGPIPE, SIG_IGN)` and mutex guards for all shared state.
+  8. **Robust TCP Stream Reassembly**: Modular sequence-difference arithmetic (`seq_diff`) handling 32-bit wraparound, deduplication, overlap trimming, and bounded out-of-order segment queues (up to 4 segments / 16 KiB per flow).
+- Dual-engine synthetic regression harness (`test_synthetic_harness.py`):
+  - 16 distinct failure cases executed against both C++ and Python engines: 32/32 PASS.
+- Real-world PCAP suite (`test_pcap_suite.py`):
+  - PCAP 247: Python and C++ both produce 109 events with exact status 200, duration 112ms, and 580 response bytes.
+  - PCAP 249: Python and C++ both produce 6,204 events with identical status codes, identities, and zero credential leaks.
+- All test suites passing:
+  - `make clean && make all && make fixture`: PASS.
+  - `python3 cpp-edge-test.py` (ASAN + UBSAN): ALL 7 EDGE TESTS PASS.
+  - `pytest test_nt_sniff.py`: 19/19 PASS.
+  - `sh build-firstrun.sh`: Regenerated self-contained bundle `install-firstrun-el68.sh` (320,259 bytes).
+
+## C++ and Python Mode Comprehensive Review & Verification (2026-09-09)
+
+- Reviewed architecture and security contracts of both C++ mode (`nt-sniff-cpp | nt-ship-cpp`) and Python mode (`nt-sniff.py | nt-ship.py`).
+- Enhanced `nt-ship.py` CLI parsing with `--ship-rate-kbps` and `--stats-interval-sec` options for direct CLI parity with `nt-ship-cpp`.
+- Updated `cpp-e2e.sh` loopback test to filter out internal stats records (`_nt_internal`) and validate live captured requests.
+- Test suite verification:
+  - Unit & contract tests: 49/49 pytest tests passed (0.56s).
+  - C++03 fixtures: `--fixture`, `--ring-fixture`, `--ship-rate-fixture`, and `--stats-fixture` all passed cleanly.
+  - C++ edge tests (`cpp-edge-test.py`): ASAN + UBSAN compilation and fixtures passed with zero errors or leaks.
+  - PCAP suite (`test_pcap_suite.py`): Python offline (200/200, 11,216/11,216), C++ offline (200/200, 11,394/11,394), zero credential leaks, and live Linux kernel VETH replay passed for both engines.
+  - Preflight installer checks: `--check` passed for both `--mode cpp` and `--mode python`.
+  - Live loopback capture: Verified real HTTP request correlation, W3C traceparents, Basic auth extraction, and secret redaction for both Python and C++.
+  - Live service Python mode installation: Installed via `--mode python --offline`; confirmed running as UID 997 (`ntsniff`), CapEff 0, 256 MiB address space limit, and 4 poster threads using bounded 256 KiB stacks.
+  - Live service restored: Reinstalled production C++ mode (`nt-sniff-cpp | nt-ship-cpp`) on `enp0s6:18080` with 30s stats and 1024 kbit/s upload limit; verified daemon running healthy.
+  - Regenerated embedded installer bundle `install-firstrun-el68.sh` (257,504 bytes).
+  - Relocated bootstrap distribution server (port 30105) to `~/Viettel/OtelTrace/bootstrap` with backward-compatibility symlink in `~/Viettel/NetworkTracing/bootstrap` and in-tree symlinks for `bundle` and `oldkernel`. Verified 100% pass on all endpoints.
+  - Created comprehensive `.gitignore` covering Python bytecode/caches, pytest artifacts, C/C++ build/test binaries (`pcap_test_cpp`, `nt-sniff-cpp-debug`, `*.o`), runtime logs/PID/tmp/jsonl files, and IDE metadata, while preserving tracked pre-compiled binaries.
+
 ## Native C++ Pipeline Isolation (2026-09-09)
 
 - Installed native mode now runs `nt-sniff-cpp | nt-ship-cpp` under the same

@@ -32,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <linux/filter.h>
 #include <linux/capability.h>
 #include <linux/if_packet.h>
@@ -39,18 +40,22 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <list>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 static volatile sig_atomic_t g_running = 1;
 static void stop_signal(int) { g_running = 0; }
 
-static const size_t MAX_FLOWS = 8192;
-static const size_t MAX_PENDING = 8192;
+static const size_t MAX_FLOWS = 4096;
+static const size_t MAX_TOTAL_BUFFER_BYTES = 16 * 1024 * 1024; // 16 MiB aggregate budget
+static const size_t MAX_PENDING_TOTAL = 4096;                   // 4096 global pending requests
 static const size_t MAX_PENDING_PER_FLOW = 32;
 static const size_t MAX_PORTS = 30;
-static const size_t MAX_HEADER = 262144;
+static const size_t MAX_HEADER_BYTES = 32768;                   // 32 KiB
+static const size_t MAX_FLOW_BUFFER_BYTES = 65536;              // 64 KiB
 static const size_t MAX_WSSE_BODY_BYTES = 65536;
 static const size_t MAX_WSSE_BODY_FLOWS = 256;
 static const size_t MAX_WSSE_USERNAME = 200;
@@ -62,11 +67,24 @@ static const unsigned DEFAULT_SHIP_RATE_KBPS = 1024;
 static const int FLUSH_SEC = 5;
 static const int RETRY_SEC = 60;
 static const unsigned FLOW_TTL = 15;
-static const unsigned PENDING_TTL = 3;
+static const unsigned DEFAULT_PENDING_TTL = 30;
+static unsigned g_pending_ttl_sec = DEFAULT_PENDING_TTL;
 static const unsigned ACCEPT = 2048;
 static const int SO_ATTACH_FILTER_OLD = 26;
 static const unsigned short ETH_P_IP_HOST = 0x0800;
 static const unsigned short ETH_P_8021Q_HOST = 0x8100;
+static const size_t MAX_OOO_SEGMENTS = 4;
+static const size_t MAX_DRAIN_PER_PASS = 256;
+
+static inline long long now_monotonic_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static inline int32_t seq_diff(uint32_t a, uint32_t b) {
+  return (int32_t)(a - b);
+}
 
 static std::string trim(const std::string &s) {
   size_t a = 0, b = s.size();
@@ -83,14 +101,14 @@ static std::string jsonq(const std::string &s) {
   std::string x = "\""; size_t i;
   for (i = 0; i < s.size(); ++i) {
     unsigned char c = (unsigned char)s[i];
-    if (c == '\\' || c == '"') { x += '\\'; x += (char)c; }
+    if (c == '\\' || c == '\"') { x += '\\'; x += (char)c; }
     else if (c == '\n') x += "\\n";
     else if (c == '\r') x += "\\r";
     else if (c == '\t') x += "\\t";
     else if (c < 32) x += '?';
     else x += (char)c;
   }
-  x += '"'; return x;
+  x += '\"'; return x;
 }
 static long long now_ms() {
   struct timeval tv; gettimeofday(&tv, NULL);
@@ -118,41 +136,65 @@ static std::string host_name() {
   char b[256]; if (gethostname(b, sizeof(b) - 1) != 0) return "unknown-node";
   b[sizeof(b) - 1] = 0; char *p = strchr(b, '.'); if (p) *p = 0; return b;
 }
+
+/* Strict Base64 decoder with uint32 accumulator, immediate stop at ':', and invalid char rejection */
 static std::string b64decode_user(const char *in, size_t in_len) {
   while (in_len > 0 && isspace((unsigned char)*in)) { ++in; --in_len; }
   while (in_len > 0 && isspace((unsigned char)in[in_len - 1])) { --in_len; }
-  std::string out; int val = 0, bits = -8; size_t i;
-  for (i = 0; i < in_len; ++i) {
-    unsigned char c = (unsigned char)in[i]; int d = -1;
+  std::string out;
+  uint32_t val = 0;
+  int bits = -8;
+  for (size_t i = 0; i < in_len; ++i) {
+    unsigned char c = (unsigned char)in[i];
+    int d = -1;
     if (c >= 'A' && c <= 'Z') d = c - 'A';
     else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
     else if (c >= '0' && c <= '9') d = c - '0' + 52;
     else if (c == '+') d = 62;
     else if (c == '/') d = 63;
     else if (c == '=') break;
-    if (d < 0) continue;
-    val = (val << 6) + d;
+    else if (isspace(c)) continue;
+    else return "";
+    val = (val << 6) | (uint32_t)d;
     bits += 6;
     if (bits >= 0) {
-      out += (char)((val >> bits) & 0xff);
+      char ch = (char)((val >> bits) & 0xff);
       bits -= 8;
-      if (out.size() > 512) return "";
+      if (ch == ':') break;
+      out += ch;
+      if (out.size() > 64) break;
     }
   }
-  size_t p = out.find(':');
-  if (p == std::string::npos) return "";
-  return out.substr(0, p > 64 ? 64 : p);
+  return out;
 }
+
 static std::string ip_to_str(uint32_t ip_be) {
   char b[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &ip_be, b, sizeof(b));
   return b;
 }
 
+static inline bool is_hex(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
 static std::string trace_id_from_parent(const std::string &tp) {
   std::string x = trim(tp);
-  if (x.size() == 55 && x[2] == '-' && x[35] == '-' && x[52] == '-') return lower(x.substr(3, 32));
-  return "";
+  if (x.size() != 55 || x[2] != '-' || x[35] != '-' || x[52] != '-') return "";
+  if (x[0] != '0' || x[1] != '0') return "";
+  bool all_zeros = true;
+  for (size_t i = 3; i < 35; ++i) {
+    if (!is_hex(x[i])) return "";
+    if (x[i] != '0') all_zeros = false;
+  }
+  if (all_zeros) return "";
+  bool span_zeros = true;
+  for (size_t i = 36; i < 52; ++i) {
+    if (!is_hex(x[i])) return "";
+    if (x[i] != '0') span_zeros = false;
+  }
+  if (span_zeros) return "";
+  return lower(x.substr(3, 32));
 }
 
 static uint64_t g_rng_state = 0;
@@ -201,20 +243,106 @@ struct RequestMeta {
   bool has_content_length;
   RequestMeta() : content_length(0), has_content_length(false) {}
 };
+
+struct TcpSegment {
+  uint32_t seq;
+  std::string data;
+};
+
+static size_t g_total_flow_bytes = 0;
+static inline void flow_bytes_add(size_t n) {
+  g_total_flow_bytes += n;
+}
+static inline void flow_bytes_sub(size_t n) {
+  if (g_total_flow_bytes >= n) g_total_flow_bytes -= n;
+  else g_total_flow_bytes = 0;
+}
+
 struct Flow {
-  std::string buf;
+  uint32_t next_seq;
+  bool has_seq;
+  bool is_broken;
   time_t touched;
-  Event event;
-  size_t body_goal;
-  bool awaiting_body;
-  Flow() : touched(time(NULL)), body_goal(0), awaiting_body(false) {}
+  long long first_byte_mono_ms;
+  uint32_t generation;
+  std::string buf;
+  std::vector<TcpSegment> ooo;
+
+  enum HttpState {
+    HTTP_STATE_HEADER,
+    HTTP_STATE_BODY,
+    HTTP_STATE_CHUNK,
+    HTTP_STATE_CLOSE_BODY
+  } state;
+
+  size_t body_remaining;
+  size_t chunk_remaining;
+  bool chunk_reading_len;
+  bool chunk_reading_trailer;
+
+  bool awaiting_wsse;
+  Event wsse_event;
+  std::string wsse_buf;
+  size_t wsse_goal;
+
+  Flow() : next_seq(0), has_seq(false), is_broken(false),
+           touched(time(NULL)), first_byte_mono_ms(0), generation(0),
+           state(HTTP_STATE_HEADER), body_remaining(0), chunk_remaining(0),
+           chunk_reading_len(true), chunk_reading_trailer(false),
+           awaiting_wsse(false), wsse_goal(0) {}
+
+  void clear_buffers() {
+    flow_bytes_sub(buf.size());
+    buf.clear();
+    flow_bytes_sub(wsse_buf.size());
+    wsse_buf.clear();
+    for (size_t i = 0; i < ooo.size(); ++i) {
+      flow_bytes_sub(ooo[i].data.size());
+    }
+    ooo.clear();
+  }
+
+  bool buf_append(const char *data, size_t len) {
+    if (buf.size() + len > MAX_FLOW_BUFFER_BYTES) {
+      clear_buffers();
+      is_broken = true;
+      return false;
+    }
+    buf.append(data, len);
+    flow_bytes_add(len);
+    return true;
+  }
+
+  void buf_erase(size_t off, size_t len) {
+    if (off >= buf.size()) return;
+    if (len > buf.size() - off) len = buf.size() - off;
+    buf.erase(off, len);
+    flow_bytes_sub(len);
+  }
+
+  void wsse_append(const char *data, size_t len) {
+    wsse_buf.append(data, len);
+    flow_bytes_add(len);
+  }
+
+  bool ooo_push(uint32_t seq, const char *data, size_t len) {
+    if (ooo.size() >= MAX_OOO_SEGMENTS) return false;
+    TcpSegment seg;
+    seg.seq = seq;
+    seg.data.assign(data, len);
+    ooo.push_back(seg);
+    flow_bytes_add(len);
+    return true;
+  }
+
+  void ooo_erase(size_t idx) {
+    if (idx < ooo.size()) {
+      flow_bytes_sub(ooo[idx].data.size());
+      ooo.erase(ooo.begin() + idx);
+    }
+  }
 };
-struct Pending {
-  Event ev;
-  long long started_ms;
-  Pending() : started_ms(0) {}
-  Pending(const Event &e, long long t) : ev(e), started_ms(t) {}
-};
+
 struct FlowKey {
   uint32_t s_ip;
   uint16_t sport;
@@ -228,6 +356,29 @@ struct FlowKey {
   }
 };
 typedef FlowKey PacketKey;
+
+static uint64_t g_req_id_seq = 0;
+
+struct Pending {
+  uint64_t req_id;
+  uint32_t generation;
+  Event ev;
+  long long started_wall_ms;
+  long long started_mono_ms;
+  Pending() : req_id(0), generation(0), started_wall_ms(0), started_mono_ms(0) {}
+  Pending(uint64_t id, uint32_t gen, const Event &e, long long wall_t, long long mono_t)
+    : req_id(id), generation(gen), ev(e), started_wall_ms(wall_t), started_mono_ms(mono_t) {}
+};
+
+struct PendingQueueRef {
+  uint64_t req_id;
+  uint32_t generation;
+  PacketKey key;
+  long long started_mono_ms;
+};
+
+static size_t g_total_pending_count = 0;
+static std::list<PendingQueueRef> g_pending_fifo;
 
 static void logmsg(const std::string &s) { fprintf(stderr, "nt-sniff-cpp: %s\n", s.c_str()); fflush(stderr); }
 
@@ -323,59 +474,60 @@ static bool is_wsse_namespace(const std::string &uri) {
          uri == "http://schemas.xmlsoap.org/ws/2003/06/secext";
 }
 
-static bool is_soap_content_type(const std::string &value) {
-  std::string media = lower(value);
-  size_t semi = media.find(';');
-  if (semi != std::string::npos) media.erase(semi);
-  media = trim(media);
-  return media == "text/xml" || media == "application/xml" ||
-         media == "application/soap+xml" ||
-         (media.size() > 4 && media.compare(media.size() - 4, 4, "+xml") == 0);
+static bool is_soap_content_type(const std::string &ct) {
+  std::string x = lower(ct);
+  return x.find("text/xml") != std::string::npos ||
+         x.find("application/soap+xml") != std::string::npos ||
+         x.find("+xml") != std::string::npos;
 }
 
-static void split_qname(const std::string &name, std::string *prefix, std::string *local) {
-  size_t colon = name.find(':');
-  if (colon == std::string::npos) { prefix->clear(); *local = name; }
-  else { *prefix = name.substr(0, colon); *local = name.substr(colon + 1); }
+static void split_qname(const std::string &qname, std::string *prefix, std::string *local) {
+  size_t p = qname.find(':');
+  if (p == std::string::npos) { prefix->clear(); *local = qname; }
+  else { *prefix = qname.substr(0, p); *local = qname.substr(p + 1); }
 }
 
-static bool append_utf8(unsigned long cp, std::string *out) {
-  if (cp == 0 || cp > 0x10ffffUL || (cp >= 0xd800UL && cp <= 0xdfffUL)) return false;
-  if (cp < 0x80) out->push_back((char)cp);
-  else if (cp < 0x800) {
-    out->push_back((char)(0xc0 | (cp >> 6)));
-    out->push_back((char)(0x80 | (cp & 0x3f)));
-  } else if (cp < 0x10000) {
-    out->push_back((char)(0xe0 | (cp >> 12)));
-    out->push_back((char)(0x80 | ((cp >> 6) & 0x3f)));
-    out->push_back((char)(0x80 | (cp & 0x3f)));
-  } else {
-    out->push_back((char)(0xf0 | (cp >> 18)));
-    out->push_back((char)(0x80 | ((cp >> 12) & 0x3f)));
-    out->push_back((char)(0x80 | ((cp >> 6) & 0x3f)));
-    out->push_back((char)(0x80 | (cp & 0x3f)));
-  }
-  return true;
-}
-
-static bool xml_unescape(const std::string &text, std::string *out) {
-  for (size_t i = 0; i < text.size();) {
-    if (text[i] != '&') { out->push_back(text[i++]); continue; }
-    size_t semi = text.find(';', i + 1);
-    if (semi == std::string::npos || semi - i > 12) return false;
-    std::string ent = text.substr(i + 1, semi - i - 1);
-    if (ent == "amp") out->push_back('&');
-    else if (ent == "lt") out->push_back('<');
-    else if (ent == "gt") out->push_back('>');
-    else if (ent == "quot") out->push_back('"');
-    else if (ent == "apos") out->push_back('\'');
-    else if (!ent.empty() && ent[0] == '#') {
+static bool xml_unescape(const std::string &in, std::string *out) {
+  out->clear();
+  out->reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    if (in[i] != '&') { out->push_back(in[i]); continue; }
+    size_t semi = in.find(';', i + 1);
+    if (semi == std::string::npos) return false;
+    std::string ref = in.substr(i + 1, semi - i - 1);
+    if (ref == "amp") out->push_back('&');
+    else if (ref == "lt") out->push_back('<');
+    else if (ref == "gt") out->push_back('>');
+    else if (ref == "quot") out->push_back('"');
+    else if (ref == "apos") out->push_back('\'');
+    else if (!ref.empty() && ref[0] == '#') {
+      unsigned long val = 0;
       char *endp = NULL;
-      unsigned long cp = strtoul(ent.c_str() + ((ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')) ? 2 : 1),
-                                 &endp, (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X')) ? 16 : 10);
-      if (!endp || *endp || !append_utf8(cp, out)) return false;
-    } else return false;
-    i = semi + 1;
+      if (ref.size() > 2 && (ref[1] == 'x' || ref[1] == 'X')) {
+        val = strtoul(ref.c_str() + 2, &endp, 16);
+      } else {
+        val = strtoul(ref.c_str() + 1, &endp, 10);
+      }
+      if (!endp || *endp != '\0' || val > 0x10ffffUL) return false;
+      if (val < 0x80) {
+        out->push_back((char)val);
+      } else if (val < 0x800) {
+        out->push_back((char)(0xc0 | (val >> 6)));
+        out->push_back((char)(0x80 | (val & 0x3f)));
+      } else if (val < 0x10000) {
+        out->push_back((char)(0xe0 | (val >> 12)));
+        out->push_back((char)(0x80 | ((val >> 6) & 0x3f)));
+        out->push_back((char)(0x80 | (val & 0x3f)));
+      } else {
+        out->push_back((char)(0xf0 | (val >> 18)));
+        out->push_back((char)(0x80 | ((val >> 12) & 0x3f)));
+        out->push_back((char)(0x80 | ((val >> 6) & 0x3f)));
+        out->push_back((char)(0x80 | (val & 0x3f)));
+      }
+    } else {
+      return false;
+    }
+    i = semi;
   }
   return true;
 }
@@ -385,22 +537,24 @@ static bool valid_utf8_username(const std::string &s) {
   size_t characters = 0;
   for (size_t i = 0; i < s.size();) {
     unsigned char c = (unsigned char)s[i];
-    unsigned long cp = c;
-    if (c < 0x80) { ++i; }
-    else {
-    size_t need = (c >= 0xc2 && c <= 0xdf) ? 1 :
-                  (c >= 0xe0 && c <= 0xef) ? 2 :
-                  (c >= 0xf0 && c <= 0xf4) ? 3 : 99;
-    if (need == 99 || i + need >= s.size()) return false;
-    for (size_t j = 1; j <= need; ++j)
-      if (((unsigned char)s[i + j] & 0xc0) != 0x80) return false;
-    if (need == 2 && c == 0xe0 && (unsigned char)s[i + 1] < 0xa0) return false;
-    if (need == 2 && c == 0xed && (unsigned char)s[i + 1] >= 0xa0) return false;
-    if (need == 3 && c == 0xf0 && (unsigned char)s[i + 1] < 0x90) return false;
-    if (need == 3 && c == 0xf4 && (unsigned char)s[i + 1] >= 0x90) return false;
-    cp = c & ((1U << (7 - need - 1)) - 1);
-    for (size_t j = 1; j <= need; ++j) cp = (cp << 6) | ((unsigned char)s[i + j] & 0x3f);
-    i += need + 1;
+    unsigned long cp = 0;
+    size_t need = 0;
+    if (c < 0x80) { cp = c; need = 0; ++i; }
+    else if ((c & 0xe0) == 0xc0) { need = 1; }
+    else if ((c & 0xf0) == 0xe0) { need = 2; }
+    else if ((c & 0xf8) == 0xf0) { need = 3; }
+    else return false;
+
+    if (need) {
+      if (i + need >= s.size()) return false;
+      if (need == 1 && c < 0xc2) return false;
+      if (need == 2 && c == 0xe0 && (unsigned char)s[i + 1] < 0xa0) return false;
+      if (need == 2 && c == 0xed && (unsigned char)s[i + 1] >= 0xa0) return false;
+      if (need == 3 && c == 0xf0 && (unsigned char)s[i + 1] < 0x90) return false;
+      if (need == 3 && c == 0xf4 && (unsigned char)s[i + 1] >= 0x90) return false;
+      cp = c & ((1U << (7 - need - 1)) - 1);
+      for (size_t j = 1; j <= need; ++j) cp = (cp << 6) | ((unsigned char)s[i + j] & 0x3f);
+      i += need + 1;
     }
     if (++characters > MAX_WSSE_USERNAME) return false;
     if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) ||
@@ -449,7 +603,7 @@ static std::string extract_wsse_username(const std::string &body) {
     size_t lt = body.find('<', pos);
     if (lt == std::string::npos) {
       if (username_depth && !username_bad && !xml_unescape(body.substr(pos), &chars)) username_bad = true;
-      break; /* a bounded prefix is commonly incomplete */
+      break;
     }
     if (username_depth && !username_bad && lt > pos &&
         !xml_unescape(body.substr(pos, lt - pos), &chars)) username_bad = true;
@@ -546,19 +700,27 @@ static std::string extract_wsse_username(const std::string &body) {
   return result;
 }
 
-static bool parse_response(const char *data, size_t len, int *status, unsigned *clen) {
+static bool parse_response(const char *data, size_t len, int *status, size_t *clen,
+                           bool *has_clen, bool *is_chunked, bool *is_close) {
+  *has_clen = false;
+  *clen = 0;
+  *is_chunked = false;
+  *is_close = false;
   const char *end = data + len;
   const char *p = data;
   const char *eol = (const char *)memchr(p, '\n', end - p);
   if (!eol) return false;
   if (strncmp(p, "HTTP/", 5) != 0) return false;
+  bool is_http_10 = (eol - p >= 8 && strncmp(p, "HTTP/1.0", 8) == 0);
+  bool conn_close = false;
+  bool conn_keep_alive = false;
+
   const char *sp1 = (const char *)memchr(p, ' ', eol - p);
   if (!sp1) return false;
   const char *sc_start = sp1 + 1;
   while (sc_start < eol && *sc_start == ' ') ++sc_start;
   *status = atoi(sc_start);
   if (*status < 100 || *status > 599) return false;
-  *clen = 0;
   p = eol + 1;
   while (p < end) {
     if (*p == '\r' || *p == '\n') break;
@@ -567,25 +729,47 @@ static bool parse_response(const char *data, size_t len, int *status, unsigned *
     const char *colon = (const char *)memchr(p, ':', line_end - p);
     if (colon) {
       size_t hlen = colon - p;
+      const char *v = colon + 1;
+      while (v < line_end && (*v == ' ' || *v == '\t')) ++v;
+      const char *ve = line_end;
+      while (ve > v && (ve[-1] == '\r' || ve[-1] == '\n' || ve[-1] == ' ' || ve[-1] == '\t')) --ve;
+      size_t vlen = (size_t)(ve - v);
+
       if (hlen == 14 && !strncasecmp(p, "content-length", 14)) {
-        const char *v = colon + 1;
-        while (v < line_end && (*v == ' ' || *v == '\t')) ++v;
-        long n = atol(v);
-        if (n >= 0 && n <= 0x7fffffff) *clen = (unsigned)n;
+        size_t n = 0;
+        if (parse_decimal_size(v, vlen, &n)) {
+          *clen = n;
+          *has_clen = true;
+        }
+      } else if (hlen == 17 && !strncasecmp(p, "transfer-encoding", 17)) {
+        std::string te(v, vlen);
+        if (lower(te).find("chunked") != std::string::npos) {
+          *is_chunked = true;
+        }
+      } else if (hlen == 10 && !strncasecmp(p, "connection", 10)) {
+        std::string conn(v, vlen);
+        if (lower(conn).find("close") != std::string::npos) {
+          conn_close = true;
+        } else if (lower(conn).find("keep-alive") != std::string::npos) {
+          conn_keep_alive = true;
+        }
       }
     }
     p = line_end + 1;
+  }
+  if (is_http_10 && !conn_keep_alive) {
+    *is_close = true;
+  } else if (conn_close) {
+    *is_close = true;
   }
   return true;
 }
 
 static std::string g_endpoint;
 static std::string g_ship_node;
-static std::vector<std::string> g_ship_buf;
 static unsigned g_ship_rate_kbps = DEFAULT_SHIP_RATE_KBPS;
 static unsigned g_stats_interval_sec = 30;
 static size_t g_wsse_body_bytes = 0;
-static double g_next_ship_slot = 0.0;
 static unsigned long long g_capture_packets = 0, g_capture_bytes = 0;
 static unsigned long long g_kernel_drops = 0, g_invalid_frames = 0;
 static unsigned long long g_events_emitted = 0, g_events_in = 0;
@@ -607,6 +791,13 @@ static unsigned long long g_prev_drop_hub = 0, g_prev_drop_oversized = 0;
 static unsigned long long g_stats_sequence = 0;
 static std::string g_instance_id;
 
+static pthread_t g_ship_worker_tid;
+static pthread_mutex_t g_ship_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ship_queue_cond = PTHREAD_COND_INITIALIZER;
+static std::vector<std::string> g_ship_buf;
+static bool g_ship_worker_active = false;
+static std::string g_pending_stats_body;
+
 static std::string shellq(const std::string &s) {
   std::string o = "'";
   for (size_t i = 0; i < s.size(); ++i) { if (s[i] == '\'') o += "'\\''"; else o += s[i]; }
@@ -623,12 +814,12 @@ static double wall_seconds() {
   gettimeofday(&tv, NULL);
   return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
-static void pace_upload(size_t bytes) {
+static void pace_upload(size_t bytes, double *next_slot) {
   const double bytes_per_sec = (double)g_ship_rate_kbps * 1000.0 / 8.0;
   double now = wall_seconds();
-  if (g_next_ship_slot < now || g_next_ship_slot - now > 60.0) g_next_ship_slot = now;
-  double slot = g_next_ship_slot;
-  g_next_ship_slot += (double)bytes / bytes_per_sec;
+  if (*next_slot < now || *next_slot - now > 60.0) *next_slot = now;
+  double slot = *next_slot;
+  *next_slot += (double)bytes / bytes_per_sec;
   while (slot > (now = wall_seconds())) {
     double remaining = slot - now;
     useconds_t delay = (useconds_t)(remaining > 0.5 ? 500000 : remaining * 1000000.0);
@@ -648,19 +839,10 @@ static size_t bounded_batch_count(const std::vector<std::string> &buf,
   }
   return n;
 }
-static int run_ship_rate_fixture() {
-  std::vector<std::string> events;
-  events.push_back(std::string(40000, 'x'));
-  events.push_back(std::string(40000, 'y'));
-  if (bounded_batch_count(events, "fixture") != 1) return 30;
-  events.clear();
-  events.push_back(std::string(MAX_POST_BYTES + 1, 'x'));
-  if (bounded_batch_count(events, "fixture") != 0) return 31;
-  return 0;
-}
+
 static bool post_body(const std::string &endpoint, const std::string &path,
-                      const std::string &body, unsigned timeout_sec) {
-  pace_upload(body.size());
+                       const std::string &body, unsigned timeout_sec, double *next_slot) {
+  if (next_slot) pace_upload(body.size(), next_slot);
   std::string cmd = "curl -sSf --max-time " + number_string(timeout_sec) + " --limit-rate " +
     number_string((size_t)g_ship_rate_kbps * 1000U / 8U) +
     " -o /dev/null -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + path);
@@ -669,47 +851,78 @@ static bool post_body(const std::string &endpoint, const std::string &path,
   int rc = pclose(fp);
   return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
 }
-static bool post(const std::string &endpoint, const std::string &node, const std::vector<std::string> &batch) {
-  std::string body = "{\"node\":" + jsonq(node) + ",\"events\":" + json_array(batch) + "}";
-  if (body.size() > MAX_POST_BYTES) return false;
-  bool ok = post_body(endpoint, "/api/ingest", body, 10);
-  if (ok) {
-    g_events_pushed += batch.size();
-    ++g_batches_pushed;
-    g_bytes_pushed += body.size();
-    g_consecutive_failures = 0;
-    g_last_push_status = 200;
-    g_last_success_at = time(NULL);
-  }
-  return ok;
-}
-static void send_batches(const std::string &endpoint, const std::string &node,
-                         std::vector<std::string> *buf, bool flush_all) {
-  while (!buf->empty() && (flush_all || buf->size() >= MAX_BATCH)) {
-    size_t n = bounded_batch_count(*buf, node);
-    if (!n) {
-      buf->erase(buf->begin());
-      ++g_events_dropped;
-      ++g_drop_oversized;
-      logmsg("WARN: dropped oversized event; encoded body exceeds 65536 bytes");
-      continue;
+
+static void *ship_worker_thread(void *) {
+  double next_slot = wall_seconds();
+  double next_stats_slot = wall_seconds();
+  while (g_running || !g_ship_buf.empty() || !g_pending_stats_body.empty()) {
+    std::vector<std::string> batch;
+    std::string stats_body;
+    pthread_mutex_lock(&g_ship_queue_mutex);
+    while (g_running && g_ship_buf.empty() && g_pending_stats_body.empty()) {
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_sec += 1;
+      pthread_cond_timedwait(&g_ship_queue_cond, &g_ship_queue_mutex, &ts);
     }
-    std::vector<std::string> batch(buf->begin(), buf->begin() + n);
-    if (post(endpoint, node, batch)) {
-      buf->erase(buf->begin(), buf->begin() + n);
-      logmsg("flushed " + number_string(n) + " events");
-    } else {
-      /* Pure in-memory drop when Hub unreachable (zero disk I/O) */
-      buf->erase(buf->begin(), buf->begin() + n);
-      g_events_dropped += n;
-      g_drop_hub += n;
-      ++g_batches_failed;
-      ++g_consecutive_failures;
-      g_last_push_status = 0;
-      logmsg("WARN: Hub unreachable, dropped " + number_string(n) + " events (in-memory drop, 0 disk I/O)");
-      break;
+    if (!g_pending_stats_body.empty()) {
+      stats_body.swap(g_pending_stats_body);
+    }
+    if (!g_ship_buf.empty()) {
+      size_t n = bounded_batch_count(g_ship_buf, g_ship_node);
+      if (!n) {
+        g_ship_buf.erase(g_ship_buf.begin());
+        ++g_events_dropped;
+        ++g_drop_oversized;
+      } else {
+        batch.assign(g_ship_buf.begin(), g_ship_buf.begin() + n);
+        g_ship_buf.erase(g_ship_buf.begin(), g_ship_buf.begin() + n);
+      }
+    }
+    pthread_mutex_unlock(&g_ship_queue_mutex);
+
+    if (!stats_body.empty()) {
+      if (!post_body(g_endpoint, "/api/agent/stats", stats_body, 2, &next_stats_slot)) {
+        pthread_mutex_lock(&g_ship_queue_mutex);
+        ++g_stats_dropped;
+        pthread_mutex_unlock(&g_ship_queue_mutex);
+      }
+    }
+
+    if (!batch.empty()) {
+      std::string body = "{\"node\":" + jsonq(g_ship_node) + ",\"events\":" + json_array(batch) + "}";
+      if (post_body(g_endpoint, "/api/ingest", body, 10, &next_slot)) {
+        pthread_mutex_lock(&g_ship_queue_mutex);
+        g_events_pushed += batch.size();
+        ++g_batches_pushed;
+        g_bytes_pushed += body.size();
+        g_consecutive_failures = 0;
+        g_last_push_status = 200;
+        g_last_success_at = time(NULL);
+        pthread_mutex_unlock(&g_ship_queue_mutex);
+      } else {
+        pthread_mutex_lock(&g_ship_queue_mutex);
+        g_events_dropped += batch.size();
+        g_drop_hub += batch.size();
+        ++g_batches_failed;
+        ++g_consecutive_failures;
+        g_last_push_status = 0;
+        pthread_mutex_unlock(&g_ship_queue_mutex);
+      }
+    }
+
+    if (!g_running) {
+      pthread_mutex_lock(&g_ship_queue_mutex);
+      if (g_consecutive_failures >= 3) {
+        g_events_dropped += g_ship_buf.size();
+        g_drop_hub += g_ship_buf.size();
+        g_ship_buf.clear();
+        g_pending_stats_body.clear();
+      }
+      pthread_mutex_unlock(&g_ship_queue_mutex);
     }
   }
+  return NULL;
 }
 
 static unsigned count_open_fds() {
@@ -759,6 +972,8 @@ static std::string agent_stats_body(int fd, size_t flows_active,
   unsigned long long packet_delta = g_capture_packets - g_prev_capture_packets;
   unsigned long long packet_bytes_delta = g_capture_bytes - g_prev_capture_bytes;
   unsigned long long emitted_delta = g_events_emitted - g_prev_events_emitted;
+
+  pthread_mutex_lock(&g_ship_queue_mutex);
   unsigned long long in_delta = g_events_in - g_prev_events_in;
   unsigned long long pushed_delta = g_events_pushed - g_prev_events_pushed;
   unsigned long long dropped_delta = g_events_dropped - g_prev_events_dropped;
@@ -768,6 +983,14 @@ static std::string agent_stats_body(int fd, size_t flows_active,
   unsigned long long queue_delta = g_drop_queue - g_prev_drop_queue;
   unsigned long long hub_delta = g_drop_hub - g_prev_drop_hub;
   unsigned long long oversized_delta = g_drop_oversized - g_prev_drop_oversized;
+  size_t ship_buf_size = g_ship_buf.size();
+  size_t queue_high = g_queue_high_water;
+  unsigned last_status = g_last_push_status;
+  time_t last_succ = g_last_success_at;
+  unsigned consec_fails = g_consecutive_failures;
+  unsigned long long stats_drop = g_stats_dropped;
+  pthread_mutex_unlock(&g_ship_queue_mutex);
+
   unsigned long long pipe_drop_delta = g_output_pipe_drops - g_prev_output_pipe_drops;
   struct rusage usage;
   memset(&usage, 0, sizeof(usage));
@@ -815,10 +1038,10 @@ static std::string agent_stats_body(int fd, size_t flows_active,
       << ",\"push_kbps\":" << double_string(8.0 * bytes_delta / (1000.0 * elapsed))
       << ",\"drop_events_per_second\":" << double_string(dropped_delta / elapsed)
       << ",\"drop_percent\":" << double_string(100.0 * dropped_delta / (in_delta ? in_delta : 1))
-      << ",\"queue_depth_events\":" << g_ship_buf.size() << ",\"queue_capacity_events\":" << MAX_QUEUE
-      << ",\"queue_high_water_events\":" << g_queue_high_water << ",\"last_push_http_status\":" << g_last_push_status
-      << ",\"last_success_at\":" << (unsigned long)g_last_success_at << ",\"consecutive_failures\":" << g_consecutive_failures
-      << ",\"stats_samples_dropped_total\":" << ull_string(g_stats_dropped) << "},\"resources\":{"
+      << ",\"queue_depth_events\":" << ship_buf_size << ",\"queue_capacity_events\":" << MAX_QUEUE
+      << ",\"queue_high_water_events\":" << queue_high << ",\"last_push_http_status\":" << last_status
+      << ",\"last_success_at\":" << (unsigned long)last_succ << ",\"consecutive_failures\":" << consec_fails
+      << ",\"stats_samples_dropped_total\":" << ull_string(stats_drop) << "},\"resources\":{"
       << "\"cpu_user_seconds\":" << double_string(user_cpu) << ",\"cpu_system_seconds\":" << double_string(sys_cpu)
       << ",\"cpu_percent_one_core\":" << double_string(cpu_pct) << ",\"rss_bytes\":" << rss
       << ",\"virtual_bytes\":" << virt << ",\"open_fds\":" << count_open_fds() << ",\"threads\":" << threads
@@ -826,11 +1049,14 @@ static std::string agent_stats_body(int fd, size_t flows_active,
       << ",\"ship_rate_kbps\":" << g_ship_rate_kbps << ",\"http_body_max_bytes\":" << MAX_POST_BYTES
       << ",\"ship_threads_max\":1,\"wsse_body_bytes\":" << g_wsse_body_bytes << "}}";
   g_prev_capture_packets = g_capture_packets; g_prev_capture_bytes = g_capture_bytes;
-  g_prev_events_emitted = g_events_emitted; g_prev_events_in = g_events_in;
+  g_prev_events_emitted = g_events_emitted;
+  pthread_mutex_lock(&g_ship_queue_mutex);
+  g_prev_events_in = g_events_in;
   g_prev_events_pushed = g_events_pushed; g_prev_events_dropped = g_events_dropped;
   g_prev_batches_pushed = g_batches_pushed; g_prev_batches_failed = g_batches_failed;
   g_prev_bytes_pushed = g_bytes_pushed; g_prev_drop_queue = g_drop_queue;
   g_prev_drop_hub = g_drop_hub; g_prev_drop_oversized = g_drop_oversized;
+  pthread_mutex_unlock(&g_ship_queue_mutex);
   g_prev_output_pipe_drops = g_output_pipe_drops;
   g_stats_last_cpu = cpu_total; g_stats_last_at = now;
   return out.str();
@@ -841,10 +1067,16 @@ static void send_agent_stats(int fd, size_t flows_active,
                              size_t wsse_body_flows) {
   std::string body = agent_stats_body(fd, flows_active, pending_requests,
                                       wsse_body_flows);
-  if (body.size() > MAX_STATS_BYTES ||
-      !post_body(g_endpoint, "/api/agent/stats", body, 2)) {
+  if (body.size() > MAX_STATS_BYTES) {
+    pthread_mutex_lock(&g_ship_queue_mutex);
     ++g_stats_dropped;
+    pthread_mutex_unlock(&g_ship_queue_mutex);
+    return;
   }
+  pthread_mutex_lock(&g_ship_queue_mutex);
+  g_pending_stats_body = body;
+  pthread_cond_signal(&g_ship_queue_cond);
+  pthread_mutex_unlock(&g_ship_queue_mutex);
 }
 
 static bool write_nonblocking_line(const std::string &line) {
@@ -887,24 +1119,6 @@ static void emit_capture_stats_internal(int fd, size_t flows_active,
                          full.substr(start, end - start) + "}");
 }
 
-static int run_stats_fixture() {
-  g_ship_node = "fixture-node";
-  g_instance_id = "fixture-1";
-  g_stats_last_at = wall_seconds() - 30.0;
-  g_capture_packets = 100;
-  g_capture_bytes = 6400;
-  g_events_emitted = g_events_in = 10;
-  g_events_pushed = 8;
-  g_events_dropped = g_drop_queue = 2;
-  std::string body = agent_stats_body(-1, 3, 2, 1);
-  if (body.size() > MAX_STATS_BYTES) return 40;
-  if (body.find("\"type\":\"agent_stats\"") == std::string::npos) return 41;
-  if (body.find("\"drop_percent\":20.0000") == std::string::npos) return 42;
-  if (body.find("\"mode\":\"cpp\"") == std::string::npos) return 43;
-  std::cout << body << "\n";
-  return 0;
-}
-
 static void emit_event(const Event &e) {
   std::ostringstream ss;
   ss << "{\"ts\":" << e.ts << ",\"host\":" << jsonq(e.host) << ",\"src\":\"pcap\",\"service\":" << jsonq(e.service)
@@ -925,6 +1139,7 @@ static void emit_event(const Event &e) {
 
   if (!g_endpoint.empty()) {
     ++g_events_in;
+    pthread_mutex_lock(&g_ship_queue_mutex);
     if (g_ship_buf.size() >= MAX_QUEUE) {
       g_ship_buf.erase(g_ship_buf.begin());
       ++g_events_dropped;
@@ -932,6 +1147,8 @@ static void emit_event(const Event &e) {
     }
     g_ship_buf.push_back(ss.str());
     if (g_ship_buf.size() > g_queue_high_water) g_queue_high_water = g_ship_buf.size();
+    pthread_cond_signal(&g_ship_queue_cond);
+    pthread_mutex_unlock(&g_ship_queue_mutex);
   } else {
     write_nonblocking_line(ss.str());
   }
@@ -939,61 +1156,126 @@ static void emit_event(const Event &e) {
 
 static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
                           uint32_t d_ip, unsigned dport,
-                          std::map<PacketKey, std::vector<Pending> > &pending);
+                          std::map<PacketKey, std::vector<Pending> > &pending,
+                          long long first_byte_mono_ms = 0,
+                          uint32_t gen = 0) {
+  PacketKey rk;
+  rk.s_ip = d_ip; rk.sport = (uint16_t)dport;
+  rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
 
-static void flush_oldest(std::map<PacketKey, std::vector<Pending> > &pending) {
-  if (pending.empty()) return;
-  std::map<PacketKey, std::vector<Pending> >::iterator it = pending.begin();
-  if (!it->second.empty()) {
-    emit_event(it->second[0].ev);
-    it->second.erase(it->second.begin());
+  long long mono_now = now_monotonic_ms();
+  long long started_mono = (first_byte_mono_ms > 0) ? first_byte_mono_ms : mono_now;
+
+  while (g_total_pending_count >= MAX_PENDING_TOTAL && !g_pending_fifo.empty()) {
+    PendingQueueRef ref = g_pending_fifo.front();
+    g_pending_fifo.pop_front();
+    std::map<PacketKey, std::vector<Pending> >::iterator it = pending.find(ref.key);
+    if (it != pending.end()) {
+      for (size_t i = 0; i < it->second.size(); ++i) {
+        if (it->second[i].req_id == ref.req_id) {
+          emit_event(it->second[i].ev);
+          it->second.erase(it->second.begin() + i);
+          if (g_total_pending_count > 0) --g_total_pending_count;
+          if (it->second.empty()) pending.erase(it);
+          break;
+        }
+      }
+    }
   }
-  if (it->second.empty()) {
-    pending.erase(it);
+
+  std::vector<Pending> &queue = pending[rk];
+  if (queue.size() >= MAX_PENDING_PER_FLOW) {
+    emit_event(queue[0].ev);
+    queue.erase(queue.begin());
+    if (g_total_pending_count > 0) --g_total_pending_count;
+  }
+  uint64_t req_id = ++g_req_id_seq;
+  queue.push_back(Pending(req_id, gen, e, now_ms(), started_mono));
+  ++g_total_pending_count;
+
+  PendingQueueRef new_ref;
+  new_ref.req_id = req_id;
+  new_ref.generation = gen;
+  new_ref.key = rk;
+  new_ref.started_mono_ms = started_mono;
+  g_pending_fifo.push_back(new_ref);
+
+  if (g_pending_fifo.size() > MAX_PENDING_TOTAL * 2) {
+    std::list<PendingQueueRef>::iterator fi = g_pending_fifo.begin();
+    while (fi != g_pending_fifo.end()) {
+      std::map<PacketKey, std::vector<Pending> >::iterator it = pending.find(fi->key);
+      bool alive = false;
+      if (it != pending.end()) {
+        for (size_t j = 0; j < it->second.size(); ++j) {
+          if (it->second[j].req_id == fi->req_id) {
+            alive = true;
+            break;
+          }
+        }
+      }
+      if (!alive) {
+        fi = g_pending_fifo.erase(fi);
+      } else {
+        ++fi;
+      }
+    }
   }
 }
+
+static void flush_incomplete_wsse(std::map<FlowKey, Flow> &flows,
+                                  std::map<PacketKey, std::vector<Pending> > &pending) {
+  for (std::map<FlowKey, Flow>::iterator f = flows.begin(); f != flows.end(); ++f) {
+    if (f->second.awaiting_wsse) {
+      queue_request(f->second.wsse_event, f->first.s_ip, f->first.sport,
+                    f->first.d_ip, f->first.dport, pending, f->second.first_byte_mono_ms,
+                    f->second.generation);
+      f->second.awaiting_wsse = false;
+    }
+    f->second.clear_buffers();
+  }
+  flows.clear();
+  g_total_flow_bytes = 0;
+}
+
 static void flush_all_pending(std::map<PacketKey, std::vector<Pending> > &pending) {
-  std::map<PacketKey, std::vector<Pending> >::iterator p;
-  for (p = pending.begin(); p != pending.end(); ++p) {
+  for (std::map<PacketKey, std::vector<Pending> >::iterator p = pending.begin(); p != pending.end(); ++p) {
     for (size_t i = 0; i < p->second.size(); ++i) {
       emit_event(p->second[i].ev);
     }
   }
   pending.clear();
+  g_pending_fifo.clear();
+  g_total_pending_count = 0;
 }
-static void flush_incomplete_wsse(std::map<FlowKey, Flow> &flows,
-                                  std::map<PacketKey, std::vector<Pending> > &pending) {
-  std::map<FlowKey, Flow>::iterator f;
-  for (f = flows.begin(); f != flows.end(); ++f) {
-    if (f->second.awaiting_body && !f->second.event.basic_user.empty()) {
-      queue_request(f->second.event, f->first.s_ip, f->first.sport,
-                    f->first.d_ip, f->first.dport, pending);
-    }
-  }
-  flows.clear();
-}
-static void sweep(std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending, time_t now) {
-  std::map<FlowKey, Flow>::iterator f, fn;
-  for (f = flows.begin(); f != flows.end();) {
-    fn = f; ++fn;
+
+static void sweep(std::map<FlowKey, Flow> &flows,
+                  std::map<PacketKey, std::vector<Pending> > &pending,
+                  time_t now, unsigned pending_ttl_sec) {
+  for (std::map<FlowKey, Flow>::iterator f = flows.begin(); f != flows.end();) {
+    std::map<FlowKey, Flow>::iterator fn = f; ++fn;
     if ((unsigned)(now - f->second.touched) > FLOW_TTL) {
-      if (f->second.awaiting_body && !f->second.event.basic_user.empty()) {
-        queue_request(f->second.event, f->first.s_ip, f->first.sport,
-                      f->first.d_ip, f->first.dport, pending);
+      if (f->second.awaiting_wsse) {
+        queue_request(f->second.wsse_event, f->first.s_ip, f->first.sport,
+                      f->first.d_ip, f->first.dport, pending, f->second.first_byte_mono_ms,
+                      f->second.generation);
+        f->second.awaiting_wsse = false;
       }
+      f->second.clear_buffers();
       flows.erase(f);
     }
     f = fn;
   }
-  long long current_ms = (long long)now * 1000LL;
-  std::map<PacketKey, std::vector<Pending> >::iterator p, pn;
-  for (p = pending.begin(); p != pending.end();) {
-    pn = p; ++pn;
+
+  long long now_mono = now_monotonic_ms();
+  long long ttl_ms = (long long)pending_ttl_sec * 1000LL;
+  for (std::map<PacketKey, std::vector<Pending> >::iterator p = pending.begin(); p != pending.end();) {
+    std::map<PacketKey, std::vector<Pending> >::iterator pn = p; ++pn;
     size_t i = 0;
     while (i < p->second.size()) {
-      if (current_ms - p->second[i].started_ms > (long long)PENDING_TTL * 1000LL) {
+      if (now_mono - p->second[i].started_mono_ms > ttl_ms) {
         emit_event(p->second[i].ev);
         p->second.erase(p->second.begin() + i);
+        if (g_total_pending_count > 0) --g_total_pending_count;
       } else {
         ++i;
       }
@@ -1001,7 +1283,13 @@ static void sweep(std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vecto
     if (p->second.empty()) pending.erase(p);
     p = pn;
   }
+
+  while (!g_pending_fifo.empty() &&
+         (now_mono - g_pending_fifo.front().started_mono_ms > ttl_ms * 2LL)) {
+    g_pending_fifo.pop_front();
+  }
 }
+
 static size_t find_http_start(const std::string &s) {
   const char *m[] = { "GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS " };
   size_t best = std::string::npos;
@@ -1012,172 +1300,694 @@ static size_t find_http_start(const std::string &s) {
   return best;
 }
 
-static bool g_monitored_ports[65536];
-
-static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
-                          uint32_t d_ip, unsigned dport,
-                          std::map<PacketKey, std::vector<Pending> > &pending) {
-  PacketKey rk;
-  rk.s_ip = d_ip; rk.sport = (uint16_t)dport;
-  rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
-  if (pending.find(rk) == pending.end() && pending.size() >= MAX_PENDING) {
-    flush_oldest(pending);
+static bool is_method_or_prefix(const char *p, size_t len) {
+  if (!len) return false;
+  const char *m[] = { "GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS " };
+  for (size_t i = 0; i < 7; ++i) {
+    size_t mlen = strlen(m[i]);
+    size_t check_len = len < mlen ? len : mlen;
+    if (memcmp(p, m[i], check_len) == 0) return true;
   }
-  std::vector<Pending> &queue = pending[rk];
-  if (queue.size() >= MAX_PENDING_PER_FLOW) {
-    emit_event(queue[0].ev);
-    queue.erase(queue.begin());
-  }
-  queue.push_back(Pending(e, now_ms()));
+  return false;
 }
+
+static bool g_monitored_ports[65536];
 
 static size_t active_wsse_flows(const std::map<FlowKey, Flow> &flows) {
   size_t count = 0;
-  std::map<FlowKey, Flow>::const_iterator it;
-  for (it = flows.begin(); it != flows.end(); ++it)
-    if (it->second.awaiting_body) ++count;
+  for (std::map<FlowKey, Flow>::const_iterator it = flows.begin(); it != flows.end(); ++it)
+    if (it->second.awaiting_wsse) ++count;
   return count;
 }
 
+static void evict_oldest_flow_if_needed(std::map<FlowKey, Flow> &flows,
+                                        std::map<PacketKey, std::vector<Pending> > &pending) {
+  while (!flows.empty() && (flows.size() >= MAX_FLOWS || g_total_flow_bytes >= MAX_TOTAL_BUFFER_BYTES)) {
+    std::map<FlowKey, Flow>::iterator oldest = flows.begin();
+    for (std::map<FlowKey, Flow>::iterator it = flows.begin(); it != flows.end(); ++it) {
+      if (it->second.touched < oldest->second.touched) oldest = it;
+    }
+    if (oldest->second.awaiting_wsse) {
+      queue_request(oldest->second.wsse_event, oldest->first.s_ip, oldest->first.sport,
+                    oldest->first.d_ip, oldest->first.dport, pending, oldest->second.first_byte_mono_ms,
+                    oldest->second.generation);
+      oldest->second.awaiting_wsse = false;
+    }
+    oldest->second.clear_buffers();
+    flows.erase(oldest);
+  }
+}
+
 static bool handle_packet(const unsigned char *buf, size_t n, const std::string &node, const std::vector<unsigned> &ports,
-                          std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending) {
+                          std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending,
+                          time_t pcap_now = 0, long long pcap_mono_now = 0) {
   (void)ports;
   if (n < 34) return false;
   size_t off = 14;
   unsigned short et = ntohs(read_u16(buf + 12));
   if (et == ETH_P_8021Q) { if (n < 38) return false; et = ntohs(read_u16(buf + 16)); off = 18; }
   if (et != ETH_P_IP || n < off + 20) return false;
+
   unsigned char ihl = (unsigned char)(buf[off] & 15) * 4;
-  if ((buf[off] >> 4) != 4 || buf[off + 9] != 6 || n < off + ihl + 20) return false;
+  if ((buf[off] >> 4) != 4 || ihl < 20 || buf[off + 9] != 6) return false;
+
+  // Reject fragmented IP packets (non-first fragment has frag offset > 0)
+  uint16_t frag = ntohs(read_u16(buf + off + 6));
+  if (frag & 0x1fff) return false;
+
+  // IPv4 total length validation and truncation check
+  uint16_t ip_total_len = ntohs(read_u16(buf + off + 2));
+  bool is_truncated = false;
+  if (ip_total_len > 0) {
+    if (ip_total_len < ihl + 20) return false;
+    if (n - off < ip_total_len) {
+      is_truncated = true;
+    } else if (n - off > ip_total_len) {
+      n = off + ip_total_len; // Exclude Ethernet padding
+    }
+  }
 
   uint32_t s_ip = read_u32(buf + off + 12);
   uint32_t d_ip = read_u32(buf + off + 16);
   size_t to = off + ihl;
+  if (n < to + 20) return false;
+
   unsigned sport = ntohs(read_u16(buf + to));
   unsigned dport = ntohs(read_u16(buf + to + 2));
+  uint32_t seq = ntohl(read_u32(buf + to + 4));
   unsigned doff = (buf[to + 12] >> 4) * 4;
-  if (n < to + doff) return false;
+  if (doff < 20 || n < to + doff) return false;
+
+  unsigned char tcp_flags = buf[to + 13];
   const char *payload = (const char *)(buf + to + doff);
   size_t plen = n - to - doff;
-  if (!plen) return false;
 
-  time_t now = time(NULL);
+  time_t now = (pcap_now > 0) ? pcap_now : time(NULL);
+  long long mono_now = (pcap_mono_now > 0) ? pcap_mono_now : now_monotonic_ms();
+
   bool dst_mon = (dport < 65536) ? g_monitored_ports[dport] : false;
   bool src_mon = (sport < 65536) ? g_monitored_ports[sport] : false;
 
-  if (src_mon && !dst_mon && plen >= 5) {
-    if (memcmp(payload, "HTTP/", 5) == 0) {
-      PacketKey k;
-      k.s_ip = s_ip; k.sport = (uint16_t)sport; k.d_ip = d_ip; k.dport = (uint16_t)dport;
-      std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(k);
-      if (p != pending.end() && !p->second.empty()) {
-        int st; unsigned cl;
-        if (parse_response(payload, plen, &st, &cl)) {
-          Event e = p->second[0].ev;
-          e.status = st; e.has_status = true;
-          e.duration_ms = (long)(now_ms() - p->second[0].started_ms);
-          if (e.duration_ms < 0) e.duration_ms = 0;
-          e.has_duration = true;
-          if (cl) { e.resp_bytes = cl; e.has_resp = true; }
-          emit_event(e);
-          p->second.erase(p->second.begin());
-          if (p->second.empty()) pending.erase(p);
+  // Direction A: Server -> Client Response Reassembly
+  if (src_mon && !dst_mon) {
+    FlowKey rfk;
+    rfk.s_ip = s_ip; rfk.sport = (uint16_t)sport;
+    rfk.d_ip = d_ip; rfk.dport = (uint16_t)dport;
+
+    if (tcp_flags & 0x02) { // SYN from server
+      evict_oldest_flow_if_needed(flows, pending);
+      Flow &rfl = flows[rfk];
+      rfl.clear_buffers();
+      rfl = Flow();
+      rfl.has_seq = true;
+      rfl.next_seq = seq + 1;
+      rfl.is_broken = false;
+      rfl.touched = now;
+      return true;
+    }
+
+    if (plen > 0) {
+      evict_oldest_flow_if_needed(flows, pending);
+      Flow &rfl = flows[rfk];
+      rfl.touched = now;
+
+      if (!rfl.has_seq) {
+        if ((plen >= 5 && memcmp(payload, "HTTP/", 5) == 0) ||
+            (plen < 5 && memcmp(payload, "HTTP/", plen) == 0)) {
+          rfl.has_seq = true;
+          rfl.next_seq = seq;
+          rfl.is_broken = false;
+        } else {
+          if (rfl.ooo.size() < MAX_OOO_SEGMENTS && !is_truncated) {
+            bool dup = false;
+            for (size_t i = 0; i < rfl.ooo.size(); ++i) {
+              if (rfl.ooo[i].seq == seq) { dup = true; break; }
+            }
+            if (!dup) {
+              rfl.ooo_push(seq, payload, plen);
+            }
+          }
+          return true;
         }
+      }
+
+      int32_t diff = seq_diff(seq, rfl.next_seq);
+      if (diff == 0) {
+        if (is_truncated) {
+          rfl.is_broken = true;
+        } else {
+          if (!rfl.buf_append(payload, plen)) return true;
+          rfl.next_seq += (uint32_t)plen;
+
+          // Drain out of order segments
+          bool drained = true;
+          while (drained && !rfl.ooo.empty()) {
+            drained = false;
+            for (size_t i = 0; i < rfl.ooo.size(); ++i) {
+              int32_t odiff = seq_diff(rfl.ooo[i].seq, rfl.next_seq);
+              if (odiff == 0) {
+                if (!rfl.buf_append(rfl.ooo[i].data.data(), rfl.ooo[i].data.size())) return true;
+                rfl.next_seq += (uint32_t)rfl.ooo[i].data.size();
+                rfl.ooo_erase(i);
+                drained = true; break;
+              } else if (odiff < 0) {
+                int32_t o_overlap = -odiff;
+                if ((size_t)o_overlap < rfl.ooo[i].data.size()) {
+                  size_t flen = rfl.ooo[i].data.size() - o_overlap;
+                  if (!rfl.buf_append(rfl.ooo[i].data.data() + o_overlap, flen)) return true;
+                  rfl.next_seq += (uint32_t)flen;
+                }
+                rfl.ooo_erase(i);
+                drained = true; break;
+              }
+            }
+          }
+        }
+      } else if (diff < 0) {
+        int32_t overlap = -diff;
+        if ((size_t)overlap < plen && !is_truncated) {
+          size_t flen = plen - overlap;
+          if (!rfl.buf_append(payload + overlap, flen)) return true;
+          rfl.next_seq += (uint32_t)flen;
+        }
+      } else { // diff > 0
+        if (rfl.ooo.size() < MAX_OOO_SEGMENTS && !is_truncated) {
+          bool dup = false;
+          for (size_t i = 0; i < rfl.ooo.size(); ++i) {
+            if (rfl.ooo[i].seq == seq) { dup = true; break; }
+          }
+          if (!dup) {
+            rfl.ooo_push(seq, payload, plen);
+          }
+        } else {
+          rfl.is_broken = true;
+        }
+      }
+
+      // Parse complete responses from reassembled buffer using HTTP framing
+      while (!rfl.buf.empty() && !rfl.is_broken) {
+        if (rfl.state == Flow::HTTP_STATE_HEADER) {
+          size_t end = rfl.buf.find("\r\n\r\n");
+          if (end == std::string::npos) {
+            if (rfl.buf.size() > MAX_HEADER_BYTES) {
+              rfl.clear_buffers();
+              rfl.is_broken = true;
+            }
+            break;
+          }
+
+          if (rfl.buf.compare(0, 5, "HTTP/") != 0) {
+            size_t hpos = rfl.buf.find("HTTP/");
+            if (hpos == std::string::npos || hpos > end) {
+              rfl.buf_erase(0, end + 4);
+              continue;
+            }
+            rfl.buf_erase(0, hpos);
+            end -= hpos;
+          }
+
+          int st = 0; size_t cl = 0; bool has_cl = false, is_chunked = false, is_close = false;
+          if (!parse_response(rfl.buf.data(), end, &st, &cl, &has_cl, &is_chunked, &is_close)) {
+            rfl.buf_erase(0, end + 4);
+            continue;
+          }
+
+          if (st >= 100 && st <= 199 && st != 101) {
+            rfl.buf_erase(0, end + 4);
+            continue;
+          }
+
+          PacketKey pk;
+          pk.s_ip = s_ip; pk.sport = (uint16_t)sport;
+          pk.d_ip = d_ip; pk.dport = (uint16_t)dport;
+          std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(pk);
+          bool is_head = false;
+          if (p != pending.end() && !p->second.empty()) {
+            Event e = p->second[0].ev;
+            if (e.method == "HEAD") is_head = true;
+            e.status = st;
+            e.has_status = true;
+            e.duration_ms = (long)(mono_now - p->second[0].started_mono_ms);
+            if (e.duration_ms < 0) e.duration_ms = 0;
+            e.has_duration = true;
+            if (has_cl) {
+              e.resp_bytes = (unsigned)cl;
+              e.has_resp = true;
+            }
+            emit_event(e);
+            p->second.erase(p->second.begin());
+            if (g_total_pending_count > 0) --g_total_pending_count;
+            if (p->second.empty()) pending.erase(p);
+          }
+
+          rfl.buf_erase(0, end + 4);
+
+          if (is_head || st == 204 || st == 304) {
+            rfl.state = Flow::HTTP_STATE_HEADER;
+          } else if (is_chunked) {
+            rfl.state = Flow::HTTP_STATE_CHUNK;
+            rfl.chunk_reading_len = true;
+            rfl.chunk_reading_trailer = false;
+            rfl.chunk_remaining = 0;
+          } else if (has_cl) {
+            if (cl > 0) {
+              rfl.state = Flow::HTTP_STATE_BODY;
+              rfl.body_remaining = cl;
+            } else {
+              rfl.state = Flow::HTTP_STATE_HEADER;
+            }
+          } else if (is_close) {
+            rfl.state = Flow::HTTP_STATE_CLOSE_BODY;
+          } else {
+            rfl.state = Flow::HTTP_STATE_CLOSE_BODY;
+          }
+          continue;
+        }
+
+        if (rfl.state == Flow::HTTP_STATE_BODY) {
+          if (rfl.buf.empty()) break;
+          size_t to_consume = (rfl.buf.size() < rfl.body_remaining) ? rfl.buf.size() : rfl.body_remaining;
+          rfl.buf_erase(0, to_consume);
+          rfl.body_remaining -= to_consume;
+          if (rfl.body_remaining == 0) {
+            rfl.state = Flow::HTTP_STATE_HEADER;
+          }
+          continue;
+        }
+
+        if (rfl.state == Flow::HTTP_STATE_CHUNK) {
+          if (rfl.buf.empty()) break;
+          if (rfl.chunk_reading_trailer) {
+            if (rfl.buf.size() >= 2 && rfl.buf[0] == '\r' && rfl.buf[1] == '\n') {
+              rfl.buf_erase(0, 2);
+              rfl.chunk_reading_trailer = false;
+              rfl.state = Flow::HTTP_STATE_HEADER;
+              continue;
+            }
+            size_t tr_end = rfl.buf.find("\r\n\r\n");
+            if (tr_end != std::string::npos) {
+              rfl.buf_erase(0, tr_end + 4);
+              rfl.chunk_reading_trailer = false;
+              rfl.state = Flow::HTTP_STATE_HEADER;
+              continue;
+            }
+            if (rfl.buf.size() > MAX_HEADER_BYTES) {
+              rfl.clear_buffers();
+              rfl.is_broken = true;
+            }
+            break;
+          }
+          if (rfl.chunk_reading_len) {
+            size_t crlf = rfl.buf.find("\r\n");
+            if (crlf == std::string::npos) {
+              if (rfl.buf.size() > 64) {
+                rfl.clear_buffers();
+                rfl.is_broken = true;
+              }
+              break;
+            }
+            std::string line = trim(rfl.buf.substr(0, crlf));
+            size_t semi = line.find(';');
+            std::string hex_str = (semi != std::string::npos) ? trim(line.substr(0, semi)) : line;
+            if (hex_str.empty()) {
+              rfl.clear_buffers();
+              rfl.is_broken = true;
+              break;
+            }
+            bool valid_hex = true;
+            for (size_t hi = 0; hi < hex_str.size(); ++hi) {
+              if (!isxdigit((unsigned char)hex_str[hi])) { valid_hex = false; break; }
+            }
+            if (!valid_hex) {
+              rfl.clear_buffers();
+              rfl.is_broken = true;
+              break;
+            }
+            char *endptr = NULL;
+            size_t chunk_len = (size_t)strtoul(hex_str.c_str(), &endptr, 16);
+            rfl.buf_erase(0, crlf + 2);
+            if (chunk_len == 0) {
+              rfl.chunk_reading_trailer = true;
+              continue;
+            } else {
+              rfl.chunk_remaining = chunk_len + 2;
+              rfl.chunk_reading_len = false;
+            }
+          } else {
+            size_t to_consume = (rfl.buf.size() < rfl.chunk_remaining) ? rfl.buf.size() : rfl.chunk_remaining;
+            rfl.buf_erase(0, to_consume);
+            rfl.chunk_remaining -= to_consume;
+            if (rfl.chunk_remaining == 0) rfl.chunk_reading_len = true;
+          }
+          continue;
+        }
+
+        if (rfl.state == Flow::HTTP_STATE_CLOSE_BODY) {
+          rfl.buf_erase(0, rfl.buf.size());
+          break;
+        }
+      }
+    }
+
+    if (tcp_flags & 0x05) { // Server FIN or RST
+      std::map<FlowKey, Flow>::iterator it = flows.find(rfk);
+      if (it != flows.end()) {
+        it->second.clear_buffers();
+        flows.erase(it);
       }
     }
     return true;
   }
-  unsigned char tcp_flags = buf[to + 13];
+
+  // Direction B: Client -> Server Request Reassembly
   if (!dst_mon) {
-    if (tcp_flags & 0x05) { /* FIN or RST */
+    if (tcp_flags & 0x05) {
       FlowKey rfk; rfk.s_ip = d_ip; rfk.sport = (uint16_t)dport; rfk.d_ip = s_ip; rfk.dport = (uint16_t)sport;
-      flows.erase(rfk);
+      std::map<FlowKey, Flow>::iterator it = flows.find(rfk);
+      if (it != flows.end()) {
+        it->second.clear_buffers();
+        flows.erase(it);
+      }
     }
     return false;
   }
 
   FlowKey fk;
   fk.s_ip = s_ip; fk.sport = (uint16_t)sport; fk.d_ip = d_ip; fk.dport = (uint16_t)dport;
-  if (tcp_flags & 0x05) { /* FIN or RST */
-    std::map<FlowKey, Flow>::iterator existing = flows.find(fk);
-    if (existing != flows.end() && existing->second.awaiting_body &&
-        !existing->second.event.basic_user.empty()) {
-      queue_request(existing->second.event, s_ip, sport, d_ip, dport, pending);
+
+  if (tcp_flags & 0x02) { // SYN from client: new connection generation!
+    evict_oldest_flow_if_needed(flows, pending);
+    PacketKey rk; rk.s_ip = d_ip; rk.sport = (uint16_t)dport; rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
+
+    // Purge previous generation's pending requests for this 4-tuple
+    std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(rk);
+    if (p != pending.end()) {
+      for (size_t i = 0; i < p->second.size(); ++i) {
+        emit_event(p->second[i].ev);
+        if (g_total_pending_count > 0) --g_total_pending_count;
+      }
+      pending.erase(p);
     }
-    flows.erase(fk);
+
+    // Reset server response flow for this 4-tuple
+    std::map<FlowKey, Flow>::iterator rfit = flows.find(rk);
+    if (rfit != flows.end()) {
+      rfit->second.clear_buffers();
+      flows.erase(rfit);
+    }
+
+    Flow &fl = flows[fk];
+    if (fl.awaiting_wsse) {
+      queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+      fl.awaiting_wsse = false;
+    }
+    uint32_t next_gen = fl.generation + 1;
+    fl.clear_buffers();
+    fl = Flow();
+    fl.generation = next_gen;
+    fl.has_seq = true;
+    fl.next_seq = seq + 1;
+    fl.touched = now;
+    fl.first_byte_mono_ms = 0;
     return true;
   }
 
-  if (flows.find(fk) == flows.end() && flows.size() >= MAX_FLOWS) {
-    flows.erase(flows.begin());
-  }
-  Flow &fl = flows[fk]; fl.touched = now;
-  if (fl.awaiting_body) {
-    std::string next_segment(payload, plen);
-    if (!fl.event.basic_user.empty() && find_http_start(next_segment) == 0) {
-      Event previous = fl.event;
-      fl = Flow();
-      fl.touched = now;
-      queue_request(previous, s_ip, sport, d_ip, dport, pending);
-    } else {
-      size_t remaining = fl.body_goal > fl.buf.size() ? fl.body_goal - fl.buf.size() : 0;
-      if (remaining) fl.buf.append(payload, plen < remaining ? plen : remaining);
-      std::string username = extract_wsse_username(fl.buf);
-      if (!username.empty() || fl.buf.size() >= fl.body_goal) {
-        Event event = fl.event;
-        if (!username.empty()) {
-          event.wsse_user = username; event.user = username; event.scheme = "wsse";
+  evict_oldest_flow_if_needed(flows, pending);
+  Flow &fl = flows[fk];
+  fl.touched = now;
+
+  if (plen > 0) {
+    if (!fl.has_seq) {
+      if (is_method_or_prefix(payload, plen)) {
+        fl.has_seq = true;
+        fl.next_seq = seq;
+        fl.is_broken = false;
+      } else {
+        if (fl.ooo.size() < MAX_OOO_SEGMENTS && !is_truncated) {
+          bool dup = false;
+          for (size_t i = 0; i < fl.ooo.size(); ++i) {
+            if (fl.ooo[i].seq == seq) { dup = true; break; }
+          }
+          if (!dup) {
+            fl.ooo_push(seq, payload, plen);
+          }
         }
-        flows.erase(fk);
-        queue_request(event, s_ip, sport, d_ip, dport, pending);
+        return true;
       }
-      return true;
+    }
+
+    int32_t diff = seq_diff(seq, fl.next_seq);
+    if (diff == 0) {
+      if (is_truncated) {
+        fl.is_broken = true;
+      } else {
+        if (!fl.buf_append(payload, plen)) return true;
+        fl.next_seq += (uint32_t)plen;
+
+        // Drain out-of-order segments
+        bool drained = true;
+        while (drained && !fl.ooo.empty()) {
+          drained = false;
+          for (size_t i = 0; i < fl.ooo.size(); ++i) {
+            int32_t odiff = seq_diff(fl.ooo[i].seq, fl.next_seq);
+            if (odiff == 0) {
+              if (!fl.buf_append(fl.ooo[i].data.data(), fl.ooo[i].data.size())) return true;
+              fl.next_seq += (uint32_t)fl.ooo[i].data.size();
+              fl.ooo_erase(i);
+              drained = true; break;
+            } else if (odiff < 0) {
+              int32_t o_overlap = -odiff;
+              if ((size_t)o_overlap < fl.ooo[i].data.size()) {
+                size_t flen = fl.ooo[i].data.size() - o_overlap;
+                if (!fl.buf_append(fl.ooo[i].data.data() + o_overlap, flen)) return true;
+                fl.next_seq += (uint32_t)flen;
+              }
+              fl.ooo_erase(i);
+              drained = true; break;
+            }
+          }
+        }
+      }
+    } else if (diff < 0) {
+      int32_t overlap = -diff;
+      if ((size_t)overlap < plen && !is_truncated) {
+        size_t flen = plen - overlap;
+        if (!fl.buf_append(payload + overlap, flen)) return true;
+        fl.next_seq += (uint32_t)flen;
+      }
+    } else { // diff > 0 (out of order gap)
+      if (fl.ooo.size() < MAX_OOO_SEGMENTS && !is_truncated) {
+        bool dup = false;
+        for (size_t i = 0; i < fl.ooo.size(); ++i) {
+          if (fl.ooo[i].seq == seq) { dup = true; break; }
+        }
+        if (!dup) {
+          fl.ooo_push(seq, payload, plen);
+        }
+      } else {
+        fl.is_broken = true;
+      }
+    }
+
+    // HTTP Framing State Machine for requests
+    while (!fl.buf.empty() && !fl.is_broken) {
+      if (fl.state == Flow::HTTP_STATE_HEADER) {
+        if (!fl.first_byte_mono_ms) fl.first_byte_mono_ms = mono_now;
+
+        size_t end = fl.buf.find("\r\n\r\n");
+        if (end == std::string::npos) {
+          if (fl.buf.size() > MAX_HEADER_BYTES) {
+            fl.clear_buffers();
+            fl.is_broken = true;
+          }
+          break;
+        }
+
+        size_t start = find_http_start(fl.buf);
+        if (start == std::string::npos || start > end) {
+          fl.buf_erase(0, end + 4);
+          continue;
+        }
+        if (start > 0) {
+          fl.buf_erase(0, start);
+          end -= start;
+        }
+
+        Event e; RequestMeta meta;
+        e.ts = now; e.host = node; e.service = "port:" + num(dport);
+        e.caller = ip_to_str(s_ip); e.caller_port = sport;
+        e.dst_ip = ip_to_str(d_ip); e.dst_port = dport;
+        e.req_bytes = (unsigned)(end + 4);
+
+        if (!parse_request(fl.buf.data(), end, &e, &meta)) {
+          fl.buf_erase(0, end + 4);
+          continue;
+        }
+
+        // Reject conflicting Content-Length + chunked encoding (RFC 7230 request smuggling prevention)
+        bool has_chunked = (lower(meta.transfer_encoding).find("chunked") != std::string::npos);
+        if (meta.has_content_length && has_chunked) {
+          fl.buf_erase(0, end + 4);
+          fl.clear_buffers();
+          fl.is_broken = true;
+          break;
+        }
+
+        fl.buf_erase(0, end + 4);
+
+        bool wsse_eligible = (g_wsse_body_bytes > 0 &&
+                              is_soap_content_type(meta.content_type) &&
+                              meta.has_content_length &&
+                              meta.content_length > 0 &&
+                              !has_chunked &&
+                              active_wsse_flows(flows) < MAX_WSSE_BODY_FLOWS);
+
+        if (wsse_eligible) {
+          fl.awaiting_wsse = true;
+          fl.wsse_event = e;
+          flow_bytes_sub(fl.wsse_buf.size());
+          fl.wsse_buf.clear();
+          fl.wsse_goal = meta.content_length < g_wsse_body_bytes ? meta.content_length : g_wsse_body_bytes;
+        } else {
+          queue_request(e, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+        }
+
+        if (meta.has_content_length && meta.content_length > 0) {
+          fl.state = Flow::HTTP_STATE_BODY;
+          fl.body_remaining = meta.content_length;
+        } else if (has_chunked) {
+          fl.state = Flow::HTTP_STATE_CHUNK;
+          fl.chunk_reading_len = true;
+          fl.chunk_reading_trailer = false;
+          fl.chunk_remaining = 0;
+        } else {
+          fl.state = Flow::HTTP_STATE_HEADER;
+          fl.first_byte_mono_ms = fl.buf.empty() ? 0 : mono_now;
+        }
+        continue;
+      }
+
+      if (fl.state == Flow::HTTP_STATE_BODY) {
+        if (fl.buf.empty()) break;
+        size_t to_consume = (fl.buf.size() < fl.body_remaining) ? fl.buf.size() : fl.body_remaining;
+
+        if (fl.awaiting_wsse) {
+          size_t wsse_need = fl.wsse_goal > fl.wsse_buf.size() ? fl.wsse_goal - fl.wsse_buf.size() : 0;
+          if (wsse_need > 0) {
+            size_t copy_len = (to_consume < wsse_need) ? to_consume : wsse_need;
+            fl.wsse_append(fl.buf.data(), copy_len);
+          }
+          std::string username = extract_wsse_username(fl.wsse_buf);
+          if (!username.empty() || fl.wsse_buf.size() >= fl.wsse_goal) {
+            Event ev = fl.wsse_event;
+            if (!username.empty()) {
+              ev.wsse_user = username; ev.user = username; ev.scheme = "wsse";
+            }
+            queue_request(ev, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+            fl.awaiting_wsse = false;
+          }
+        }
+
+        fl.buf_erase(0, to_consume);
+        fl.body_remaining -= to_consume;
+        if (fl.body_remaining == 0) {
+          if (fl.awaiting_wsse) {
+            queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+            fl.awaiting_wsse = false;
+          }
+          fl.state = Flow::HTTP_STATE_HEADER;
+          fl.first_byte_mono_ms = fl.buf.empty() ? 0 : mono_now;
+        }
+        continue;
+      }
+
+      if (fl.state == Flow::HTTP_STATE_CHUNK) {
+        if (fl.buf.empty()) break;
+        if (fl.chunk_reading_trailer) {
+          if (fl.buf.size() >= 2 && fl.buf[0] == '\r' && fl.buf[1] == '\n') {
+            fl.buf_erase(0, 2);
+            fl.chunk_reading_trailer = false;
+            fl.state = Flow::HTTP_STATE_HEADER;
+            fl.first_byte_mono_ms = fl.buf.empty() ? 0 : mono_now;
+            continue;
+          }
+          size_t tr_end = fl.buf.find("\r\n\r\n");
+          if (tr_end != std::string::npos) {
+            fl.buf_erase(0, tr_end + 4);
+            fl.chunk_reading_trailer = false;
+            fl.state = Flow::HTTP_STATE_HEADER;
+            fl.first_byte_mono_ms = fl.buf.empty() ? 0 : mono_now;
+            continue;
+          }
+          if (fl.buf.size() > MAX_HEADER_BYTES) {
+            fl.clear_buffers();
+            fl.is_broken = true;
+          }
+          break;
+        }
+        if (fl.chunk_reading_len) {
+          size_t crlf = fl.buf.find("\r\n");
+          if (crlf == std::string::npos) {
+            if (fl.buf.size() > 64) {
+              fl.clear_buffers();
+              fl.is_broken = true;
+            }
+            break;
+          }
+          std::string line = trim(fl.buf.substr(0, crlf));
+          size_t semi = line.find(';');
+          std::string hex_str = (semi != std::string::npos) ? trim(line.substr(0, semi)) : line;
+          if (hex_str.empty()) {
+            fl.clear_buffers();
+            fl.is_broken = true;
+            break;
+          }
+          bool valid_hex = true;
+          for (size_t hi = 0; hi < hex_str.size(); ++hi) {
+            if (!isxdigit((unsigned char)hex_str[hi])) { valid_hex = false; break; }
+          }
+          if (!valid_hex) {
+            fl.clear_buffers();
+            fl.is_broken = true;
+            break;
+          }
+          char *endptr = NULL;
+          size_t chunk_len = (size_t)strtoul(hex_str.c_str(), &endptr, 16);
+          fl.buf_erase(0, crlf + 2);
+          if (chunk_len == 0) {
+            fl.chunk_reading_trailer = true;
+            continue;
+          } else {
+            fl.chunk_remaining = chunk_len + 2;
+            fl.chunk_reading_len = false;
+          }
+        } else {
+          size_t to_consume = (fl.buf.size() < fl.chunk_remaining) ? fl.buf.size() : fl.chunk_remaining;
+          fl.buf_erase(0, to_consume);
+          fl.chunk_remaining -= to_consume;
+          if (fl.chunk_remaining == 0) fl.chunk_reading_len = true;
+        }
+        continue;
+      }
     }
   }
-  fl.buf.append(payload, plen);
-  if (fl.buf.size() > MAX_HEADER) { flows.erase(fk); return false; }
-  while (true) {
-    size_t start = find_http_start(fl.buf);
-    if (start == std::string::npos) { fl.buf.clear(); break; }
-    if (start > 0) fl.buf.erase(0, start);
-    size_t end = fl.buf.find("\r\n\r\n");
-    if (end == std::string::npos) break;
-    Event e; RequestMeta meta; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = ip_to_str(s_ip); e.caller_port = sport; e.dst_ip = ip_to_str(d_ip); e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
-    if (!parse_request(fl.buf.data(), end, &e, &meta)) { fl.buf.erase(0, end + 4); continue; }
-    fl.buf.erase(0, end + 4);
-    if (g_wsse_body_bytes &&
-        is_soap_content_type(meta.content_type) && meta.has_content_length &&
-        meta.content_length > 0 &&
-        lower(meta.transfer_encoding).find("chunked") == std::string::npos &&
-        active_wsse_flows(flows) < MAX_WSSE_BODY_FLOWS) {
-      fl.event = e;
-      fl.awaiting_body = true;
-      fl.body_goal = meta.content_length < g_wsse_body_bytes ? meta.content_length : g_wsse_body_bytes;
-      if (fl.body_goal > MAX_WSSE_BODY_BYTES) fl.body_goal = MAX_WSSE_BODY_BYTES;
-      if (fl.buf.size() > fl.body_goal) fl.buf.resize(fl.body_goal);
-      std::string username = extract_wsse_username(fl.buf);
-      if (!username.empty() || fl.buf.size() >= fl.body_goal) {
-        Event event = fl.event;
-        if (!username.empty()) {
-          event.wsse_user = username; event.user = username; event.scheme = "wsse";
-        }
-        flows.erase(fk);
-        queue_request(event, s_ip, sport, d_ip, dport, pending);
-      }
-      return true;
+
+  // FIN / RST Lifecycle: process after payload
+  if (tcp_flags & 0x05) {
+    if (fl.awaiting_wsse) {
+      queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+      fl.awaiting_wsse = false;
     }
-    queue_request(e, s_ip, sport, d_ip, dport, pending);
-  }
-  if (fl.buf.empty()) {
+    fl.clear_buffers();
     flows.erase(fk);
   }
+
   return true;
 }
 
 static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
   if (ports.empty()) return false;
   std::vector<struct sock_filter> f; size_t i;
-  /* Dual-path cBPF: Path A (standard IPv4) and Path B (802.1Q VLAN tagged IPv4). */
   unsigned N = (unsigned)ports.size();
   unsigned reject = 11 + N * 8;
   unsigned accept = reject + 1;
@@ -1188,31 +1998,21 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
   x.code=(C); x.jt=(unsigned char)_jt; x.jf=(unsigned char)_jf; x.k=(K); \
   f.push_back(x); \
 } while(0)
-  /* [0] Load EtherType at offset 12 */
   ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 12);
-  /* [1] If standard IPv4 (0x0800), jump over Path B (6 + 4*N instructions) to Path A */
   ADD(BPF_JMP|BPF_JEQ|BPF_K, (unsigned)(6 + 4 * N), 0, ETH_P_IP_HOST);
 
-  /* --- Path B: 802.1Q VLAN (index 2) --- */
-  /* [2] If not 802.1Q (0x8100), reject */
+  // Path B: 802.1Q VLAN
   ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), ETH_P_8021Q_HOST);
-  /* [3] Load encapsulated EtherType at offset 16 */
   ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 16);
-  /* [4] If encapsulated != IPv4, reject */
   ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), ETH_P_IP_HOST);
-  /* [5] Load IP protocol at offset 27 (23 + 4) */
   ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 27);
-  /* [6] If not TCP, reject */
   ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), IPPROTO_TCP);
-  /* [7] Load IHL at offset 18 (14 + 4) */
   ADD(BPF_LDX|BPF_B|BPF_MSH, 0, 0, 18);
-  /* Destination port checks for VLAN */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 20);
     unsigned jt = accept - (unsigned)f.size() - 1;
     ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, 0, ports[i]);
   }
-  /* Source port checks for VLAN */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 18);
     unsigned jt = accept - (unsigned)f.size() - 1;
@@ -1220,20 +2020,15 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
     ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
   }
 
-  /* --- Path A: Standard IPv4 --- */
-  /* Load IP protocol at offset 23 */
+  // Path A: Standard IPv4
   ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 23);
-  /* If not TCP, reject */
   ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), IPPROTO_TCP);
-  /* Load IHL at offset 14 */
   ADD(BPF_LDX|BPF_B|BPF_MSH, 0, 0, 14);
-  /* Destination port checks for standard IPv4 */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 16);
     unsigned jt = accept - (unsigned)f.size() - 1;
     ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, 0, ports[i]);
   }
-  /* Source port checks for standard IPv4 */
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 14);
     unsigned jt = accept - (unsigned)f.size() - 1;
@@ -1241,17 +2036,12 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
     ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
   }
 
-  /* [reject] Drop packet */
   ADD(BPF_RET|BPF_K, 0, 0, 0);
-  /* [accept] Accept packet (2048 bytes) */
   ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
 #undef ADD
   if (f.size() > 4096) return false;
   struct sock_fprog prog; prog.len = (unsigned short)f.size(); prog.filter = &f[0];
-#ifndef SO_ATTACH_FILTER
-#define SO_ATTACH_FILTER 26
-#endif
-  return setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) == 0;
+  return setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER_OLD, &prog, sizeof(prog)) == 0;
 }
 
 struct MmapRing {
@@ -1348,15 +2138,14 @@ static bool valid_ring_frame(const struct tpacket2_hdr *hdr,
 
 static int run_ring_fixture() {
   MmapRing mr;
-  if (!valid_ring_geometry(mr)) return 20;
-  unsigned char frame[2048];
+  uint8_t frame[2048];
   memset(frame, 0, sizeof(frame));
   struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)frame;
-  size_t off = 0, len = 0;
   hdr->tp_mac = TPACKET2_HDRLEN;
-  hdr->tp_net = TPACKET2_HDRLEN + 14;
+  hdr->tp_net = TPACKET2_HDRLEN;
   hdr->tp_snaplen = 128;
   hdr->tp_len = 128;
+  size_t off = 0, len = 0;
   if (!valid_ring_frame(hdr, sizeof(frame), &off, &len) ||
       off != TPACKET2_HDRLEN || len != 128) return 21;
   hdr->tp_mac = TPACKET2_HDRLEN - 1;
@@ -1429,12 +2218,14 @@ static int run_dual_auth_fixture() {
   std::vector<unsigned char> packet(14 + 20 + 20 + payload.size(), 0);
   packet[12] = 0x08; packet[13] = 0x00;
   packet[14] = 0x45; packet[23] = IPPROTO_TCP;
+  uint16_t tot_len = (uint16_t)(20 + 20 + payload.size());
+  packet[16] = (unsigned char)(tot_len >> 8); packet[17] = (unsigned char)(tot_len & 0xff);
   packet[26] = 192; packet[27] = 0; packet[28] = 2; packet[29] = 2;
   packet[30] = 192; packet[31] = 0; packet[32] = 2; packet[33] = 1;
   unsigned short sport = htons(51000), dport = htons(8080);
   memcpy(&packet[34], &sport, sizeof(sport));
   memcpy(&packet[36], &dport, sizeof(dport));
-  packet[46] = 5U << 4; packet[47] = 0x18;
+  packet[46] = 5U << 4; packet[47] = 0x19;
   memcpy(&packet[54], payload.data(), payload.size());
 
   g_wsse_body_bytes = 8192;
@@ -1449,6 +2240,35 @@ static int run_dual_auth_fixture() {
                      ports, flows, pending)) return 9;
   if (!flows.empty() || pending.size() != 1) return 10;
   flush_all_pending(pending);
+  return 0;
+}
+
+static int run_ship_rate_fixture() {
+  std::vector<std::string> events;
+  events.push_back(std::string(40000, 'x'));
+  events.push_back(std::string(40000, 'y'));
+  if (bounded_batch_count(events, "fixture") != 1) return 30;
+  events.clear();
+  events.push_back(std::string(MAX_POST_BYTES + 1, 'x'));
+  if (bounded_batch_count(events, "fixture") != 0) return 31;
+  return 0;
+}
+
+static int run_stats_fixture() {
+  g_ship_node = "fixture-node";
+  g_instance_id = "fixture-1";
+  g_stats_last_at = wall_seconds() - 30.0;
+  g_capture_packets = 100;
+  g_capture_bytes = 6400;
+  g_events_emitted = g_events_in = 10;
+  g_events_pushed = 8;
+  g_events_dropped = g_drop_queue = 2;
+  std::string body = agent_stats_body(-1, 3, 2, 1);
+  if (body.size() > MAX_STATS_BYTES) return 40;
+  if (body.find("\"type\":\"agent_stats\"") == std::string::npos) return 41;
+  if (body.find("\"drop_percent\":20.0000") == std::string::npos) return 42;
+  if (body.find("\"mode\":\"cpp\"") == std::string::npos) return 43;
+  std::cout << body << "\n";
   return 0;
 }
 
@@ -1475,6 +2295,7 @@ static int open_capture_socket(const std::string &iface,
                                MmapRing &ring) {
   int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
   if (fd < 0) { perror("AF_PACKET"); return -1; }
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
   int rb = 8 * 1024 * 1024;
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
   if (!attach_bpf(fd, ports)) {
@@ -1547,6 +2368,9 @@ int main(int argc, char **argv) {
   if (rate_env && *rate_env) g_ship_rate_kbps = (unsigned)atoi(rate_env);
   const char *stats_env = getenv("NT_STATS_INTERVAL_SEC");
   if (stats_env && *stats_env) g_stats_interval_sec = (unsigned)atoi(stats_env);
+  const char *ttl_env = getenv("NT_PENDING_TTL_SEC");
+  if (ttl_env && *ttl_env) g_pending_ttl_sec = (unsigned)atoi(ttl_env);
+
   for (i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i];
     else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
@@ -1558,8 +2382,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--endpoint") && i + 1 < argc) endpoint = argv[++i];
     else if (!strcmp(argv[i], "--ship-rate-kbps") && i + 1 < argc) g_ship_rate_kbps = (unsigned)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--stats-interval-sec") && i + 1 < argc) g_stats_interval_sec = (unsigned)atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--pending-ttl-sec") && i + 1 < argc) g_pending_ttl_sec = (unsigned)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--capability-probe")) capability_probe = true;
-    else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i; /* ignored: 0 disk write */
+    else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i;
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--wsse-body-bytes") && i + 1 < argc) {
       if (!parse_wsse_size(argv[++i], &g_wsse_body_bytes)) {
@@ -1567,7 +2392,7 @@ int main(int argc, char **argv) {
       }
     }
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..300] [-j workers] [--wsse-body-bytes 0..65536]\n");
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..300] [--pending-ttl-sec 1..300] [-j workers] [--wsse-body-bytes 0..65536]\n");
       return 0;
     }
     else { fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
@@ -1579,6 +2404,10 @@ int main(int argc, char **argv) {
   }
   if (g_stats_interval_sec < 10 || g_stats_interval_sec > 300) {
     fprintf(stderr, "stats interval must be in range 10..300 seconds\n");
+    return 2;
+  }
+  if (g_pending_ttl_sec < 1 || g_pending_ttl_sec > 300) {
+    fprintf(stderr, "pending ttl must be in range 1..300 seconds\n");
     return 2;
   }
   if (ports.size() > MAX_PORTS) {
@@ -1611,6 +2440,8 @@ int main(int argc, char **argv) {
   int fd = open_capture_socket(iface, ports, ring);
   if (fd < 0) return 2;
 
+  signal(SIGPIPE, SIG_IGN);
+
   if (g_endpoint.empty()) {
     int output_flags = fcntl(STDOUT_FILENO, F_GETFL, 0);
     if (output_flags < 0 ||
@@ -1620,7 +2451,14 @@ int main(int argc, char **argv) {
       close(fd);
       return 2;
     }
-    signal(SIGPIPE, SIG_IGN);
+  } else {
+    g_ship_worker_active = true;
+    if (pthread_create(&g_ship_worker_tid, NULL, ship_worker_thread, NULL) != 0) {
+      logmsg("failed to spawn shipping worker thread");
+      release_mmap_ring(fd, ring);
+      close(fd);
+      return 2;
+    }
   }
 
   signal(SIGTERM, stop_signal);
@@ -1634,84 +2472,85 @@ int main(int argc, char **argv) {
     logmsg("WSSE UsernameToken inspection enabled (bounded to " + number_string(g_wsse_body_bytes) + " bytes/request)");
   }
   if (!g_endpoint.empty()) {
-    logmsg("single-binary in-memory mode: shipping directly to " + g_endpoint + " (0 disk I/O)");
+    logmsg("single-binary mode: non-blocking thread shipping directly to " + g_endpoint + " (0 disk I/O)");
   } else {
     logmsg("non-blocking native pipeline mode enabled; WAN I/O isolated in nt-ship-cpp");
   }
   logmsg("listening");
 
-  time_t last = time(NULL), last_flush = last;
+  time_t last = time(NULL);
   bool ring_integrity_failure = false;
 
   struct pollfd pfd;
   pfd.fd = fd;
-  pfd.events = POLLIN | POLLERR;
+  pfd.events = POLLIN | POLLERR | POLLHUP | POLLNVAL;
   pfd.revents = 0;
 
   while (g_running) {
     int rc = poll(&pfd, 1, 1000);
     if (rc < 0 && errno == EINTR) {
-      /* Signal handled, loop condition will check g_running */
-    } else if (rc >= 0) {
-      /* Drain all ready frames in the ring without extra syscalls. */
-      while (g_running) {
-          unsigned b_idx = ring.frame_idx / ring.frames_per_block;
-          unsigned f_in_b = ring.frame_idx % ring.frames_per_block;
-          uint8_t *frame_ptr = ((uint8_t *)ring.ring) + (b_idx * ring.block_size) + (f_in_b * ring.frame_size);
-          volatile struct tpacket2_hdr *volatile_hdr =
-              (volatile struct tpacket2_hdr *)frame_ptr;
+      // Signal handled
+    } else if (rc < 0) {
+      logmsg("poll error encountered");
+      break;
+    } else if (rc > 0 && (pfd.revents & (POLLERR | POLLNVAL))) {
+      logmsg("poll error revents detected");
+      break;
+    } else if (rc > 0) {
+      size_t drain_count = 0;
+      while (g_running && drain_count < MAX_DRAIN_PER_PASS) {
+        unsigned b_idx = ring.frame_idx / ring.frames_per_block;
+        unsigned f_in_b = ring.frame_idx % ring.frames_per_block;
+        uint8_t *frame_ptr = ((uint8_t *)ring.ring) + (b_idx * ring.block_size) + (f_in_b * ring.frame_size);
+        volatile struct tpacket2_hdr *volatile_hdr =
+            (volatile struct tpacket2_hdr *)frame_ptr;
 
-          if (!(volatile_hdr->tp_status & TP_STATUS_USER)) {
-            break; /* No more kernel-populated frames in ring right now */
-          }
-          __sync_synchronize(); /* acquire kernel-owned frame contents */
+        if (!(volatile_hdr->tp_status & TP_STATUS_USER)) {
+          break;
+        }
+        __sync_synchronize();
 
-          const struct tpacket2_hdr *hdr =
-              (const struct tpacket2_hdr *)frame_ptr;
-          size_t packet_offset = 0, packet_length = 0;
-          if (!valid_ring_frame(hdr, ring.frame_size,
-                                &packet_offset, &packet_length)) {
-            __sync_synchronize();
-            volatile_hdr->tp_status = TP_STATUS_KERNEL;
-            ring_integrity_failure = true;
-            ++g_invalid_frames;
-            g_running = 0;
-            logmsg("invalid TPACKET_V2 frame metadata; stopping capture");
-            break;
-          }
-          if (packet_length > 0) {
-            const unsigned char *pkt = frame_ptr + packet_offset;
-            ++g_capture_packets;
-            g_capture_bytes += packet_length;
-            handle_packet(pkt, packet_length, node, ports, flows, pending);
-          }
-
-          __sync_synchronize(); /* release all reads before returning ownership */
+        const struct tpacket2_hdr *hdr =
+            (const struct tpacket2_hdr *)frame_ptr;
+        size_t packet_offset = 0, packet_length = 0;
+        if (!valid_ring_frame(hdr, ring.frame_size,
+                              &packet_offset, &packet_length)) {
+          __sync_synchronize();
           volatile_hdr->tp_status = TP_STATUS_KERNEL;
-          ring.frame_idx = (ring.frame_idx + 1) % ring.frame_nr;
+          ring_integrity_failure = true;
+          ++g_invalid_frames;
+          g_running = 0;
+          logmsg("invalid TPACKET_V2 frame metadata; stopping capture");
+          break;
+        }
+        if (packet_length > 0) {
+          const unsigned char *pkt = frame_ptr + packet_offset;
+          ++g_capture_packets;
+          g_capture_bytes += packet_length;
+          handle_packet(pkt, packet_length, node, ports, flows, pending);
+        }
+
+        __sync_synchronize();
+        volatile_hdr->tp_status = TP_STATUS_KERNEL;
+        ring.frame_idx = (ring.frame_idx + 1) % ring.frame_nr;
+        ++drain_count;
       }
       if (g_endpoint.empty()) std::cout.flush();
     }
 
     time_t now = time(NULL);
     if (now - last >= 1) {
-      sweep(flows, pending, now);
+      sweep(flows, pending, now, g_pending_ttl_sec);
       if (g_endpoint.empty()) std::cout.flush();
       last = now;
     }
 
-    if (!g_endpoint.empty()) {
-      if (now - last_flush >= FLUSH_SEC || g_ship_buf.size() >= MAX_BATCH) {
-        if (!g_ship_buf.empty()) send_batches(g_endpoint, g_ship_node, &g_ship_buf, true);
-        last_flush = now;
-      }
-    }
     if (wall_seconds() - g_stats_last_at >= g_stats_interval_sec) {
       size_t pending_count = 0, wsse_count = 0;
       for (std::map<PacketKey, std::vector<Pending> >::iterator pi = pending.begin(); pi != pending.end(); ++pi)
         pending_count += pi->second.size();
       for (std::map<FlowKey, Flow>::iterator fi = flows.begin(); fi != flows.end(); ++fi)
-        if (fi->second.awaiting_body) ++wsse_count;
+        if (fi->second.awaiting_wsse) ++wsse_count;
       if (!g_endpoint.empty())
         send_agent_stats(fd, flows.size(), pending_count, wsse_count);
       else
@@ -1719,14 +2558,15 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* A response is optional enrichment. Preserve requests still awaiting a
-   * response when SIGTERM/restart ends capture. */
   flush_incomplete_wsse(flows, pending);
   flush_all_pending(pending);
   if (g_endpoint.empty()) std::cout.flush();
 
-  if (!g_endpoint.empty() && !g_ship_buf.empty()) {
-    send_batches(g_endpoint, g_ship_node, &g_ship_buf, true);
+  if (g_ship_worker_active) {
+    pthread_mutex_lock(&g_ship_queue_mutex);
+    pthread_cond_signal(&g_ship_queue_cond);
+    pthread_mutex_unlock(&g_ship_queue_mutex);
+    pthread_join(g_ship_worker_tid, NULL);
   } else if (g_endpoint.empty()) {
     size_t pending_count = 0;
     emit_capture_stats_internal(fd, 0, pending_count, 0);
