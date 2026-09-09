@@ -335,6 +335,33 @@ class Flow(object):
         self.syn_seen = False
         self.corr_eligible = True
 
+    def reset_for_new_connection(self, next_gen, now=None, syn_seen=True, corr_eligible=True):
+        self.next_seq = 0
+        self.has_seq = False
+        self.is_broken = False
+        self.touched = time.time() if now is None else now
+        self.first_byte_ts = 0.0
+        self.buf = bytearray()
+        self.ooo = []
+        self.state = HTTP_STATE_HEADER
+        self.body_remaining = 0
+        self.chunk_remaining = 0
+        self.chunk_payload_remaining = 0
+        self.chunk_reading_len = True
+        self.chunk_reading_crlf = False
+        self.chunk_reading_trailer = False
+        self.awaiting_wsse = False
+        self.wsse_event = None
+        self.wsse_buf = bytearray()
+        self.wsse_goal = 0
+        self.event = None
+        self.hdrs = None
+        self.head_bytes = 0
+        self.body_goal = 0
+        self.generation = next_gen
+        self.syn_seen = syn_seen
+        self.corr_eligible = corr_eligible
+
 
 def _drain_ooo(fl):
     drained = True
@@ -540,14 +567,12 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                 gen = cfl.generation
                 syn = cfl.syn_seen
                 eligible = cfl.corr_eligible
-        rfl = Flow()
-        rfl.generation = gen
-        rfl.syn_seen = syn or True
-        rfl.corr_eligible = eligible if gen > 0 else True
+        if rfl is None:
+            rfl = Flow()
+            resp_flows[rk] = rfl
+        rfl.reset_for_new_connection(gen, now=now, syn_seen=syn or True, corr_eligible=eligible if gen > 0 else True)
         rfl.has_seq = True
         rfl.next_seq = (seq + 1) & 0xFFFFFFFF
-        rfl.touched = now
-        resp_flows[rk] = rfl
         return
 
     rfl = resp_flows.get(rk)
@@ -626,22 +651,24 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                     ent.pop(0)
                     if not ent:
                         pending_tbl.pop(rk, None)
-                elif is_tombstone:
-                    ent.pop(0)
-                    if not ent:
-                        pending_tbl.pop(rk, None)
                 else:
-                    ev, started = item[0], item[1]
-                    ent.pop(0)
-                    if not ent:
-                        pending_tbl.pop(rk, None)
+                    ev = item[0]
                     if ev.get("method") == "HEAD":
                         is_head = True
-                    ev["status"] = st
-                    ev["duration_ms"] = max(0, int((now - started) * 1000))
-                    if clen is not None:
-                        ev["resp_bytes"] = clen
-                    out.append(ev)
+                    if is_tombstone:
+                        ent.pop(0)
+                        if not ent:
+                            pending_tbl.pop(rk, None)
+                    else:
+                        started = item[1]
+                        ent.pop(0)
+                        if not ent:
+                            pending_tbl.pop(rk, None)
+                        ev["status"] = st
+                        ev["duration_ms"] = max(0, int((now - started) * 1000))
+                        if clen is not None:
+                            ev["resp_bytes"] = clen
+                        out.append(ev)
 
             del rfl.buf[:head_len]
 
@@ -1092,23 +1119,19 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
 
         old_gen = fl.generation if fl is not None else 0
         next_gen = old_gen + 1
-        fl = Flow()
-        fl.generation = next_gen
-        fl.syn_seen = True
-        fl.corr_eligible = True
+        if fl is None:
+            fl = Flow()
+            flows[key] = fl
+        fl.reset_for_new_connection(next_gen, now=now, syn_seen=True, corr_eligible=True)
         fl.has_seq = True
         fl.next_seq = (seq + 1) & 0xFFFFFFFF
-        fl.touched = now
-        fl.first_byte_ts = 0.0
-        flows[key] = fl
 
         if resp_flows is not None:
-            rfl = Flow()
-            rfl.generation = next_gen
-            rfl.syn_seen = True
-            rfl.corr_eligible = True
-            rfl.touched = now
-            resp_flows[rk] = rfl
+            rfl = resp_flows.get(rk)
+            if rfl is None:
+                rfl = Flow()
+                resp_flows[rk] = rfl
+            rfl.reset_for_new_connection(next_gen, now=now, syn_seen=True, corr_eligible=True)
         return
 
     fl = flows.get(key)

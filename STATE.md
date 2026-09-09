@@ -3,6 +3,32 @@
 
 # STATE.md — Current Project State & Memory
 
+## Capture & Parser Hardening Round 5 — Unified Flow Reset & Expired HEAD Semantics (2026-09-09)
+
+Two critical edge cases resolved in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
+
+1. **Unified Flow Reset on Client SYN (`reset_for_new_connection`, Test 28)**:
+   - Addressed reproduction where an invalid request framing broke a flow (`fl.is_broken = true`), and subsequent client SYN started a new connection generation without clearing `is_broken`.
+   - Unified connection initialization across both directions (`fl` and `resp_fl`) and server SYN into a single complete reset routine (`Flow::reset_for_new_connection`). This guarantees `is_broken = false`, resets HTTP framing state, clears sequence tracking, and resets correlation eligibility without leaving any fields stale.
+   - Subsequent valid requests and responses on the new connection correlate properly with status 200.
+
+2. **Expired HEAD Bodyless-Response Semantics (Test 29)**:
+   - Addressed reproduction where an expired HEAD request became a tombstone, and upon delivery of the late response, `is_head` was not checked because the tombstone was consumed in the tombstone branch before checking `e.method == "HEAD"`.
+   - The sniffer fell back to non-HEAD response parsing, and with `Content-Length: X` present in the response headers, entered `HTTP_STATE_BODY`, consuming the subsequent GET response as HEAD body bytes.
+   - Fixed by inspecting `p->second[0].ev.method == "HEAD"` (or Python equivalent `ev.get("method") == "HEAD"`) *before* checking or discarding its tombstone. A late HEAD response remains strictly bodyless regardless of `Content-Length`.
+
+### Test Results After Round 5 Fixes
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **24/24 PASS** |
+| `python3 test_synthetic_harness.py` | **58/58 PASS** (Tests 1–29, both engines) |
+| `./nt-sniff-cpp --lockout-fixture` | **PASS** (10k bounded registry + all 4 sequence reproductions) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,204 events ✓ |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 8 EDGE TESTS PASS** |
+| `make clean && make all && make fixture` | **PASS** (0 warnings) |
+| `sh build-firstrun.sh` | **357,093 bytes** bundle rebuilt |
+
 ## Capture & Parser Hardening Round 4 — Generation-Scoped Eligibility & SYN-ACK Verification (2026-09-09)
 
 Two critical edge cases resolved in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:

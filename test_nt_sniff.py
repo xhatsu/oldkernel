@@ -396,3 +396,88 @@ def test_synack_preserves_verification_under_capacity_fallback():
                                           corr_eligible=resp_flows[rk].corr_eligible) is True
     nt_sniff.corr_disabled_clear()
 
+
+def test_client_syn_resets_is_broken():
+    flows = {}
+    resp_flows = {}
+    pending = {}
+    out = []
+
+    key = ("10.0.0.1", 50028, "10.0.0.2", 80)
+    meta = ("10.0.0.2", 80, "10.0.0.1", 50028)
+    rk = ("10.0.0.2", 80, "10.0.0.1", 50028)
+
+    # 1. Connection starts and breaks due to invalid framing / conflict CL
+    nt_sniff.handle_payload(flows, key, None, b"", meta, {80}, "node", out,
+                            pending_tbl=pending, now=10.0, seq=1000, flags=0x02, resp_flows=resp_flows)
+    bad_req = b"POST /bad HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n12345"
+    nt_sniff.handle_payload(flows, key, None, bad_req, meta, {80}, "node", out,
+                            pending_tbl=pending, now=10.1, seq=1001, flags=0x18, resp_flows=resp_flows)
+    assert flows[key].is_broken is True
+
+    # 2. Client initiates a new connection with fresh SYN
+    nt_sniff.handle_payload(flows, key, None, b"", meta, {80}, "node", out,
+                            pending_tbl=pending, now=20.0, seq=3000, flags=0x02, resp_flows=resp_flows)
+    assert flows[key].is_broken is False
+    assert flows[key].generation == 2
+
+    # 3. Valid request and response produce event with status 200
+    good_req = b"GET /api/valid28 HTTP/1.1\r\nHost: x\r\n\r\n"
+    nt_sniff.handle_payload(flows, key, None, good_req, meta, {80}, "node", out,
+                            pending_tbl=pending, now=20.1, seq=3001, flags=0x18, resp_flows=resp_flows)
+    good_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    nt_sniff.handle_response(resp_flows, rk, good_resp, 20.2, out, pending,
+                            seq=5000, flags=0x18, flows=flows)
+
+    valid_events = [e for e in out if e.get("path") == "/api/valid28"]
+    assert len(valid_events) == 1
+    assert valid_events[0].get("status") == 200
+
+
+def test_expired_head_request_preserves_bodyless_response():
+    flows = {}
+    resp_flows = {}
+    pending = {}
+    out = []
+
+    key = ("10.0.0.1", 50029, "10.0.0.2", 80)
+    meta = ("10.0.0.2", 80, "10.0.0.1", 50029)
+    rk = ("10.0.0.2", 80, "10.0.0.1", 50029)
+
+    # 1. Connection starts
+    nt_sniff.handle_payload(flows, key, None, b"", meta, {80}, "node", out,
+                            pending_tbl=pending, now=10.0, seq=1000, flags=0x02, resp_flows=resp_flows)
+
+    # 2. Client sends HEAD request
+    head_req = b"HEAD /api/head29 HTTP/1.1\r\nHost: x\r\n\r\n"
+    nt_sniff.handle_payload(flows, key, None, head_req, meta, {80}, "node", out,
+                            pending_tbl=pending, now=10.1, seq=1001, flags=0x18, resp_flows=resp_flows)
+    assert len(pending[rk]) == 1
+    assert pending[rk][0][0].get("method") == "HEAD"
+
+    # 3. Advance time past pending TTL (e.g. 10s TTL at now=25.0) -> HEAD request expires to tombstone
+    nt_sniff.sweep_pending(pending, 25.0, out, flows=flows, resp_flows=resp_flows)
+    assert len(out) == 1
+    assert out[0].get("path") == "/api/head29"
+    assert out[0].get("status") is None
+    assert len(pending[rk]) == 1
+    assert pending[rk][0][2] is True  # is_tombstone
+
+    # 4. Client sends GET request on same connection
+    get_req = b"GET /api/get29 HTTP/1.1\r\nHost: x\r\n\r\n"
+    nt_sniff.handle_payload(flows, key, None, get_req, meta, {80}, "node", out,
+                            pending_tbl=pending, now=25.1, seq=1001 + len(head_req), flags=0x18, resp_flows=resp_flows)
+    assert len(pending[rk]) == 2  # [tombstone, get_req]
+
+    # 5. Server sends response to HEAD with Content-Length: 100 (bodyless per RFC)
+    # followed by response to GET with 200 OK
+    resp_head = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"
+    resp_get = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO"
+    nt_sniff.handle_response(resp_flows, rk, resp_head + resp_get, 25.2, out, pending,
+                            seq=5000, flags=0x18, flows=flows)
+
+    get_events = [e for e in out if e.get("path") == "/api/get29"]
+    assert len(get_events) == 1
+    assert get_events[0].get("status") == 200
+    assert get_events[0].get("resp_bytes") == 5
+

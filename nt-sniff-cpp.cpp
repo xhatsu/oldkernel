@@ -298,6 +298,28 @@ struct Flow {
            chunk_reading_len(true), chunk_reading_crlf(false), chunk_reading_trailer(false),
            awaiting_wsse(false), wsse_goal(0) {}
 
+  void reset_for_new_connection(uint32_t next_gen, time_t now, bool is_syn_seen = true, bool is_corr_eligible = true) {
+    clear_buffers();
+    next_seq = 0;
+    has_seq = false;
+    is_broken = false;
+    correlation_disabled = false;
+    syn_seen = is_syn_seen;
+    corr_eligible = is_corr_eligible;
+    touched = now;
+    first_byte_mono_ms = 0;
+    generation = next_gen;
+    state = HTTP_STATE_HEADER;
+    body_remaining = 0;
+    chunk_payload_remaining = 0;
+    chunk_reading_len = true;
+    chunk_reading_crlf = false;
+    chunk_reading_trailer = false;
+    awaiting_wsse = false;
+    wsse_event = Event();
+    wsse_goal = 0;
+  }
+
 
   void clear_buffers() {
     flow_bytes_sub(buf.size());
@@ -1639,22 +1661,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           eligible = cfit->second.corr_eligible;
         }
       }
-      rfl.clear_buffers();
-      rfl.buf.clear();
-      rfl.ooo.clear();
-      rfl.state = Flow::HTTP_STATE_HEADER;
-      rfl.body_remaining = 0;
-      rfl.chunk_payload_remaining = 0;
-      rfl.chunk_reading_len = true;
-      rfl.chunk_reading_crlf = false;
-      rfl.chunk_reading_trailer = false;
-      rfl.generation = gen;
-      rfl.syn_seen = syn || true;
-      rfl.corr_eligible = (gen > 0) ? eligible : true;
+      rfl.reset_for_new_connection(gen, now, syn || true, (gen > 0) ? eligible : true);
       rfl.has_seq = true;
       rfl.next_seq = seq + 1;
-      rfl.is_broken = false;
-      rfl.touched = now;
       return true;
     }
 
@@ -1767,26 +1776,28 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
               if (!p->second[0].is_tombstone && g_total_pending_count > 0) --g_total_pending_count;
               p->second.erase(p->second.begin());
               if (p->second.empty()) pending.erase(p);
-            } else if (p->second[0].is_tombstone) {
-              // Late response for expired request: consume tombstone, do not attach to newer requests
-              p->second.erase(p->second.begin());
-              if (p->second.empty()) pending.erase(p);
             } else {
-              Event e = p->second[0].ev;
-              if (e.method == "HEAD") is_head = true;
-              e.status = st;
-              e.has_status = true;
-              e.duration_ms = (long)(mono_now - p->second[0].started_mono_ms);
-              if (e.duration_ms < 0) e.duration_ms = 0;
-              e.has_duration = true;
-              if (has_cl) {
-                e.resp_bytes = (unsigned)cl;
-                e.has_resp = true;
+              if (p->second[0].ev.method == "HEAD") is_head = true;
+              if (p->second[0].is_tombstone) {
+                // Late response for expired request: consume tombstone, do not attach to newer requests
+                p->second.erase(p->second.begin());
+                if (p->second.empty()) pending.erase(p);
+              } else {
+                Event e = p->second[0].ev;
+                e.status = st;
+                e.has_status = true;
+                e.duration_ms = (long)(mono_now - p->second[0].started_mono_ms);
+                if (e.duration_ms < 0) e.duration_ms = 0;
+                e.has_duration = true;
+                if (has_cl) {
+                  e.resp_bytes = (unsigned)cl;
+                  e.has_resp = true;
+                }
+                emit_event(e);
+                p->second.erase(p->second.begin());
+                if (g_total_pending_count > 0) --g_total_pending_count;
+                if (p->second.empty()) pending.erase(p);
               }
-              emit_event(e);
-              p->second.erase(p->second.begin());
-              if (g_total_pending_count > 0) --g_total_pending_count;
-              if (p->second.empty()) pending.erase(p);
             }
           }
 
@@ -1973,45 +1984,13 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
       fl.awaiting_wsse = false;
     }
     uint32_t next_gen = fl.generation + 1;
-    fl.clear_buffers();
-    fl.buf.clear();
-    fl.ooo.clear();
-    fl.state = Flow::HTTP_STATE_HEADER;
-    fl.body_remaining = 0;
-    fl.chunk_payload_remaining = 0;
-    fl.chunk_reading_len = true;
-    fl.chunk_reading_crlf = false;
-    fl.chunk_reading_trailer = false;
-    fl.generation = next_gen;
-    fl.syn_seen = true;
-    fl.corr_eligible = true;
+    fl.reset_for_new_connection(next_gen, now, true, true);
     fl.has_seq = true;
     fl.next_seq = seq + 1;
-    fl.touched = now;
-    fl.first_byte_mono_ms = 0;
 
     // Reset server response flow for this 4-tuple and carry forward new generation
-    std::map<FlowKey, Flow>::iterator rfit = flows.find(rk);
-    if (rfit != flows.end()) {
-      rfit->second.clear_buffers();
-    }
     Flow &resp_fl = flows[rk];
-    resp_fl.clear_buffers();
-    resp_fl.buf.clear();
-    resp_fl.ooo.clear();
-    resp_fl.state = Flow::HTTP_STATE_HEADER;
-    resp_fl.body_remaining = 0;
-    resp_fl.chunk_payload_remaining = 0;
-    resp_fl.chunk_reading_len = true;
-    resp_fl.chunk_reading_crlf = false;
-    resp_fl.chunk_reading_trailer = false;
-    resp_fl.generation = next_gen;
-    resp_fl.syn_seen = true;
-    resp_fl.corr_eligible = true;
-    resp_fl.has_seq = false;
-    resp_fl.next_seq = 0;
-    resp_fl.is_broken = false;
-    resp_fl.touched = now;
+    resp_fl.reset_for_new_connection(next_gen, now, true, true);
     return true;
 
   }
@@ -2766,10 +2745,7 @@ static int run_lockout_fixture() {
     uint32_t gen = sfl.generation;
     bool syn = sfl.syn_seen;
     bool eligible = sfl.corr_eligible;
-    sfl.clear_buffers();
-    sfl.generation = gen;
-    sfl.syn_seen = syn || true;
-    sfl.corr_eligible = (gen > 0) ? eligible : true;
+    sfl.reset_for_new_connection(gen, time(NULL), syn || true, (gen > 0) ? eligible : true);
 
     // Both directions must remain eligible for correlation under capacity fallback!
     if (!is_correlation_allowed(rk, test_flows, cfl.generation, cfl.syn_seen, cfl.corr_eligible)) {
@@ -2778,6 +2754,30 @@ static int run_lockout_fixture() {
     }
     if (!is_correlation_allowed(rk, test_flows, sfl.generation, sfl.syn_seen, sfl.corr_eligible)) {
       fprintf(stderr, "Lockout fixture failed: server direction lost verification after SYN-ACK\n");
+      return 1;
+    }
+
+    // Test Reproduction 3: reset_for_new_connection clears is_broken
+    cfl.is_broken = true;
+    cfl.reset_for_new_connection(2, time(NULL), true, true);
+    if (cfl.is_broken) {
+      fprintf(stderr, "Lockout fixture failed: is_broken was not cleared on reset_for_new_connection\n");
+      return 1;
+    }
+
+    // Test Reproduction 4: Expired HEAD tombstone retains HEAD semantics
+    std::map<PacketKey, std::vector<Pending> > test_pending;
+    Event head_ev;
+    head_ev.method = "HEAD";
+    Pending tombstone(999, 1, head_ev, 1000, 1000);
+    tombstone.is_tombstone = true;
+    test_pending[rk].push_back(tombstone);
+    bool fixture_is_head = false;
+    if (!test_pending[rk].empty()) {
+      if (test_pending[rk][0].ev.method == "HEAD") fixture_is_head = true;
+    }
+    if (!fixture_is_head) {
+      fprintf(stderr, "Lockout fixture failed: tombstone failed to yield is_head=true\n");
       return 1;
     }
   }

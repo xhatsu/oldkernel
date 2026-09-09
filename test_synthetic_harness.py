@@ -699,6 +699,83 @@ def run_test_suite_for_engine_ext(run_pcap, engine_name):
     else:
         print("  [%s] Test 27 (SYN-ACK Preserves Verification): PASS (SYN-ACK preserved verification, status 200 correlated)" % engine_name)
 
+    # -----------------------------------------------------------------------
+    # 28. Client SYN Resets is_broken
+    # Invalid request framing breaks flow; verified new SYN must reset is_broken
+    # so subsequent requests and responses are captured and correlated.
+    # -----------------------------------------------------------------------
+    pkts28 = []
+    # Step 1: Broken connection
+    pkt_syn28_old = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50028, 80, 1000, 0, 0x02, b"")
+    pkt_synack28_old = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50028, 5000, 1001, 0x12, b"")
+    bad_req28 = b"POST /bad HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n12345"
+    pkt_bad28 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50028, 80, 1001, 5001, 0x18, bad_req28)
+    pkts28.append((180, 0, pkt_syn28_old, len(pkt_syn28_old)))
+    pkts28.append((180, 1000, pkt_synack28_old, len(pkt_synack28_old)))
+    pkts28.append((180, 2000, pkt_bad28, len(pkt_bad28)))
+
+    # Step 2: Client starts new connection with fresh SYN
+    pkt_syn28_new = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50028, 80, 3000, 0, 0x02, b"")
+    pkt_synack28_new = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50028, 6000, 3001, 0x12, b"")
+    good_req28 = b"GET /api/valid28 HTTP/1.1\r\nHost: x\r\n\r\n"
+    pkt_good28 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50028, 80, 3001, 6001, 0x18, good_req28)
+    good_resp28 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_resp28 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50028, 6001, 3001 + len(good_req28), 0x18, good_resp28)
+    pkts28.append((190, 0, pkt_syn28_new, len(pkt_syn28_new)))
+    pkts28.append((190, 1000, pkt_synack28_new, len(pkt_synack28_new)))
+    pkts28.append((190, 2000, pkt_good28, len(pkt_good28)))
+    pkts28.append((190, 3000, pkt_resp28, len(pkt_resp28)))
+
+    write_pcap(tmp_pcap, pkts28)
+    ev28 = run_pcap(tmp_pcap, [80])
+    valid_ev28 = [e for e in ev28 if e.get("path") == "/api/valid28" and e.get("status") == 200]
+    if not valid_ev28:
+        failures.append("[%s] Test 28 (Client SYN Resets is_broken): /api/valid28 missing or failed to correlate with 200 OK after new SYN: %s" % (engine_name, [e for e in ev28 if e.get("path") == "/api/valid28"]))
+    else:
+        print("  [%s] Test 28 (Client SYN Resets is_broken): PASS (new SYN cleared is_broken, status 200 correlated)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 29. Expired HEAD Request Preserves Bodyless-Response Semantics
+    # Expired HEAD becomes tombstone; late response has Content-Length but NO body.
+    # Subsequent GET response must not be swallowed as HEAD body bytes.
+    # -----------------------------------------------------------------------
+    pkts29 = []
+    pkt_syn29 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50029, 80, 2000, 0, 0x02, b"")
+    pkt_synack29 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50029, 7000, 2001, 0x12, b"")
+    pkts29.append((200, 0, pkt_syn29, len(pkt_syn29)))
+    pkts29.append((200, 1000, pkt_synack29, len(pkt_synack29)))
+
+    # Client sends HEAD request
+    req_head29 = b"HEAD /api/head29 HTTP/1.1\r\nHost: x\r\n\r\n"
+    pkt_head29 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50029, 80, 2001, 7001, 0x18, req_head29)
+    pkts29.append((200, 2000, pkt_head29, len(pkt_head29)))
+
+    # Advance time to 215s (>10s pending TTL) -> HEAD expires to tombstone.
+    # Client sends GET request on same connection.
+    seq_get29 = 2001 + len(req_head29)
+    req_get29 = b"GET /api/get29 HTTP/1.1\r\nHost: x\r\n\r\n"
+    pkt_get29 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50029, 80, seq_get29, 7001, 0x18, req_get29)
+    pkts29.append((215, 0, pkt_get29, len(pkt_get29)))
+
+    # Server sends HEAD response with Content-Length: 100 (NO body bytes per RFC)
+    resp_head29 = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"
+    pkt_resp_head29 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50029, 7001, seq_get29 + len(req_get29), 0x18, resp_head29)
+    pkts29.append((215, 1000, pkt_resp_head29, len(pkt_resp_head29)))
+
+    # Server sends GET response with 200 OK and body
+    resp_get29 = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO"
+    seq_resp_get29 = 7001 + len(resp_head29)
+    pkt_resp_get29 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50029, seq_resp_get29, seq_get29 + len(req_get29), 0x18, resp_get29)
+    pkts29.append((215, 2000, pkt_resp_get29, len(pkt_resp_get29)))
+
+    write_pcap(tmp_pcap, pkts29)
+    ev29 = run_pcap(tmp_pcap, [80])
+    get_ev29 = [e for e in ev29 if e.get("path") == "/api/get29" and e.get("status") == 200]
+    if not get_ev29:
+        failures.append("[%s] Test 29 (Expired HEAD Preserves Bodyless Semantics): /api/get29 failed to correlate with 200 OK (consumed by HEAD body?): %s" % (engine_name, [e for e in ev29 if e.get("path") == "/api/get29"]))
+    else:
+        print("  [%s] Test 29 (Expired HEAD Preserves Bodyless Semantics): PASS (HEAD recognized as bodyless, GET correlated with 200 OK)" % engine_name)
+
     if os.path.exists(tmp_pcap):
         os.remove(tmp_pcap)
     return failures
@@ -720,7 +797,7 @@ def run_regression_suite():
             print("  *", f)
         sys.exit(1)
     else:
-        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (54/54 PASS)!")
+        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (58/58 PASS)!")
 
 if __name__ == "__main__":
     run_regression_suite()
