@@ -102,16 +102,22 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   and SysV supervisor, confirming rootless execution (`ntsniff`), 256 MiB address space bounds,
   and zero credential exposure. Production runs in native C++ mode on `enp0s6:18080`.
 
-## Capture & Parser Hardening State (2026-09-09)
-- **TCP Stream Reassembly**: Modular sequence-difference arithmetic (`seq_diff`), duplicate segment suppression, retransmission overlap trimming, and bounded out-of-order segment queues (up to 4 segments / 16 KiB per flow) implemented in both C++ (`nt-sniff-cpp.cpp`) and Python (`nt-sniff.py`).
-- **HTTP Request & Response Framing**: Explicit state machines (`HTTP_STATE_HEADER`, `HTTP_STATE_BODY`, `HTTP_STATE_CHUNK`, `HTTP_STATE_CLOSE_BODY`) on both request and response paths. Eliminates body scanning for fake status lines, parses chunk extensions/trailers, respects HEAD request bodyless responses (RFC 7230 §3.3.3), and drops desynchronizing requests with conflicting Content-Length + chunked encoding.
-- **Symmetrical Memory Accounting**: Symmetrical tracking via `flow_bytes_add()` and `flow_bytes_sub()` across all buffers (`buf`, `wsse_buf`, `ooo`) against `MAX_TOTAL_BUFFER_BYTES` (16 MiB) and `MAX_FLOW_BUFFER_BYTES` (64 KiB). Flow creation triggers oldest flow eviction.
-- **Pending FIFO Leak Remediation**: Monotonic `req_id` and generation tracking per pending request; lazy reconciliation in `g_pending_fifo` prevents stale request leaks and avoids corrupting queue order.
-- **Keep-Alive Timing Precision**: Request start timestamp reset at request boundaries (`first_byte_mono_ms` reset on `HTTP_STATE_HEADER`), avoiding latency inflation across idle gaps.
-- **Connection Generations**: Client SYN increments flow generation, purges stale pending requests for that 4-tuple, and cleans up stale response flows, preventing cross-connection correlation errors.
-- **Shipping Concurrency**: Thread-safe asynchronous stats upload via `g_pending_stats_body` and worker thread; `signal(SIGPIPE, SIG_IGN)` and mutex guards prevent capture stalls and race conditions.
-- **Informational Response Handling**: Server response reassembly ignores `100 Continue`, `102 Processing`, and `103 Early Hints`, keeping requests pending until final status (>= 200 or 101) arrives.
-- **Incomplete SOAP Preservation**: Incomplete WSSE requests without Basic auth fallback are safely emitted upon stream close or timeout instead of being discarded.
-- **Dual-Engine Synthetic Regression Suite (`test_synthetic_harness.py`)**: 32/32 PASS across both C++ and Python engines covering 16 distinct edge cases.
-- **PCAP Verification Parity**: Offline PCAP 247 yields 109 events with 100% traceparent correlation, duration 112ms, and status 200 in both Python and C++; PCAP 249 yields 6,204 events in both Python and C++ with exact username, scheme, and status parity.
+## Capture & Parser Hardening State (2026-09-09) — Final
+- **TCP Stream Reassembly**: Modular `seq_diff`, duplicate suppression, overlap trimming, `_drain_ooo()` / `drain_ooo_segments()` called on BOTH in-order and overlapping paths, bounded OOO queues (4 segs / 16 KiB).
+- **HTTP Request & Response Framing**: Explicit state machines on both request and response paths. Body bytes never scanned for HTTP status lines. Chunk size overflow (>16 hex digits or >0x7FFFFFFF) breaks flow. Mandatory trailing `\r\n` per chunk validated separately via `chunk_reading_crlf` state.
+- **Conflicting Content-Length Detection**: Both engines parse every `Content-Length` header occurrence; mismatch, negative value, or `Content-Length + Transfer-Encoding: chunked` immediately breaks the flow and prevents smuggled request fabrication (Tests 15, 19).
+- **Tombstone Pending Queue**: Expired requests become tombstones (C++: `is_tombstone=true`, Python: `item[2]=True`) with a 10-second secondary TTL. Late responses consume the tombstone without correlating to newer requests on the same connection (Test 17).
+- **Connection Generation Isolation**: Client SYN increments `fl.generation` on request flow AND propagates to response flow. Response correlation checks generation equality to prevent cross-connection misattribution (Tests 14, 18).
+- **Incomplete SOAP on SYN Reconnect**: Previous flow's WSSE event emitted directly to `out[]` (not re-queued into pending) before generation is incremented (Test 18).
+- **sweep_pending Tombstone Handling**: Tombstones skip emission but are retained for 10s then purged; non-tombstone items past TTL become tombstones in-place instead of popping (preserves FIFO order for subsequent responses).
+- **drain_pending Tombstone Awareness**: Emits only non-tombstone events on shutdown.
+- **parse_response_head Hardening**: Status code range validated (100–599), negative `Content-Length` flagged as conflict, conflicting multi-value `Content-Length` or `CL+chunked` returns `None` to break response flow (C++ equivalent in `parse_response`).
+- **Symmetrical Memory Accounting**: `flow_bytes_add()` / `flow_bytes_sub()` across all buffers against 16 MiB total / 64 KiB per-flow bounds.
+- **Keep-Alive Timing Precision**: `first_byte_ts` / `first_byte_mono_ms` reset strictly at request boundaries.
+- **Shipping Concurrency**: Mutex-guarded `g_producer_finished`, explicit 10s shutdown deadline, `pthread_cond_broadcast` on exit.
+- **Dual-Engine Synthetic Regression Suite (`test_synthetic_harness.py`)**: **44/44 PASS** across both C++ and Python engines covering 22 distinct edge cases (Tests 1–22).
+- **PCAP Verification Parity**: PCAP 247 → 109 events, status 200, duration 112ms, both engines. PCAP 249 → 6,204 events (Python) / 6,205 events (C++), zero credential leaks, both engines.
+- **Unit Tests**: `pytest test_nt_sniff.py` 19/19 PASS.
+- **ASAN/UBSAN**: `cpp-edge-test.py` ALL 7 EDGE TESTS PASS (sniffer, WSSE, dual-auth, TPACKET_V2, shipper ceiling, agent stats, bounded egress).
+
 

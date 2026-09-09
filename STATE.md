@@ -3,26 +3,36 @@
 
 # STATE.md — Current Project State & Memory
 
-## Capture & Parser Hardening: Dual-Engine Retransmission, Body Framing, Timing & Memory Remediation (2026-09-09)
-- Hardened both C++ (`nt-sniff-cpp.cpp`) and Python (`nt-sniff.py`) capture engines against network packet loss, TCP retransmissions, embedded HTTP bodies, informational 1xx responses, incomplete SOAP requests, response body fabrication, keep-alive latency drift, stale connection generations, and memory accounting leaks:
-  1. **Strict Response Body Framing**: Eliminated `rfl.buf.find("HTTP/")` body scanning. Implemented explicit response states (`HTTP_STATE_HEADER`, `HTTP_STATE_BODY`, `HTTP_STATE_CHUNK`, `HTTP_STATE_CLOSE_BODY`) consuming Content-Length, chunk extensions/trailers, and close-delimited bodies. Bounded HEAD requests and 1xx/204/304 bodyless responses per RFC 7230 §3.3.3.
-  2. **Symmetrical Memory Accounting**: Added `flow_bytes_add()` and `flow_bytes_sub()` tracking all buffers (`buf`, `wsse_buf`, `ooo`) symmetrically against `MAX_TOTAL_BUFFER_BYTES` (16 MiB) and `MAX_FLOW_BUFFER_BYTES` (64 KiB). Response flows trigger `evict_oldest_flow_if_needed()`.
-  3. **Pending FIFO Leak Remediation**: Monotonic `req_id` and generation tracking per pending request; lazy reconciliation in `g_pending_fifo` cleans up matched and expired entries without unbounded growth.
-  4. **Keep-Alive Timing Precision**: `first_byte_mono_ms` set strictly on request arrival in `HTTP_STATE_HEADER` and reset to `mono_now` (if pipelined data remains) or `0` on completion, preventing idle gaps from skewing subsequent request latency.
-  5. **Connection Generation Isolation**: Client SYN increments flow generation, purges stale pending requests for that 4-tuple, and resets response flow, preventing cross-connection correlation misalignment.
-  6. **Smuggling Prevention**: Conflicting `Content-Length` and `Transfer-Encoding: chunked` headers are rejected as broken flows per RFC 7230 §3.3.3. Full chunk trailer sections (`\r\n\r\n`) are framed.
-  7. **Shipping Concurrency**: Thread-safe asynchronous stats upload via `g_pending_stats_body` and `ship_worker_thread`. Unconditional `signal(SIGPIPE, SIG_IGN)` and mutex guards for all shared state.
-  8. **Robust TCP Stream Reassembly**: Modular sequence-difference arithmetic (`seq_diff`) handling 32-bit wraparound, deduplication, overlap trimming, and bounded out-of-order segment queues (up to 4 segments / 16 KiB per flow).
-- Dual-engine synthetic regression harness (`test_synthetic_harness.py`):
-  - 16 distinct failure cases executed against both C++ and Python engines: 32/32 PASS.
-- Real-world PCAP suite (`test_pcap_suite.py`):
-  - PCAP 247: Python and C++ both produce 109 events with exact status 200, duration 112ms, and 580 response bytes.
-  - PCAP 249: Python and C++ both produce 6,204 events with identical status codes, identities, and zero credential leaks.
-- All test suites passing:
-  - `make clean && make all && make fixture`: PASS.
-  - `python3 cpp-edge-test.py` (ASAN + UBSAN): ALL 7 EDGE TESTS PASS.
-  - `pytest test_nt_sniff.py`: 19/19 PASS.
-  - `sh build-firstrun.sh`: Regenerated self-contained bundle `install-firstrun-el68.sh` (320,259 bytes).
+## Capture & Parser Final Hardening Round 2 (2026-09-09)
+
+Seven additional reproducible bugs fixed in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
+
+1. **OOO Drain After Overlap Trim** (`diff < 0` path): `_drain_ooo()` / `drain_ooo_segments()` now called after both in-order *and* overlapping segment ingestion so queued out-of-order segments are immediately consumed after coverage advances (Test 21).
+
+2. **Conflicting Content-Length in Requests** (`nt-sniff.py` parse loop): Duplicate or contradictory `Content-Length` headers detected per-line with `first_cl`; breaks flow. `parse_response_head` similarly validates status range and rejects multi-value `CL` or `CL + chunked` (Test 19).
+
+3. **Chunk Size Overflow** (request-side `HTTP_STATE_CHUNK`): hex string length capped at 16 digits; parsed value checked `< 0 or > 0x7FFFFFFF`; breaks flow. Mandatory trailing `\r\n` validated via separate `chunk_reading_crlf` state (Test 20).
+
+4. **Tombstone Sweep** (`sweep_pending`): Expired non-tombstone items now become tombstones in-place (emitting the event) with a 10-second secondary TTL before removal, preserving FIFO order so late responses consume the tombstone instead of correlating to the next real request (Test 17).
+
+5. **`drain_pending` Tombstone Awareness**: Iterates and emits only non-tombstone items on shutdown (no double-emit).
+
+6. **SYN Response-Flow Generation Propagation**: On client SYN, `next_gen` is now applied to the response flow `flows[rk]` in addition to the request flow, so the `generation` check in response correlation works correctly (Tests 14, 18).
+
+7. **`parse_request` conflict-check removal from early-return**: `parse_request()` in C++ no longer returns `false` early (that path was handled by the caller); caller's `meta.has_conflict_cl` check via `has_chunked` continues to break the stream correctly (Test 15).
+
+### Test Results After All Fixes
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **19/19 PASS** |
+| `python3 test_synthetic_harness.py` | **44/44 PASS** (Tests 1–22, both engines) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,205 events ✓ |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 7 EDGE TESTS PASS** |
+| `make clean && make all && make fixture` | **PASS** (0 warnings) |
+| `sh build-firstrun.sh` | **328,822 bytes** bundle rebuilt |
+
+
 
 ## C++ and Python Mode Comprehensive Review & Verification (2026-09-09)
 

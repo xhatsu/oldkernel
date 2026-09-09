@@ -211,7 +211,8 @@ def test_pending_sweep_flushes_all_stale_requests_for_connection():
     nt_sniff.sweep_pending(pending, 10.0, out)
 
     assert [event["path"] for event in out] == ["/one", "/two"]
-    assert pending[key][0][0]["path"] == "/fresh"
+    active = [item for item in pending[key] if not (item[2] if len(item) > 2 else False)]
+    assert active[0][0]["path"] == "/fresh"
 
 
 def test_idle_sweep_cadence_honors_pending_ttl():

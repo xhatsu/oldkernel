@@ -241,7 +241,8 @@ struct RequestMeta {
   std::string content_type, transfer_encoding;
   size_t content_length;
   bool has_content_length;
-  RequestMeta() : content_length(0), has_content_length(false) {}
+  bool has_conflict_cl;
+  RequestMeta() : content_length(0), has_content_length(false), has_conflict_cl(false) {}
 };
 
 struct TcpSegment {
@@ -262,6 +263,7 @@ struct Flow {
   uint32_t next_seq;
   bool has_seq;
   bool is_broken;
+  bool correlation_disabled;
   time_t touched;
   long long first_byte_mono_ms;
   uint32_t generation;
@@ -276,8 +278,9 @@ struct Flow {
   } state;
 
   size_t body_remaining;
-  size_t chunk_remaining;
+  size_t chunk_payload_remaining;
   bool chunk_reading_len;
+  bool chunk_reading_crlf;
   bool chunk_reading_trailer;
 
   bool awaiting_wsse;
@@ -285,10 +288,10 @@ struct Flow {
   std::string wsse_buf;
   size_t wsse_goal;
 
-  Flow() : next_seq(0), has_seq(false), is_broken(false),
+  Flow() : next_seq(0), has_seq(false), is_broken(false), correlation_disabled(false),
            touched(time(NULL)), first_byte_mono_ms(0), generation(0),
-           state(HTTP_STATE_HEADER), body_remaining(0), chunk_remaining(0),
-           chunk_reading_len(true), chunk_reading_trailer(false),
+           state(HTTP_STATE_HEADER), body_remaining(0), chunk_payload_remaining(0),
+           chunk_reading_len(true), chunk_reading_crlf(false), chunk_reading_trailer(false),
            awaiting_wsse(false), wsse_goal(0) {}
 
   void clear_buffers() {
@@ -365,9 +368,13 @@ struct Pending {
   Event ev;
   long long started_wall_ms;
   long long started_mono_ms;
-  Pending() : req_id(0), generation(0), started_wall_ms(0), started_mono_ms(0) {}
+  bool is_tombstone;
+  long long tombstone_mono_ms;
+  Pending() : req_id(0), generation(0), started_wall_ms(0), started_mono_ms(0),
+              is_tombstone(false), tombstone_mono_ms(0) {}
   Pending(uint64_t id, uint32_t gen, const Event &e, long long wall_t, long long mono_t)
-    : req_id(id), generation(gen), ev(e), started_wall_ms(wall_t), started_mono_ms(mono_t) {}
+    : req_id(id), generation(gen), ev(e), started_wall_ms(wall_t), started_mono_ms(mono_t),
+      is_tombstone(false), tombstone_mono_ms(0) {}
 };
 
 struct PendingQueueRef {
@@ -453,13 +460,24 @@ static bool parse_request(const char *data, size_t len, Event *e, RequestMeta *m
       } else if (meta && hname_len == 12 && !strncasecmp(p, "content-type", 12)) {
         meta->content_type.assign(val_start, val_len);
       } else if (meta && hname_len == 14 && !strncasecmp(p, "content-length", 14)) {
-        meta->has_content_length = parse_decimal_size(val_start, val_len, &meta->content_length);
+        size_t clen_val = 0;
+        if (parse_decimal_size(val_start, val_len, &clen_val)) {
+          if (meta->has_content_length && meta->content_length != clen_val) {
+            meta->has_conflict_cl = true;
+          }
+          meta->content_length = clen_val;
+          meta->has_content_length = true;
+        } else {
+          meta->has_conflict_cl = true;
+        }
       } else if (meta && hname_len == 17 && !strncasecmp(p, "transfer-encoding", 17)) {
         meta->transfer_encoding.assign(val_start, val_len);
       }
     }
     p = line_end + 1;
   }
+
+
 
   if (e->user.empty()) e->user = "-anonymous-";
   if (e->scheme.empty()) e->scheme = "none";
@@ -738,8 +756,13 @@ static bool parse_response(const char *data, size_t len, int *status, size_t *cl
       if (hlen == 14 && !strncasecmp(p, "content-length", 14)) {
         size_t n = 0;
         if (parse_decimal_size(v, vlen, &n)) {
+          if (*has_clen && *clen != n) {
+            return false;
+          }
           *clen = n;
           *has_clen = true;
+        } else {
+          return false;
         }
       } else if (hlen == 17 && !strncasecmp(p, "transfer-encoding", 17)) {
         std::string te(v, vlen);
@@ -757,6 +780,7 @@ static bool parse_response(const char *data, size_t len, int *status, size_t *cl
     }
     p = line_end + 1;
   }
+  if (*has_clen && *is_chunked) return false;
   if (is_http_10 && !conn_keep_alive) {
     *is_close = true;
   } else if (conn_close) {
@@ -796,6 +820,7 @@ static pthread_mutex_t g_ship_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_ship_queue_cond = PTHREAD_COND_INITIALIZER;
 static std::vector<std::string> g_ship_buf;
 static bool g_ship_worker_active = false;
+static bool g_producer_finished = false;
 static std::string g_pending_stats_body;
 
 static std::string shellq(const std::string &s) {
@@ -815,9 +840,10 @@ static double wall_seconds() {
   return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 static void pace_upload(size_t bytes, double *next_slot) {
-  const double bytes_per_sec = (double)g_ship_rate_kbps * 1000.0 / 8.0;
+  if (!g_ship_rate_kbps) return;
+  double bytes_per_sec = (double)g_ship_rate_kbps * 1000.0 / 8.0;
   double now = wall_seconds();
-  if (*next_slot < now || *next_slot - now > 60.0) *next_slot = now;
+  if (*next_slot < now) *next_slot = now;
   double slot = *next_slot;
   *next_slot += (double)bytes / bytes_per_sec;
   while (slot > (now = wall_seconds())) {
@@ -855,15 +881,31 @@ static bool post_body(const std::string &endpoint, const std::string &path,
 static void *ship_worker_thread(void *) {
   double next_slot = wall_seconds();
   double next_stats_slot = wall_seconds();
-  while (g_running || !g_ship_buf.empty() || !g_pending_stats_body.empty()) {
+  double shutdown_deadline = 0.0;
+  while (true) {
     std::vector<std::string> batch;
     std::string stats_body;
     pthread_mutex_lock(&g_ship_queue_mutex);
-    while (g_running && g_ship_buf.empty() && g_pending_stats_body.empty()) {
+    while (g_running && !g_producer_finished && g_ship_buf.empty() && g_pending_stats_body.empty()) {
       struct timespec ts;
       clock_gettime(CLOCK_REALTIME, &ts);
       ts.tv_sec += 1;
       pthread_cond_timedwait(&g_ship_queue_cond, &g_ship_queue_mutex, &ts);
+    }
+    if (!g_running && shutdown_deadline == 0.0) {
+      shutdown_deadline = wall_seconds() + 10.0;
+    }
+    if (g_producer_finished && g_ship_buf.empty() && g_pending_stats_body.empty()) {
+      pthread_mutex_unlock(&g_ship_queue_mutex);
+      break;
+    }
+    if (shutdown_deadline > 0.0 && wall_seconds() > shutdown_deadline) {
+      g_events_dropped += g_ship_buf.size();
+      g_drop_hub += g_ship_buf.size();
+      g_ship_buf.clear();
+      g_pending_stats_body.clear();
+      pthread_mutex_unlock(&g_ship_queue_mutex);
+      break;
     }
     if (!g_pending_stats_body.empty()) {
       stats_body.swap(g_pending_stats_body);
@@ -907,19 +949,16 @@ static void *ship_worker_thread(void *) {
         ++g_batches_failed;
         ++g_consecutive_failures;
         g_last_push_status = 0;
+        if (shutdown_deadline > 0.0 && g_consecutive_failures >= 3) {
+          g_events_dropped += g_ship_buf.size();
+          g_drop_hub += g_ship_buf.size();
+          g_ship_buf.clear();
+          g_pending_stats_body.clear();
+          pthread_mutex_unlock(&g_ship_queue_mutex);
+          break;
+        }
         pthread_mutex_unlock(&g_ship_queue_mutex);
       }
-    }
-
-    if (!g_running) {
-      pthread_mutex_lock(&g_ship_queue_mutex);
-      if (g_consecutive_failures >= 3) {
-        g_events_dropped += g_ship_buf.size();
-        g_drop_hub += g_ship_buf.size();
-        g_ship_buf.clear();
-        g_pending_stats_body.clear();
-      }
-      pthread_mutex_unlock(&g_ship_queue_mutex);
     }
   }
   return NULL;
@@ -1250,14 +1289,13 @@ static void flush_all_pending(std::map<PacketKey, std::vector<Pending> > &pendin
 
 static void sweep(std::map<FlowKey, Flow> &flows,
                   std::map<PacketKey, std::vector<Pending> > &pending,
-                  time_t now, unsigned pending_ttl_sec) {
+                  time_t now, unsigned pending_ttl_sec,
+                  long long now_mono = 0) {
   for (std::map<FlowKey, Flow>::iterator f = flows.begin(); f != flows.end();) {
     std::map<FlowKey, Flow>::iterator fn = f; ++fn;
     if ((unsigned)(now - f->second.touched) > FLOW_TTL) {
       if (f->second.awaiting_wsse) {
-        queue_request(f->second.wsse_event, f->first.s_ip, f->first.sport,
-                      f->first.d_ip, f->first.dport, pending, f->second.first_byte_mono_ms,
-                      f->second.generation);
+        emit_event(f->second.wsse_event);
         f->second.awaiting_wsse = false;
       }
       f->second.clear_buffers();
@@ -1266,16 +1304,25 @@ static void sweep(std::map<FlowKey, Flow> &flows,
     f = fn;
   }
 
-  long long now_mono = now_monotonic_ms();
+  if (now_mono <= 0) now_mono = now_monotonic_ms();
   long long ttl_ms = (long long)pending_ttl_sec * 1000LL;
   for (std::map<PacketKey, std::vector<Pending> >::iterator p = pending.begin(); p != pending.end();) {
     std::map<PacketKey, std::vector<Pending> >::iterator pn = p; ++pn;
     size_t i = 0;
     while (i < p->second.size()) {
-      if (now_mono - p->second[i].started_mono_ms > ttl_ms) {
-        emit_event(p->second[i].ev);
-        p->second.erase(p->second.begin() + i);
+      Pending &entry = p->second[i];
+      if (entry.is_tombstone) {
+        if (now_mono - entry.tombstone_mono_ms > 10000LL) {
+          p->second.erase(p->second.begin() + i);
+        } else {
+          ++i;
+        }
+      } else if (now_mono - entry.started_mono_ms > ttl_ms) {
+        emit_event(entry.ev);
         if (g_total_pending_count > 0) --g_total_pending_count;
+        entry.is_tombstone = true;
+        entry.tombstone_mono_ms = now_mono;
+        ++i;
       } else {
         ++i;
       }
@@ -1288,6 +1335,32 @@ static void sweep(std::map<FlowKey, Flow> &flows,
          (now_mono - g_pending_fifo.front().started_mono_ms > ttl_ms * 2LL)) {
     g_pending_fifo.pop_front();
   }
+}
+
+static bool drain_ooo_segments(Flow &fl) {
+  bool drained = true;
+  while (drained && !fl.ooo.empty()) {
+    drained = false;
+    for (size_t i = 0; i < fl.ooo.size(); ++i) {
+      int32_t odiff = seq_diff(fl.ooo[i].seq, fl.next_seq);
+      if (odiff == 0) {
+        if (!fl.buf_append(fl.ooo[i].data.data(), fl.ooo[i].data.size())) return false;
+        fl.next_seq += (uint32_t)fl.ooo[i].data.size();
+        fl.ooo_erase(i);
+        drained = true; break;
+      } else if (odiff < 0) {
+        int32_t o_overlap = -odiff;
+        if ((size_t)o_overlap < fl.ooo[i].data.size()) {
+          size_t flen = fl.ooo[i].data.size() - o_overlap;
+          if (!fl.buf_append(fl.ooo[i].data.data() + o_overlap, flen)) return false;
+          fl.next_seq += (uint32_t)flen;
+        }
+        fl.ooo_erase(i);
+        drained = true; break;
+      }
+    }
+  }
+  return true;
 }
 
 static size_t find_http_start(const std::string &s) {
@@ -1438,30 +1511,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
         } else {
           if (!rfl.buf_append(payload, plen)) return true;
           rfl.next_seq += (uint32_t)plen;
-
-          // Drain out of order segments
-          bool drained = true;
-          while (drained && !rfl.ooo.empty()) {
-            drained = false;
-            for (size_t i = 0; i < rfl.ooo.size(); ++i) {
-              int32_t odiff = seq_diff(rfl.ooo[i].seq, rfl.next_seq);
-              if (odiff == 0) {
-                if (!rfl.buf_append(rfl.ooo[i].data.data(), rfl.ooo[i].data.size())) return true;
-                rfl.next_seq += (uint32_t)rfl.ooo[i].data.size();
-                rfl.ooo_erase(i);
-                drained = true; break;
-              } else if (odiff < 0) {
-                int32_t o_overlap = -odiff;
-                if ((size_t)o_overlap < rfl.ooo[i].data.size()) {
-                  size_t flen = rfl.ooo[i].data.size() - o_overlap;
-                  if (!rfl.buf_append(rfl.ooo[i].data.data() + o_overlap, flen)) return true;
-                  rfl.next_seq += (uint32_t)flen;
-                }
-                rfl.ooo_erase(i);
-                drained = true; break;
-              }
-            }
-          }
+          if (!drain_ooo_segments(rfl)) return true;
         }
       } else if (diff < 0) {
         int32_t overlap = -diff;
@@ -1469,6 +1519,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           size_t flen = plen - overlap;
           if (!rfl.buf_append(payload + overlap, flen)) return true;
           rfl.next_seq += (uint32_t)flen;
+          if (!drain_ooo_segments(rfl)) return true;
         }
       } else { // diff > 0
         if (rfl.ooo.size() < MAX_OOO_SEGMENTS && !is_truncated) {
@@ -1507,7 +1558,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           }
 
           int st = 0; size_t cl = 0; bool has_cl = false, is_chunked = false, is_close = false;
-          if (!parse_response(rfl.buf.data(), end, &st, &cl, &has_cl, &is_chunked, &is_close)) {
+          if (!parse_response(rfl.buf.data(), end + 2, &st, &cl, &has_cl, &is_chunked, &is_close)) {
             rfl.buf_erase(0, end + 4);
             continue;
           }
@@ -1523,21 +1574,33 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(pk);
           bool is_head = false;
           if (p != pending.end() && !p->second.empty()) {
-            Event e = p->second[0].ev;
-            if (e.method == "HEAD") is_head = true;
-            e.status = st;
-            e.has_status = true;
-            e.duration_ms = (long)(mono_now - p->second[0].started_mono_ms);
-            if (e.duration_ms < 0) e.duration_ms = 0;
-            e.has_duration = true;
-            if (has_cl) {
-              e.resp_bytes = (unsigned)cl;
-              e.has_resp = true;
+            if (rfl.generation != 0 && p->second[0].generation != 0 && p->second[0].generation != rfl.generation) {
+              // Generation mismatch! Stale request from previous connection.
+              emit_event(p->second[0].ev);
+              if (!p->second[0].is_tombstone && g_total_pending_count > 0) --g_total_pending_count;
+              p->second.erase(p->second.begin());
+              if (p->second.empty()) pending.erase(p);
+            } else if (p->second[0].is_tombstone) {
+              // Late response for expired request: consume tombstone, do not attach to newer requests
+              p->second.erase(p->second.begin());
+              if (p->second.empty()) pending.erase(p);
+            } else {
+              Event e = p->second[0].ev;
+              if (e.method == "HEAD") is_head = true;
+              e.status = st;
+              e.has_status = true;
+              e.duration_ms = (long)(mono_now - p->second[0].started_mono_ms);
+              if (e.duration_ms < 0) e.duration_ms = 0;
+              e.has_duration = true;
+              if (has_cl) {
+                e.resp_bytes = (unsigned)cl;
+                e.has_resp = true;
+              }
+              emit_event(e);
+              p->second.erase(p->second.begin());
+              if (g_total_pending_count > 0) --g_total_pending_count;
+              if (p->second.empty()) pending.erase(p);
             }
-            emit_event(e);
-            p->second.erase(p->second.begin());
-            if (g_total_pending_count > 0) --g_total_pending_count;
-            if (p->second.empty()) pending.erase(p);
           }
 
           rfl.buf_erase(0, end + 4);
@@ -1547,8 +1610,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           } else if (is_chunked) {
             rfl.state = Flow::HTTP_STATE_CHUNK;
             rfl.chunk_reading_len = true;
+            rfl.chunk_reading_crlf = false;
             rfl.chunk_reading_trailer = false;
-            rfl.chunk_remaining = 0;
+            rfl.chunk_payload_remaining = 0;
           } else if (has_cl) {
             if (cl > 0) {
               rfl.state = Flow::HTTP_STATE_BODY;
@@ -1609,7 +1673,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
             std::string line = trim(rfl.buf.substr(0, crlf));
             size_t semi = line.find(';');
             std::string hex_str = (semi != std::string::npos) ? trim(line.substr(0, semi)) : line;
-            if (hex_str.empty()) {
+            if (hex_str.empty() || hex_str.size() > 16) {
               rfl.clear_buffers();
               rfl.is_broken = true;
               break;
@@ -1624,20 +1688,40 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
               break;
             }
             char *endptr = NULL;
-            size_t chunk_len = (size_t)strtoul(hex_str.c_str(), &endptr, 16);
+            errno = 0;
+            unsigned long long parsed_len = strtoull(hex_str.c_str(), &endptr, 16);
+            if (errno != 0 || endptr != hex_str.c_str() + hex_str.size() || parsed_len > 16777216ULL) {
+              rfl.clear_buffers();
+              rfl.is_broken = true;
+              break;
+            }
             rfl.buf_erase(0, crlf + 2);
-            if (chunk_len == 0) {
+            if (parsed_len == 0) {
               rfl.chunk_reading_trailer = true;
+              rfl.chunk_reading_len = false;
               continue;
             } else {
-              rfl.chunk_remaining = chunk_len + 2;
+              rfl.chunk_payload_remaining = (size_t)parsed_len;
               rfl.chunk_reading_len = false;
+              rfl.chunk_reading_crlf = false;
             }
+          } else if (rfl.chunk_reading_crlf) {
+            if (rfl.buf.size() < 2) break;
+            if (rfl.buf[0] != '\r' || rfl.buf[1] != '\n') {
+              rfl.clear_buffers();
+              rfl.is_broken = true;
+              break;
+            }
+            rfl.buf_erase(0, 2);
+            rfl.chunk_reading_crlf = false;
+            rfl.chunk_reading_len = true;
           } else {
-            size_t to_consume = (rfl.buf.size() < rfl.chunk_remaining) ? rfl.buf.size() : rfl.chunk_remaining;
+            size_t to_consume = (rfl.buf.size() < rfl.chunk_payload_remaining) ? rfl.buf.size() : rfl.chunk_payload_remaining;
             rfl.buf_erase(0, to_consume);
-            rfl.chunk_remaining -= to_consume;
-            if (rfl.chunk_remaining == 0) rfl.chunk_reading_len = true;
+            rfl.chunk_payload_remaining -= to_consume;
+            if (rfl.chunk_payload_remaining == 0) {
+              rfl.chunk_reading_crlf = true;
+            }
           }
           continue;
         }
@@ -1689,16 +1773,11 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
       pending.erase(p);
     }
 
-    // Reset server response flow for this 4-tuple
-    std::map<FlowKey, Flow>::iterator rfit = flows.find(rk);
-    if (rfit != flows.end()) {
-      rfit->second.clear_buffers();
-      flows.erase(rfit);
-    }
-
     Flow &fl = flows[fk];
     if (fl.awaiting_wsse) {
-      queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+      if (!fl.wsse_event.method.empty()) {
+        emit_event(fl.wsse_event);
+      }
       fl.awaiting_wsse = false;
     }
     uint32_t next_gen = fl.generation + 1;
@@ -1709,6 +1788,15 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     fl.next_seq = seq + 1;
     fl.touched = now;
     fl.first_byte_mono_ms = 0;
+
+    // Reset server response flow for this 4-tuple and carry forward new generation
+    std::map<FlowKey, Flow>::iterator rfit = flows.find(rk);
+    if (rfit != flows.end()) {
+      rfit->second.clear_buffers();
+    }
+    Flow &resp_fl = flows[rk];
+    resp_fl = Flow();
+    resp_fl.generation = next_gen;
     return true;
   }
 
@@ -1743,30 +1831,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
       } else {
         if (!fl.buf_append(payload, plen)) return true;
         fl.next_seq += (uint32_t)plen;
-
-        // Drain out-of-order segments
-        bool drained = true;
-        while (drained && !fl.ooo.empty()) {
-          drained = false;
-          for (size_t i = 0; i < fl.ooo.size(); ++i) {
-            int32_t odiff = seq_diff(fl.ooo[i].seq, fl.next_seq);
-            if (odiff == 0) {
-              if (!fl.buf_append(fl.ooo[i].data.data(), fl.ooo[i].data.size())) return true;
-              fl.next_seq += (uint32_t)fl.ooo[i].data.size();
-              fl.ooo_erase(i);
-              drained = true; break;
-            } else if (odiff < 0) {
-              int32_t o_overlap = -odiff;
-              if ((size_t)o_overlap < fl.ooo[i].data.size()) {
-                size_t flen = fl.ooo[i].data.size() - o_overlap;
-                if (!fl.buf_append(fl.ooo[i].data.data() + o_overlap, flen)) return true;
-                fl.next_seq += (uint32_t)flen;
-              }
-              fl.ooo_erase(i);
-              drained = true; break;
-            }
-          }
-        }
+        if (!drain_ooo_segments(fl)) return true;
       }
     } else if (diff < 0) {
       int32_t overlap = -diff;
@@ -1774,6 +1839,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
         size_t flen = plen - overlap;
         if (!fl.buf_append(payload + overlap, flen)) return true;
         fl.next_seq += (uint32_t)flen;
+        if (!drain_ooo_segments(fl)) return true;
       }
     } else { // diff > 0 (out of order gap)
       if (fl.ooo.size() < MAX_OOO_SEGMENTS && !is_truncated) {
@@ -1819,14 +1885,14 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
         e.dst_ip = ip_to_str(d_ip); e.dst_port = dport;
         e.req_bytes = (unsigned)(end + 4);
 
-        if (!parse_request(fl.buf.data(), end, &e, &meta)) {
+        if (!parse_request(fl.buf.data(), end + 2, &e, &meta)) {
           fl.buf_erase(0, end + 4);
           continue;
         }
 
         // Reject conflicting Content-Length + chunked encoding (RFC 7230 request smuggling prevention)
         bool has_chunked = (lower(meta.transfer_encoding).find("chunked") != std::string::npos);
-        if (meta.has_content_length && has_chunked) {
+        if (meta.has_conflict_cl || (meta.has_content_length && has_chunked)) {
           fl.buf_erase(0, end + 4);
           fl.clear_buffers();
           fl.is_broken = true;
@@ -1858,8 +1924,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
         } else if (has_chunked) {
           fl.state = Flow::HTTP_STATE_CHUNK;
           fl.chunk_reading_len = true;
+          fl.chunk_reading_crlf = false;
           fl.chunk_reading_trailer = false;
-          fl.chunk_remaining = 0;
+          fl.chunk_payload_remaining = 0;
         } else {
           fl.state = Flow::HTTP_STATE_HEADER;
           fl.first_byte_mono_ms = fl.buf.empty() ? 0 : mono_now;
@@ -1937,7 +2004,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           std::string line = trim(fl.buf.substr(0, crlf));
           size_t semi = line.find(';');
           std::string hex_str = (semi != std::string::npos) ? trim(line.substr(0, semi)) : line;
-          if (hex_str.empty()) {
+          if (hex_str.empty() || hex_str.size() > 16) {
             fl.clear_buffers();
             fl.is_broken = true;
             break;
@@ -1952,20 +2019,40 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
             break;
           }
           char *endptr = NULL;
-          size_t chunk_len = (size_t)strtoul(hex_str.c_str(), &endptr, 16);
+          errno = 0;
+          unsigned long long parsed_len = strtoull(hex_str.c_str(), &endptr, 16);
+          if (errno != 0 || endptr != hex_str.c_str() + hex_str.size() || parsed_len > 16777216ULL) {
+            fl.clear_buffers();
+            fl.is_broken = true;
+            break;
+          }
           fl.buf_erase(0, crlf + 2);
-          if (chunk_len == 0) {
+          if (parsed_len == 0) {
             fl.chunk_reading_trailer = true;
+            fl.chunk_reading_len = false;
             continue;
           } else {
-            fl.chunk_remaining = chunk_len + 2;
+            fl.chunk_payload_remaining = (size_t)parsed_len;
             fl.chunk_reading_len = false;
+            fl.chunk_reading_crlf = false;
           }
+        } else if (fl.chunk_reading_crlf) {
+          if (fl.buf.size() < 2) break;
+          if (fl.buf[0] != '\r' || fl.buf[1] != '\n') {
+            fl.clear_buffers();
+            fl.is_broken = true;
+            break;
+          }
+          fl.buf_erase(0, 2);
+          fl.chunk_reading_crlf = false;
+          fl.chunk_reading_len = true;
         } else {
-          size_t to_consume = (fl.buf.size() < fl.chunk_remaining) ? fl.buf.size() : fl.chunk_remaining;
+          size_t to_consume = (fl.buf.size() < fl.chunk_payload_remaining) ? fl.buf.size() : fl.chunk_payload_remaining;
           fl.buf_erase(0, to_consume);
-          fl.chunk_remaining -= to_consume;
-          if (fl.chunk_remaining == 0) fl.chunk_reading_len = true;
+          fl.chunk_payload_remaining -= to_consume;
+          if (fl.chunk_payload_remaining == 0) {
+            fl.chunk_reading_crlf = true;
+          }
         }
         continue;
       }
@@ -2492,9 +2579,11 @@ int main(int argc, char **argv) {
       // Signal handled
     } else if (rc < 0) {
       logmsg("poll error encountered");
+      g_running = 0;
       break;
     } else if (rc > 0 && (pfd.revents & (POLLERR | POLLNVAL))) {
       logmsg("poll error revents detected");
+      g_running = 0;
       break;
     } else if (rc > 0) {
       size_t drain_count = 0;
@@ -2564,7 +2653,8 @@ int main(int argc, char **argv) {
 
   if (g_ship_worker_active) {
     pthread_mutex_lock(&g_ship_queue_mutex);
-    pthread_cond_signal(&g_ship_queue_cond);
+    g_producer_finished = true;
+    pthread_cond_broadcast(&g_ship_queue_cond);
     pthread_mutex_unlock(&g_ship_queue_mutex);
     pthread_join(g_ship_worker_tid, NULL);
   } else if (g_endpoint.empty()) {

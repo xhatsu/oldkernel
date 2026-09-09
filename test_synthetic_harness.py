@@ -85,6 +85,7 @@ def run_python_pcap(pcap_file, ports, wsse_bytes=0):
             return []
         linktype = struct.unpack("<I", gh[20:24])[0]
         swap = (struct.unpack("<I", gh[:4])[0] == 0xd4c3b2a1)
+        last_sweep = 0
         while True:
             ph = f.read(16)
             if not ph:
@@ -95,6 +96,10 @@ def run_python_pcap(pcap_file, ports, wsse_bytes=0):
                            ((incl_len << 8) & 0xff0000) | ((incl_len << 24) & 0xff000000)
             raw = f.read(incl_len)
             now = ts_sec + ts_usec / 1e6
+            if now - last_sweep >= 1.0:
+                nt_sniff.sweep_pending(pending, now, out)
+                nt_sniff.sweep_idle(flows, now, out, pending, resp_flows)
+                last_sweep = now
             if linktype == 113:
                 if len(raw) < 16:
                     continue
@@ -369,6 +374,120 @@ def run_test_suite_for_engine(run_pcap, engine_name):
     else:
         print("  [%s] Test 16 (HEAD Bodyless Response): PASS (both requests correlated)" % engine_name)
 
+    # 17. Late response to expired request does not attach to newer request (Tombstone isolation)
+    req17_1 = b"GET /api/expired HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    pkt_r17_1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50017, 80, 17000, 0, 0x18, req17_1)
+    req17_2 = b"GET /api/newer HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    pkt_r17_2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50017, 80, 17000 + len(req17_1), 0, 0x18, req17_2)
+    resp17_1 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_rp17_1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50017, 27000, 17000 + len(req17_1), 0x18, resp17_1)
+    resp17_2 = b"HTTP/1.1 204 No Content\r\n\r\n"
+    pkt_rp17_2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50017, 27000 + len(resp17_1), 17000 + len(req17_1) + len(req17_2), 0x18, resp17_2)
+    write_pcap(tmp_pcap, [(1017, 0, pkt_r17_1, len(pkt_r17_1)),
+                          (1055, 0, pkt_r17_2, len(pkt_r17_2)),
+                          (1055, 10000, pkt_rp17_1, len(pkt_rp17_1)),
+                          (1055, 20000, pkt_rp17_2, len(pkt_rp17_2))])
+    ev17 = run_pcap(tmp_pcap, [80])
+    exp_ev = [e for e in ev17 if e.get("path") == "/api/expired"]
+    new_ev = [e for e in ev17 if e.get("path") == "/api/newer"]
+    if not exp_ev or exp_ev[0].get("status") is not None:
+        failures.append("[%s] Test 17 (Late Response Isolation): Expected /api/expired with status None, got %s" % (engine_name, exp_ev))
+    elif not new_ev or new_ev[0].get("status") != 204:
+        failures.append("[%s] Test 17 (Late Response Isolation): Expected /api/newer with status 204, got %s" % (engine_name, new_ev))
+    else:
+        print("  [%s] Test 17 (Late Response Isolation): PASS (expired tombstone consumed, newer got 204)" % engine_name)
+
+    # 18. Client SYN reconnect does not reinsert incomplete SOAP request
+    pkt_syn18_1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50018, 80, 18000, 0, 0x02, b"")
+    req18_soap = (b"POST /api/oldsoap HTTP/1.1\r\n"
+                  b"Host: api.test\r\n"
+                  b"Content-Type: text/xml\r\n"
+                  b"Content-Length: 1000\r\n\r\n"
+                  b"<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Header>")
+    pkt_r18_soap = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50018, 80, 18001, 0, 0x18, req18_soap)
+    pkt_syn18_2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50018, 80, 58000, 0, 0x02, b"")
+    req18_new = b"GET /api/newreq HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    pkt_r18_new = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50018, 80, 58001, 0, 0x18, req18_new)
+    resp18_new = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_rp18_new = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50018, 88000, 58001 + len(req18_new), 0x18, resp18_new)
+    write_pcap(tmp_pcap, [(1018, 0, pkt_syn18_1, len(pkt_syn18_1)),
+                          (1018, 10000, pkt_r18_soap, len(pkt_r18_soap)),
+                          (1019, 0, pkt_syn18_2, len(pkt_syn18_2)),
+                          (1019, 10000, pkt_r18_new, len(pkt_r18_new)),
+                          (1019, 20000, pkt_rp18_new, len(pkt_rp18_new))])
+    ev18 = run_pcap(tmp_pcap, [80], wsse_bytes=8192)
+    soap_ev = [e for e in ev18 if e.get("path") == "/api/oldsoap"]
+    new_ev = [e for e in ev18 if e.get("path") == "/api/newreq"]
+    if not soap_ev or soap_ev[0].get("status") is not None:
+        failures.append("[%s] Test 18 (SYN Incomplete SOAP): Expected /api/oldsoap with status None, got %s" % (engine_name, soap_ev))
+    elif not new_ev or new_ev[0].get("status") != 200:
+        failures.append("[%s] Test 18 (SYN Incomplete SOAP): Expected /api/newreq with status 200, got %s" % (engine_name, new_ev))
+    else:
+        print("  [%s] Test 18 (SYN Incomplete SOAP): PASS (old soap not reinserted ahead of new request)" % engine_name)
+
+    # 19. Conflicting Content-Length Headers
+    conflicting_cl_req = (b"POST /api/conflict HTTP/1.1\r\n"
+                          b"Host: api.test\r\n"
+                          b"Content-Length: 8\r\n"
+                          b"Content-Length: 16\r\n\r\n"
+                          b"12345678"
+                          b"GET /api/fabricated-req HTTP/1.1\r\nHost: api.test\r\n\r\n")
+    pkt_conf_cl = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50019, 80, 19000, 0, 0x18, conflicting_cl_req)
+    write_pcap(tmp_pcap, [(1019, 0, pkt_conf_cl, len(pkt_conf_cl))])
+    ev19 = run_pcap(tmp_pcap, [80])
+    fab_ev = [e for e in ev19 if e.get("path") == "/api/fabricated-req"]
+    if fab_ev:
+        failures.append("[%s] Test 19 (Conflicting CL): Detected fabricated request %s" % (engine_name, fab_ev))
+    else:
+        print("  [%s] Test 19 (Conflicting CL): PASS (conflicting Content-Length dropped flow)" % engine_name)
+
+    # 20. Chunk Length Overflow
+    chunk_ovf_req = (b"POST /api/chunk-ovf HTTP/1.1\r\n"
+                     b"Host: api.test\r\n"
+                     b"Transfer-Encoding: chunked\r\n\r\n"
+                     b"FFFFFFFFFFFFFFFF\r\n"
+                     b"boom\r\n"
+                     b"0\r\n\r\n"
+                     b"GET /api/chunk-fab HTTP/1.1\r\nHost: api.test\r\n\r\n")
+    pkt_chunk_ovf = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50020, 80, 20000, 0, 0x18, chunk_ovf_req)
+    write_pcap(tmp_pcap, [(1020, 0, pkt_chunk_ovf, len(pkt_chunk_ovf))])
+    ev20 = run_pcap(tmp_pcap, [80])
+    chunk_fab_ev = [e for e in ev20 if e.get("path") == "/api/chunk-fab"]
+    if chunk_fab_ev:
+        failures.append("[%s] Test 20 (Chunk Overflow): Detected fabricated request %s" % (engine_name, chunk_fab_ev))
+    else:
+        print("  [%s] Test 20 (Chunk Overflow): PASS (oversized chunk length dropped flow)" % engine_name)
+
+    # 21. Overlapping Retransmission Drains Queued Out-Of-Order Segment
+    pkt_p1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50021, 80, 21000, 0, 0x18, b"GET /api")
+    pkt_p3 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50021, 80, 21020, 0, 0x18, b" HTTP/1.1\r\nHost: api.test\r\n\r\n")
+    pkt_p2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50021, 80, 21004, 0, 0x18, b"/api/overlap-ooo")
+    full_req_len = len(b"GET /api/overlap-ooo HTTP/1.1\r\nHost: api.test\r\n\r\n")
+    resp21 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_rp21 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50021, 31000, 21000 + full_req_len, 0x18, resp21)
+    write_pcap(tmp_pcap, [(1021, 0, pkt_p1, len(pkt_p1)),
+                          (1021, 10000, pkt_p3, len(pkt_p3)),
+                          (1021, 20000, pkt_p2, len(pkt_p2)),
+                          (1021, 30000, pkt_rp21, len(pkt_rp21))])
+    ev21 = run_pcap(tmp_pcap, [80])
+    if len(ev21) != 1 or ev21[0].get("path") != "/api/overlap-ooo" or ev21[0].get("status") != 200:
+        failures.append("[%s] Test 21 (Overlapping Retransmission Drains OOO): Expected /api/overlap-ooo with 200, got %s" % (engine_name, ev21))
+    else:
+        print("  [%s] Test 21 (Overlapping Retransmission Drains OOO): PASS (drained OOO segment after overlap trimming)" % engine_name)
+
+    # 22. Headerless 204 No Content Response
+    req22 = b"POST /api/action HTTP/1.1\r\nHost: api.test\r\nContent-Length: 0\r\n\r\n"
+    pkt_r22 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50022, 80, 22000, 0, 0x18, req22)
+    resp22 = b"HTTP/1.1 204 No Content\r\n\r\n"
+    pkt_rp22 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50022, 32000, 22000 + len(req22), 0x18, resp22)
+    write_pcap(tmp_pcap, [(1022, 0, pkt_r22, len(pkt_r22)),
+                          (1022, 10000, pkt_rp22, len(pkt_rp22))])
+    ev22 = run_pcap(tmp_pcap, [80])
+    if len(ev22) != 1 or ev22[0].get("path") != "/api/action" or ev22[0].get("status") != 204:
+        failures.append("[%s] Test 22 (Headerless 204 Response): Expected /api/action with 204, got %s" % (engine_name, ev22))
+    else:
+        print("  [%s] Test 22 (Headerless 204 Response): PASS (parsed headerless 204 response)" % engine_name)
+
     if os.path.exists(tmp_pcap):
         os.remove(tmp_pcap)
     return failures
@@ -388,7 +507,7 @@ def run_regression_suite():
             print("  *", f)
         sys.exit(1)
     else:
-        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (32/32 PASS)!")
+        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (44/44 PASS)!")
 
 if __name__ == "__main__":
     run_regression_suite()

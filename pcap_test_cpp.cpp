@@ -104,6 +104,7 @@ int main(int argc, char **argv) {
 
     time_t pcap_now = (time_t)ph.ts_sec;
     long long pcap_mono_now = (long long)ph.ts_sec * 1000LL + (long long)ph.ts_usec / 1000LL;
+    sweep(flows, pending, pcap_now, g_pending_ttl_sec, pcap_mono_now);
     handle_packet(pkt_ptr, pkt_len, node, ports, flows, pending, pcap_now, pcap_mono_now);
   }
 

@@ -303,8 +303,9 @@ def find_http_start(buf):
 class Flow(object):
     __slots__ = ("next_seq", "has_seq", "is_broken", "touched", "first_byte_ts",
                  "buf", "ooo", "state", "body_remaining", "chunk_remaining",
-                 "chunk_reading_len", "chunk_reading_trailer", "awaiting_wsse", "wsse_event", "wsse_buf",
-                 "wsse_goal", "event", "hdrs", "head_bytes", "body_goal")
+                 "chunk_payload_remaining", "chunk_reading_len", "chunk_reading_crlf",
+                 "chunk_reading_trailer", "awaiting_wsse", "wsse_event", "wsse_buf",
+                 "wsse_goal", "event", "hdrs", "head_bytes", "body_goal", "generation")
 
     def __init__(self):
         self.next_seq = 0
@@ -317,7 +318,9 @@ class Flow(object):
         self.state = HTTP_STATE_HEADER
         self.body_remaining = 0
         self.chunk_remaining = 0
+        self.chunk_payload_remaining = 0
         self.chunk_reading_len = True
+        self.chunk_reading_crlf = False
         self.chunk_reading_trailer = False
         self.awaiting_wsse = False
         self.wsse_event = None
@@ -327,6 +330,29 @@ class Flow(object):
         self.hdrs = None
         self.head_bytes = 0
         self.body_goal = 0
+        self.generation = 0
+
+
+def _drain_ooo(fl):
+    drained = True
+    while drained and fl.ooo:
+        drained = False
+        for i, (oseq, odata) in enumerate(fl.ooo):
+            odiff = seq_diff(oseq, fl.next_seq)
+            if odiff == 0:
+                fl.buf.extend(odata)
+                fl.next_seq = (fl.next_seq + len(odata)) & 0xFFFFFFFF
+                fl.ooo.pop(i)
+                drained = True
+                break
+            elif odiff < 0:
+                o_overlap = -odiff
+                if o_overlap < len(odata):
+                    fl.buf.extend(odata[o_overlap:])
+                    fl.next_seq = (fl.next_seq + len(odata) - o_overlap) & 0xFFFFFFFF
+                fl.ooo.pop(i)
+                drained = True
+                break
 
 
 # ------------------------------------------------- response correlation ----
@@ -353,11 +379,14 @@ def pending_pop(rk, out, pending_tbl=None):
     lst = pending_tbl.get(rk)
     if not lst:
         return None
-    ev, _ = lst.pop(0)
+    item = lst.pop(0)
     if not lst:
         pending_tbl.pop(rk, None)
-    out.append(ev)
-    return ev
+    is_tombstone = item[2] if len(item) > 2 else False
+    if not is_tombstone:
+        out.append(item[0])
+        return item[0]
+    return None
 
 
 def parse_response_head(payload):
@@ -373,9 +402,13 @@ def parse_response_head(payload):
         if len(first) < 2 or not first[0].startswith(b"HTTP/"):
             return None, None, idx + 4, False, False
         st = int(first[1])
+        if st < 100 or st > 599:
+            return None, None, None, False, False
     except (ValueError, IndexError):
         return None, None, None, False, False
     clen = None
+    has_clen = False
+    has_conflict_cl = False
     is_chunked = False
     is_close = False
     is_http_10 = first[0].startswith(b"HTTP/1.0")
@@ -385,9 +418,15 @@ def parse_response_head(payload):
         low = ln.lower()
         if low.startswith(b"content-length:"):
             try:
-                clen = int(ln.split(b":", 1)[1].strip())
+                val = int(ln.split(b":", 1)[1].strip())
+                if val < 0:
+                    has_conflict_cl = True
+                elif has_clen and clen != val:
+                    has_conflict_cl = True
+                clen = val
+                has_clen = True
             except ValueError:
-                pass
+                has_conflict_cl = True
         elif low.startswith(b"transfer-encoding:"):
             if b"chunked" in low:
                 is_chunked = True
@@ -396,11 +435,14 @@ def parse_response_head(payload):
                 conn_close = True
             elif b"keep-alive" in low:
                 conn_keep_alive = True
+    if has_conflict_cl or (has_clen and is_chunked):
+        return None, None, None, False, False
     if is_http_10 and not conn_keep_alive:
         is_close = True
     elif conn_close:
         is_close = True
     return st, clen, idx + 4, is_chunked, is_close
+
 
 
 def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, flags=0, is_truncated=False):
@@ -440,30 +482,13 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                 else:
                     rfl.buf.extend(payload)
                     rfl.next_seq = (rfl.next_seq + plen) & 0xFFFFFFFF
-                    drained = True
-                    while drained and rfl.ooo:
-                        drained = False
-                        for i, (oseq, odata) in enumerate(rfl.ooo):
-                            odiff = seq_diff(oseq, rfl.next_seq)
-                            if odiff == 0:
-                                rfl.buf.extend(odata)
-                                rfl.next_seq = (rfl.next_seq + len(odata)) & 0xFFFFFFFF
-                                rfl.ooo.pop(i)
-                                drained = True
-                                break
-                            elif odiff < 0:
-                                o_overlap = -odiff
-                                if o_overlap < len(odata):
-                                    rfl.buf.extend(odata[o_overlap:])
-                                    rfl.next_seq = (rfl.next_seq + len(odata) - o_overlap) & 0xFFFFFFFF
-                                rfl.ooo.pop(i)
-                                drained = True
-                                break
+                    _drain_ooo(rfl)
             elif diff < 0:
                 overlap = -diff
                 if overlap < plen and not is_truncated:
                     rfl.buf.extend(payload[overlap:])
                     rfl.next_seq = (rfl.next_seq + plen - overlap) & 0xFFFFFFFF
+                    _drain_ooo(rfl)
             else:
                 if len(rfl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
                     if not any(s == seq for s, _ in rfl.ooo):
@@ -478,6 +503,9 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             if st is None:
                 if head_len is not None:
                     del rfl.buf[:head_len]
+                elif rfl.buf.find(b"\r\n\r\n") != -1:
+                    rfl.buf = bytearray()
+                    rfl.is_broken = True
                 break
 
             if 100 <= st <= 199 and st != 101:
@@ -487,16 +515,31 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             ent = pending_tbl.get(rk)
             is_head = False
             if ent:
-                ev, started = ent.pop(0)
-                if not ent:
-                    pending_tbl.pop(rk, None)
-                if ev.get("method") == "HEAD":
-                    is_head = True
-                ev["status"] = st
-                ev["duration_ms"] = max(0, int((now - started) * 1000))
-                if clen is not None:
-                    ev["resp_bytes"] = clen
-                out.append(ev)
+                item = ent[0]
+                is_tombstone = item[2] if len(item) > 2 else False
+                gen = item[4] if len(item) > 4 else 0
+                if rfl.generation != 0 and gen != 0 and gen != rfl.generation:
+                    ev = item[0]
+                    out.append(ev)
+                    ent.pop(0)
+                    if not ent:
+                        pending_tbl.pop(rk, None)
+                elif is_tombstone:
+                    ent.pop(0)
+                    if not ent:
+                        pending_tbl.pop(rk, None)
+                else:
+                    ev, started = item[0], item[1]
+                    ent.pop(0)
+                    if not ent:
+                        pending_tbl.pop(rk, None)
+                    if ev.get("method") == "HEAD":
+                        is_head = True
+                    ev["status"] = st
+                    ev["duration_ms"] = max(0, int((now - started) * 1000))
+                    if clen is not None:
+                        ev["resp_bytes"] = clen
+                    out.append(ev)
 
             del rfl.buf[:head_len]
 
@@ -505,8 +548,9 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             elif is_chunked:
                 rfl.state = HTTP_STATE_CHUNK
                 rfl.chunk_reading_len = True
+                rfl.chunk_reading_crlf = False
                 rfl.chunk_reading_trailer = False
-                rfl.chunk_remaining = 0
+                rfl.chunk_payload_remaining = 0
             elif clen is not None:
                 if clen > 0:
                     rfl.state = HTTP_STATE_BODY
@@ -558,6 +602,10 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                 hex_str = line[:semi].strip() if semi != -1 else line
                 try:
                     chunk_len = int(hex_str, 16)
+                    if chunk_len < 0 or chunk_len > 16777216:
+                        rfl.buf = bytearray()
+                        rfl.is_broken = True
+                        break
                 except ValueError:
                     rfl.buf = bytearray()
                     rfl.is_broken = True
@@ -565,16 +613,28 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                 del rfl.buf[:crlf + 2]
                 if chunk_len == 0:
                     rfl.chunk_reading_trailer = True
+                    rfl.chunk_reading_len = False
                     continue
                 else:
-                    rfl.chunk_remaining = chunk_len + 2
+                    rfl.chunk_payload_remaining = chunk_len
                     rfl.chunk_reading_len = False
+                    rfl.chunk_reading_crlf = False
+            elif getattr(rfl, "chunk_reading_crlf", False):
+                if len(rfl.buf) < 2:
+                    break
+                if rfl.buf[:2] != b"\r\n":
+                    rfl.buf = bytearray()
+                    rfl.is_broken = True
+                    break
+                del rfl.buf[:2]
+                rfl.chunk_reading_crlf = False
+                rfl.chunk_reading_len = True
             else:
-                to_consume = min(len(rfl.buf), rfl.chunk_remaining)
+                to_consume = min(len(rfl.buf), rfl.chunk_payload_remaining)
                 del rfl.buf[:to_consume]
-                rfl.chunk_remaining -= to_consume
-                if rfl.chunk_remaining == 0:
-                    rfl.chunk_reading_len = True
+                rfl.chunk_payload_remaining -= to_consume
+                if rfl.chunk_payload_remaining == 0:
+                    rfl.chunk_reading_crlf = True
             continue
 
         if rfl.state == HTTP_STATE_CLOSE_BODY:
@@ -839,7 +899,7 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
     ent.append([ev, started])
 
 
-def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_tbl, now):
+def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_tbl, now, generation=0):
     dst_ip, dport, src_ip, sport = meta
     if not ev:
         return
@@ -859,7 +919,7 @@ def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_t
         if ent is None:
             ent = pending_tbl[rk] = []
     started = first_byte_ts if first_byte_ts > 0 else (now if now is not None else time.time())
-    ent.append([ev, started])
+    ent.append([ev, started, False, 0.0, generation])
 
 
 def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
@@ -875,7 +935,7 @@ def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
         fl.wsse_event["scheme"] = "wsse"
     if username or len(fl.wsse_buf) >= fl.wsse_goal:
         _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
-                                 meta, out, pending_tbl, now)
+                                 meta, out, pending_tbl, now, generation=fl.generation)
         fl.awaiting_wsse = False
         return True
     return False
@@ -894,17 +954,21 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
     if flags & 0x02 and seq is not None:
         fl = flows.get(key)
         if fl is not None and fl.awaiting_wsse and fl.wsse_event:
-            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
-                                     meta, out, pending_tbl, now)
+            out.append(fl.wsse_event)
+            fl.awaiting_wsse = False
         rk = (dst_ip, dport, src_ip, sport)
         if pending_tbl is not None:
             ent = pending_tbl.pop(rk, None)
             if ent:
-                for pev, _ in ent:
-                    out.append(pev)
+                for item in ent:
+                    is_tomb = item[2] if len(item) > 2 else False
+                    if not is_tomb:
+                        out.append(item[0])
         if rev_key is not None and rev_key in flows:
             flows.pop(rev_key, None)
+        old_gen = fl.generation if fl is not None else 0
         fl = Flow()
+        fl.generation = old_gen + 1
         fl.has_seq = True
         fl.next_seq = (seq + 1) & 0xFFFFFFFF
         fl.touched = now
@@ -951,30 +1015,13 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                 else:
                     fl.buf.extend(payload)
                     fl.next_seq = (fl.next_seq + plen) & 0xFFFFFFFF
-                    drained = True
-                    while drained and fl.ooo:
-                        drained = False
-                        for i, (oseq, odata) in enumerate(fl.ooo):
-                            odiff = seq_diff(oseq, fl.next_seq)
-                            if odiff == 0:
-                                fl.buf.extend(odata)
-                                fl.next_seq = (fl.next_seq + len(odata)) & 0xFFFFFFFF
-                                fl.ooo.pop(i)
-                                drained = True
-                                break
-                            elif odiff < 0:
-                                o_overlap = -odiff
-                                if o_overlap < len(odata):
-                                    fl.buf.extend(odata[o_overlap:])
-                                    fl.next_seq = (fl.next_seq + len(odata) - o_overlap) & 0xFFFFFFFF
-                                fl.ooo.pop(i)
-                                drained = True
-                                break
+                    _drain_ooo(fl)
             elif diff < 0:
                 overlap = -diff
                 if overlap < plen and not is_truncated:
                     fl.buf.extend(payload[overlap:])
                     fl.next_seq = (fl.next_seq + plen - overlap) & 0xFFFFFFFF
+                    _drain_ooo(fl)
             else:
                 if len(fl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
                     if not any(s == seq for s, _ in fl.ooo):
@@ -1011,11 +1058,26 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             hdrs = {}
             hdrs["_method"] = first[0].decode("ascii", "replace")
             hdrs["_path"] = first[1].decode("ascii", "replace")
+            has_conflict_cl = False
+            first_cl = None
             for ln in lines[1:]:
                 if b":" not in ln:
                     continue
                 kn, kv = ln.split(b":", 1)
-                hdrs[kn.strip().lower().decode("ascii", "replace")] = kv.strip().decode("utf-8", "replace")[:180]
+                k_norm = kn.strip().lower().decode("ascii", "replace")
+                v_norm = kv.strip().decode("utf-8", "replace")[:180]
+                if k_norm == "content-length":
+                    try:
+                        parsed_cl = int(v_norm)
+                        if parsed_cl < 0:
+                            has_conflict_cl = True
+                        elif first_cl is None:
+                            first_cl = parsed_cl
+                        elif first_cl != parsed_cl:
+                            has_conflict_cl = True
+                    except ValueError:
+                        has_conflict_cl = True
+                hdrs[k_norm] = v_norm
             fl.hdrs = hdrs
             fl.event = finish_event(fl, key, dst_ip, dport, src_ip, sport, ports, node_host)
             fl.head_bytes = idx + 4
@@ -1031,7 +1093,7 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             te = hdrs.get("transfer-encoding", "").lower()
             is_chunked = "chunked" in te
 
-            if content_length > 0 and is_chunked:
+            if has_conflict_cl or (content_length > 0 and is_chunked) or ("content-length" in hdrs and is_chunked):
                 fl.buf = bytearray()
                 fl.is_broken = True
                 break
@@ -1049,7 +1111,7 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                 fl.wsse_buf = bytearray()
                 fl.wsse_goal = min(content_length, wsse_body_bytes, MAX_WSSE_BODY_BYTES)
             else:
-                _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+                _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now, generation=fl.generation)
             fl.event = None
 
             if content_length > 0:
@@ -1058,8 +1120,9 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             elif is_chunked:
                 fl.state = HTTP_STATE_CHUNK
                 fl.chunk_reading_len = True
+                fl.chunk_reading_crlf = False
                 fl.chunk_reading_trailer = False
-                fl.chunk_remaining = 0
+                fl.chunk_payload_remaining = 0
             else:
                 fl.state = HTTP_STATE_HEADER
                 fl.first_byte_ts = now if fl.buf else 0.0
@@ -1081,14 +1144,14 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                         ev["wsse_user"] = username
                         ev["user"] = username
                         ev["scheme"] = "wsse"
-                    _emit_request_to_pending(ev, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+                    _emit_request_to_pending(ev, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now, generation=fl.generation)
                     fl.awaiting_wsse = False
 
             del fl.buf[:to_consume]
             fl.body_remaining -= to_consume
             if fl.body_remaining == 0:
                 if fl.awaiting_wsse:
-                    _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+                    _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now, generation=fl.generation)
                     fl.awaiting_wsse = False
                 fl.state = HTTP_STATE_HEADER
                 fl.first_byte_ts = now if fl.buf else 0.0
@@ -1120,32 +1183,50 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                 if crlf < 0:
                     if len(fl.buf) > 64:
                         fl.buf = bytearray()
-                        fl.state = HTTP_STATE_HEADER
-                        fl.first_byte_ts = now if fl.buf else 0.0
+                        fl.is_broken = True
                     break
                 line = bytes(fl.buf[:crlf]).strip()
                 semi = line.find(b";")
                 hex_str = line[:semi].strip() if semi != -1 else line
+                if len(hex_str) > 16:
+                    fl.buf = bytearray()
+                    fl.is_broken = True
+                    break
                 try:
                     chunk_len = int(hex_str, 16)
+                    if chunk_len < 0 or chunk_len > 0x7FFFFFFF:
+                        fl.buf = bytearray()
+                        fl.is_broken = True
+                        break
                 except ValueError:
                     fl.buf = bytearray()
-                    fl.state = HTTP_STATE_HEADER
-                    fl.first_byte_ts = now if fl.buf else 0.0
+                    fl.is_broken = True
                     break
                 del fl.buf[:crlf + 2]
                 if chunk_len == 0:
                     fl.chunk_reading_trailer = True
+                    fl.chunk_reading_len = False
                     continue
                 else:
-                    fl.chunk_remaining = chunk_len + 2
+                    fl.chunk_payload_remaining = chunk_len
                     fl.chunk_reading_len = False
+                    fl.chunk_reading_crlf = False
+            elif fl.chunk_reading_crlf:
+                if len(fl.buf) < 2:
+                    break
+                if fl.buf[:2] != b"\r\n":
+                    fl.buf = bytearray()
+                    fl.is_broken = True
+                    break
+                del fl.buf[:2]
+                fl.chunk_reading_crlf = False
+                fl.chunk_reading_len = True
             else:
-                to_consume = min(len(fl.buf), fl.chunk_remaining)
+                to_consume = min(len(fl.buf), fl.chunk_payload_remaining)
                 del fl.buf[:to_consume]
-                fl.chunk_remaining -= to_consume
-                if fl.chunk_remaining == 0:
-                    fl.chunk_reading_len = True
+                fl.chunk_payload_remaining -= to_consume
+                if fl.chunk_payload_remaining == 0:
+                    fl.chunk_reading_crlf = True
             continue
 
     if flags & 0x05:
@@ -1166,10 +1247,7 @@ def sweep_idle(flows, now, out=None, pending_tbl=None, resp_flows=None):
         fl = flows.get(k)
         if fl is not None and fl.awaiting_wsse and fl.wsse_event is not None:
             if out is not None:
-                src_ip, sport, dst_ip, dport = k
-                _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
-                                         (dst_ip, dport, src_ip, sport),
-                                         out, pending_tbl, now)
+                out.append(fl.wsse_event)
             fl.awaiting_wsse = False
         flows.pop(k, None)
     if resp_flows is not None:
@@ -1187,10 +1265,7 @@ def drain_incomplete_wsse(flows, out, pending_tbl, now=None):
         if fl is None:
             continue
         if fl.awaiting_wsse and fl.wsse_event is not None:
-            src_ip, sport, dst_ip, dport = key
-            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
-                                     (dst_ip, dport, src_ip, sport),
-                                     out, pending_tbl, now)
+            out.append(fl.wsse_event)
             fl.awaiting_wsse = False
         flows.pop(key, None)
 
@@ -1269,6 +1344,8 @@ def _flush_oldest_pending(pending_tbl, out):
     """Overflow guard: emit the single oldest pending event as-is."""
     oldest_key, oldest_ts = None, None
     for rk, lst in pending_tbl.items():
+        if not lst:
+            continue
         ts = lst[0][1]
         if oldest_ts is None or ts < oldest_ts:
             oldest_key, oldest_ts = rk, ts
@@ -1280,9 +1357,30 @@ def sweep_pending(pending_tbl, now, out):
     """TTL flush: emit requests whose responses never showed up."""
     for rk in list(pending_tbl.keys()):
         lst = pending_tbl.get(rk)
-        while lst and now - lst[0][1] > PENDING_TTL:
-            pending_pop(rk, out, pending_tbl)
-            lst = pending_tbl.get(rk)
+        if not lst:
+            continue
+        i = 0
+        while i < len(lst):
+            item = lst[i]
+            is_tomb = item[2] if len(item) > 2 else False
+            tomb_ts = item[3] if len(item) > 3 else 0.0
+            if is_tomb:
+                if now - tomb_ts > 10.0:
+                    lst.pop(i)
+                else:
+                    i += 1
+            elif now - item[1] > PENDING_TTL:
+                out.append(item[0])
+                if len(item) > 3:
+                    item[2] = True
+                    item[3] = now
+                else:
+                    item.extend([True, now, 0])
+                i += 1
+            else:
+                i += 1
+        if not lst:
+            pending_tbl.pop(rk, None)
 
 
 def drain_pending(pending_tbl, out):
@@ -1293,8 +1391,12 @@ def drain_pending(pending_tbl, out):
     flight when the process received SIGTERM.
     """
     for rk in list(pending_tbl.keys()):
-        while pending_tbl.get(rk):
-            pending_pop(rk, out, pending_tbl)
+        lst = pending_tbl.pop(rk, None)
+        if lst:
+            for item in lst:
+                is_tomb = item[2] if len(item) > 2 else False
+                if not is_tomb:
+                    out.append(item[0])
 
 
 def maintenance_due(now, last_sweep):
