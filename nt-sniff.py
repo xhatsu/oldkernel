@@ -65,6 +65,23 @@ def log(msg):
     sys.stderr.flush()
 
 
+def drop_capture_capabilities():
+    """Irreversibly clear CAP_NET_RAW after the packet socket is ready."""
+    try:
+        import ctypes
+        libcap = ctypes.CDLL("libcap.so.2")
+        libcap.cap_init.restype = ctypes.c_void_p
+        empty = libcap.cap_init()
+        if not empty:
+            return False
+        try:
+            return libcap.cap_set_proc(ctypes.c_void_p(empty)) == 0
+        finally:
+            libcap.cap_free(ctypes.c_void_p(empty))
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------- perf: cBPF
 # Attach a classic BPF program so the KERNEL drops everything that is not
 # IPv4 TCP to or from a monitored port. Request headers drive events and
@@ -137,13 +154,9 @@ def build_bpf(ports):
 
 
 def apply_perf_opts(sock, ports):
-    """Best-effort kernel assist: BPF port filter + big rcvbuf.
-    NT_SNIFF_NO_BPF=1 disables the filter (debugging)."""
-    built = None
-    if os.environ.get("NT_SNIFF_NO_BPF") == "1":
-        log("NT_SNIFF_NO_BPF set — skipping kernel filter")
-    else:
-        built = build_bpf(ports)
+    """Attach the mandatory kernel port filter and tune the receive buffer."""
+    built = build_bpf(ports)
+    filter_ok = False
     if built is not None:
         try:
             import ctypes
@@ -156,14 +169,13 @@ def apply_perf_opts(sock, ports):
             if ret == 0:
                 log("kernel BPF filter attached (%d monitored ports)"
                     % len(ports))
+                filter_ok = True
             else:
-                log("WARN: BPF attach rejected by kernel (ret=%d) "
-                    "— running unfiltered" % ret)
+                log("BPF attach rejected by kernel (ret=%d)" % ret)
         except Exception as e:
-            log("WARN: BPF filter attach failed (%s) — running unfiltered"
-                % e)
+            log("BPF filter attach failed (%s)" % e)
     else:
-        log("WARN: ctypes unavailable — running without BPF filter")
+        log("BPF construction unavailable")
     try:
         want = 8 * 1024 * 1024
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, want)
@@ -171,6 +183,7 @@ def apply_perf_opts(sock, ports):
         log("rcvbuf: %d bytes" % got)
     except Exception as e:
         log("WARN: SO_RCVBUF raise failed: %s" % e)
+    return filter_ok
 
 
 # ---------------------------------------------------------------- perf: fanout
@@ -815,19 +828,23 @@ def main():
         raise SystemExit("cannot open AF_PACKET socket (%s) — need "
                          "CAP_NET_RAW / root" % e)
     s.settimeout(1.0)
-    apply_perf_opts(s, ports)
+    if not apply_perf_opts(s, ports):
+        s.close()
+        raise SystemExit("kernel BPF safety filter unavailable; refusing unfiltered capture")
     try:
         s.bind((iface or "", ETH_P_ALL))
-    except socket.error:
-        try:
-            s.bind(("", ETH_P_ALL))
-        except socket.error:
-            pass
+    except socket.error as e:
+        s.close()
+        raise SystemExit("cannot bind AF_PACKET to %s (%s)" %
+                         (iface or "<all>", e))
     fanout_ok = False
     if workers > 1:
         fanout_ok = apply_fanout(s, 0xF00D)
         if fanout_ok:
             log("fanout group 0xF00D: spawning %d workers" % workers)
+    if not drop_capture_capabilities():
+        s.close()
+        raise SystemExit("cannot drop CAP_NET_RAW after socket setup; refusing unsafe capture")
 
     # precompiled struct readers — unpack_from reads straight out of the
     # packet buffer (no slice copies) and yields ints under py2 AND py3

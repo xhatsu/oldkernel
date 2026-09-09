@@ -3,8 +3,8 @@
 #
 # Installs the pcap-based HTTP/SOAP sniffer + python2.6 shipper as a SysV
 # service. NO eBPF, NO systemd, NO kernel modules. Prefers rootless capture
-# via file capability (cap_net_raw on a private interpreter copy); falls
-# back to root only if setcap is unavailable or SELinux refuses.
+# via file capability (cap_net_raw on a private interpreter copy); fails
+# closed rather than running capture as root when this cannot be enforced.
 #
 # FIRST RUN — works standalone on a bare node; missing kit files are
 # fetched automatically from the hub bootstrap server:
@@ -81,7 +81,7 @@ fetch() { # fetch <url> <dest>
 #   3. fetched from the hub bootstrap server (--hub / derived from endpoint)
 # Uninstall never needs the kit.
 need_kit=0
-for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh; do
+for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh nt-supervise.sh; do
     [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$f" ] || need_kit=1
 done
 
@@ -113,10 +113,11 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         sed -n '/^#__CPP_MAKE_B64__$/,/^#__END_CPP_MAKE__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/Makefile" 2>/dev/null
         sed -n '/^#__CPP_RUN_B64__$/,/^#__END_CPP_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-run-cpp.sh" 2>/dev/null
         sed -n '/^#__RESOURCE_GUARD_B64__$/,/^#__END_RESOURCE_GUARD__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-resource-guard.sh" 2>/dev/null
+        sed -n '/^#__SUPERVISOR_B64__$/,/^#__END_SUPERVISOR__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-supervise.sh" 2>/dev/null
     fi
 
     # --- source 3: hub bootstrap server ---------------------------------
-    if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ] || [ ! -s "$WORKDIR/nt-sniff-cpp.cpp" ] || [ ! -s "$WORKDIR/Makefile" ] || [ ! -s "$WORKDIR/nt-resource-guard.sh" ]; then
+    if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ] || [ ! -s "$WORKDIR/nt-sniff-cpp.cpp" ] || [ ! -s "$WORKDIR/Makefile" ] || [ ! -s "$WORKDIR/nt-resource-guard.sh" ] || [ ! -s "$WORKDIR/nt-supervise.sh" ]; then
         if [ -z "$KIT_URLS" ] && [ -n "$ENDPOINT" ]; then
             HUBHOST=$(printf %s "$ENDPOINT" | sed -n 's#^\(https\?://[^/:]*\).*$#\1#p')
             [ -n "$HUBHOST" ] && KIT_URLS="$HUBHOST:30105/oldkernel"
@@ -124,13 +125,13 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         [ -n "$KIT_URLS" ] || die "kit files missing, no embedded payload, cannot derive hub URL — pass --hub http://HUB:30105/oldkernel"
         log "first run: fetching kit from $KIT_URLS -> $WORKDIR"
         have curl || have wget || die "neither curl nor wget present and no embedded payload"
-        for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
+        for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh nt-supervise.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
             fetch "$KIT_URLS/$f" "$WORKDIR/$f.new" || die "cannot download $f from $KIT_URLS"
             mv "$WORKDIR/$f.new" "$WORKDIR/$f"
         done
     fi
 
-    chmod 755 "$WORKDIR"/nt-*.py "$WORKDIR"/nt-run-cpp.sh "$WORKDIR"/nt-resource-guard.sh 2>/dev/null || true
+    chmod 755 "$WORKDIR"/nt-*.py "$WORKDIR"/nt-run-cpp.sh "$WORKDIR"/nt-resource-guard.sh "$WORKDIR"/nt-supervise.sh 2>/dev/null || true
     PYBIN=""
     for c in python python2 python3; do
         if have "$c"; then PYBIN=$(command -v "$c"); break; fi
@@ -164,7 +165,7 @@ if [ "$MODE" = "uninstall" ]; then
     fi
     if have chkconfig; then chkconfig networktracing-legacy off >/dev/null 2>&1 || true; fi
     rm -f "$INIT"
-    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py"; do
+for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py" "$PREFIX/nt-supervise.sh"; do
         for p in $(pgrep -f "$pattern" 2>/dev/null || true); do
             [ "$p" = "$$" ] || kill "$p" 2>/dev/null || true
         done
@@ -172,7 +173,7 @@ if [ "$MODE" = "uninstall" ]; then
     rm -f "$CONTROL_TOKEN_FILE" /var/run/networktracing-legacy.pid
     rm -rf "$PREFIX" /tmp/ntkit*
     RESIDUE=""
-    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py"; do
+    for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-control.py" "$PREFIX/nt-supervise.sh"; do
         pgrep -f "$pattern" >/dev/null 2>&1 && RESIDUE="$RESIDUE procs-alive"
     done
     [ -e "$INIT" ] && RESIDUE="$RESIDUE init-script-present"
@@ -250,7 +251,7 @@ if [ -x "$INIT" ]; then
     fi
     "$INIT" stop >/dev/null 2>&1 || true
 fi
-for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-ship-cpp"; do
+for pattern in "$PREFIX/nt-sniff.py" "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship.py" "$PREFIX/nt-ship-cpp" "$PREFIX/nt-supervise.sh"; do
     for p in $(pgrep -f "$pattern" 2>/dev/null || true); do
         [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null || true
     done
@@ -259,7 +260,7 @@ rm -f "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship-cpp"
 
 mkdir -p "$PREFIX" || die "mkdir $PREFIX failed"
 # Python control client is bundled for CentOS 6.x nodes.
-for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh; do
+for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh nt-supervise.sh; do
     [ -f "$SCRIPT_DIR/$f" ] || die "bundle incomplete: missing $f"
 done
 cp "$SCRIPT_DIR"/nt-sniff.py "$PREFIX/"
@@ -271,6 +272,7 @@ cp "$SCRIPT_DIR"/nt-sniff-cpp.cpp "$PREFIX/"
 cp "$SCRIPT_DIR"/Makefile "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-run-cpp.sh "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-resource-guard.sh "$PREFIX/"
+cp "$SCRIPT_DIR"/nt-supervise.sh "$PREFIX/"
 if [ -f "$SCRIPT_DIR/install-oldkernel.sh" ]; then
     cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install-oldkernel.sh"
     cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install.sh"
@@ -278,7 +280,7 @@ elif [ -n "${SELF:-}" ] && [ -f "$SELF" ]; then
     cp "$SELF" "$PREFIX/install-oldkernel.sh"
     cp "$SELF" "$PREFIX/install.sh"
 fi
-chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-control.py "$PREFIX"/nt_control.py "$PREFIX"/nt-run-cpp.sh "$PREFIX"/nt-resource-guard.sh "$PREFIX"/install*.sh 2>/dev/null || true
+chmod 755 "$PREFIX"/nt-*.py "$PREFIX"/nt-control.py "$PREFIX"/nt_control.py "$PREFIX"/nt-run-cpp.sh "$PREFIX"/nt-resource-guard.sh "$PREFIX"/nt-supervise.sh "$PREFIX"/install*.sh 2>/dev/null || true
 
 # privilege model: copy the interpreter or native binary, grant IT cap_net_raw
 SNIFF_AS=root
@@ -293,16 +295,22 @@ if have setcap && have useradd; then
         # NOTE: chown BEFORE setcap — chown clears file capabilities
         if [ -f "$PREFIX/python-capnetraw" ] \
            && chown "$SNIFF_USER" "$PREFIX"/python-capnetraw 2>/dev/null \
-           && setcap cap_net_raw+ep "$PREFIX/python-capnetraw" 2>/dev/null; then
+           && chmod 750 "$PREFIX/python-capnetraw" 2>/dev/null \
+           && setcap cap_net_raw+ep "$PREFIX/python-capnetraw" 2>/dev/null \
+           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/python-capnetraw -c 'import socket; s=socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)); s.close()'" >/dev/null 2>&1; then
             SNIFF_AS="$SNIFF_USER"
             log "rootless mode: cap_net_raw on private interpreter, user=$SNIFF_USER"
         else
             rm -f "$PREFIX/python-capnetraw"
-            log "WARN: setcap path failed — sniffer will run as root"
+            log "WARN: setcap path failed — safe runtime boundary unavailable"
         fi
     fi
 else
-    log "WARN: setcap/useradd absent — sniffer will run as root"
+    log "WARN: setcap/useradd absent"
+fi
+
+if [ "$CAPTURE_MODE" != "cpp" ] && [ "$SNIFF_AS" = root ]; then
+    die "safe rootless Python capture unavailable; refusing to run the agent as root"
 fi
 
 mkdir -p /var/lib/networktracing
@@ -319,9 +327,12 @@ fi
 # sniff.log is appended by $SNIFF_USER inside su -c; pre-create it or the
 # redirect fails with EACCES on a root-owned 755 PREFIX (proven on el6)
 touch "$PREFIX/sniff.log"
+touch "$PREFIX/ship.log"
 chmod 644 "$PREFIX/sniff.log"
+chmod 644 "$PREFIX/ship.log"
 if [ "$SNIFF_AS" != root ]; then
     chown "$SNIFF_USER" "$PREFIX/sniff.log" 2>/dev/null || true
+    chown "$SNIFF_USER" "$PREFIX/ship.log" 2>/dev/null || true
 fi
 
 # sniffer stdout must FEED the shipper's stdin; starting them separately
@@ -331,15 +342,18 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
     if [ -f "$PREFIX/nt-sniff-cpp" ] && have setcap && have useradd; then
         chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
+        chmod 750 "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         if setcap cap_net_raw+ep "$PREFIX/nt-sniff-cpp" 2>/dev/null \
-           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-sniff-cpp --fixture" >/dev/null 2>&1; then
+           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-sniff-cpp --capability-probe" >/dev/null 2>&1; then
             SNIFF_AS="$SNIFF_USER"
             log "rootless mode: cap_net_raw on native C++ binary, user=$SNIFF_USER"
         else
             SNIFF_AS=root
-            log "WARN: rootless capability execution failed — sniffer will run as root"
+            log "WARN: rootless capability execution failed — safe runtime boundary unavailable"
         fi
     fi
+    [ "$SNIFF_AS" != root ] \
+        || die "safe rootless C++ capture unavailable; refusing to run the agent as root"
     if [ "$SNIFF_AS" != root ]; then
         RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --wsse-body-bytes $WSSE_BODY_BYTES' >>\$PREFIX/sniff.log 2>&1"
     else
@@ -352,7 +366,7 @@ else
     else
         SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES"
     fi
-    SHIP_CMD="exec python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT"
+    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
 fi
 
@@ -393,16 +407,39 @@ case "\$1" in
             export NT_NODE_NAME="\${NT_NODE_NAME:-\$(hostname -s)}"
         fi
         # Fail closed behind one inherited CPU affinity and finite host limits.
-        nohup "\$PREFIX/nt-resource-guard.sh" "\$CPU_CORE" sh -c "$RUN_CMD" >/dev/null 2>&1 &
-        echo \$! > "\$PIDFILE"
+        nohup "\$PREFIX/nt-resource-guard.sh" "\$CPU_CORE" \
+            "\$PREFIX/nt-supervise.sh" "\$PREFIX/nt-resource-guard.sh" "\$CPU_CORE" \
+            sh -c "$RUN_CMD" >/dev/null 2>&1 &
+        supervisor_pid=\$!
+        echo "\$supervisor_pid" > "\$PIDFILE"
         sleep 1
-        pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null || pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null || { echo "sniffer failed to start"; exit 1; }
+        if ! pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null; then
+            kill "\$supervisor_pid" 2>/dev/null || true
+            rm -f "\$PIDFILE"
+            echo "sniffer failed safe startup checks"
+            exit 1
+        fi
         echo "networktracing-legacy started"
         ;;
     reload)
         "\$0" restart
         ;;
     stop)
+        if [ -s "\$PIDFILE" ]; then
+            supervisor=$(cat "\$PIDFILE" 2>/dev/null || true)
+            case "\$supervisor" in
+                ''|*[!0-9]*) : ;;
+                *)
+                    kill "\$supervisor" 2>/dev/null || true
+                    _sw=0
+                    while [ \$_sw -lt 5 ] && kill -0 "\$supervisor" 2>/dev/null; do
+                        sleep 1
+                        _sw=$((_sw + 1))
+                    done
+                    kill -0 "\$supervisor" 2>/dev/null && kill -9 "\$supervisor" 2>/dev/null || true
+                    ;;
+            esac
+        fi
         for pattern in "\$PREFIX/nt-sniff.py" "\$PREFIX/nt-sniff-cpp" "\$PREFIX/nt-ship.py"; do
             for p in \$(pgrep -f "\$pattern" 2>/dev/null || true); do
                 if [ -n "\$p" ] && [ "\$p" != "\$\$" ]; then
@@ -482,7 +519,7 @@ if ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-c
 fi
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
-log "Safety: cpu=$CPU_CORE (one logical core), memory=256MiB, fds=1024, output-file=32MiB, core-dumps=off"
+log "Safety: rootless, cpu=$CPU_CORE (one logical core/nice 19), memory=256MiB, fds=1024, output-file=32MiB, crash circuit=5"
 if [ "$WSSE_BODY_BYTES" -ne 0 ]; then
     log "WSSE UsernameToken inspection: bounded to $WSSE_BODY_BYTES bytes/request"
 else

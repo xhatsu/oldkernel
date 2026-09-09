@@ -15,7 +15,7 @@
   the sanitized event; body and credential material are discarded.
 - Installer native mode now passes the configured body window instead of
   rejecting it. The PCAP harness supports the same option.
-- Verification: 22 pytest-compatible tests, optimized native builds/fixtures,
+- Verification: 24 pytest-compatible tests, optimized native builds/fixtures,
   and ASAN+UBSAN fixtures passed. With an 8192-byte window, sample PCAP 247
   produced 200 C++ events with `product/wsse`; PCAP 249 produced 11,394 C++
   events with Basic+WSSE identities. All had traceparents and no body/secret
@@ -23,17 +23,26 @@
 
 ## Runtime Host Safety Boundary (2026-09-08)
 - Every installed sniffer/shipper pipeline now starts through
-  `nt-resource-guard.sh`; startup fails closed when `taskset` is missing or the
-  chosen CPU is outside the service cpuset.
+  `nt-supervise.sh` and `nt-resource-guard.sh`; startup fails closed when
+  `taskset`/file capabilities are unavailable or the chosen CPU is outside the
+  service cpuset. Unsafe root capture fallback was removed; Python and native
+  shipping execute under the dedicated non-login `ntsniff` account.
 - The complete descendant process tree is pinned to one logical CPU, runs at
-  nice level 10, and inherits hard limits of 256 MiB virtual memory, 1,024 file
-  descriptors, 32 MiB per regular output file, and zero-byte core dumps.
-  EL6 `/bin/sh` additionally enforces a 64-process ceiling.
+  nice level 19, and inherits hard limits of 256 MiB virtual memory, 8 MiB
+  stack, 64 KiB locked memory, 1,024 file descriptors, 32 MiB per regular
+  output file, and zero-byte core dumps. EL6 `/bin/sh` additionally enforces a
+  64-process ceiling.
+- Failures restart with 1/2/4/8-second backoff. Five processes that each die
+  inside 60 seconds open the circuit and stop, preventing crash-loop pressure.
+- Installation verifies a real `AF_PACKET` open as `ntsniff`, not merely the
+  `setcap` return code. Both sniffers require the kernel BPF safety filter and
+  drop all capabilities after socket/filter/bind setup; unfiltered or
+  capability-retaining capture fails closed.
 - The installer automatically chooses the first allowed CPU, supports a
   validated `NT_CPU_CORE=N`, and forces Python PACKET_FANOUT workers to one.
 - `test_resource_guard.py` exercises the actual kernel affinity/resource
   limits and verifies that installer startup is routed through the guard.
-- Verification: 22 pytest-compatible tests passed (including the loopback
+- Verification: 24 pytest-compatible tests passed (including the loopback
   shipper test); native fixture, ASAN+UBSAN edge tests, and the CentOS runbook
   passed. Offline Python/C++ processing of both sample PCAPs produced the
   established 200/218 and 11,216/12,441 event counts with full traceparents.
@@ -201,5 +210,3 @@
       - Average CPU: **14.89%** of 1 core (peak: 14.89%).
       - Resident Memory (RSS): **24.47 MB** peak.
   - Benchmarking tools: `measure_usage.py`, `run_100tps_benchmark.py`.
-
-

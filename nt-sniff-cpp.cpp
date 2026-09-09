@@ -21,6 +21,7 @@
 #include <string.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/time.h>
@@ -29,6 +30,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/filter.h>
+#include <linux/capability.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <iostream>
@@ -979,9 +981,27 @@ static bool parse_wsse_size(const char *value, size_t *result) {
   return true;
 }
 
+static int run_capability_probe() {
+  int fd = socket(AF_PACKET, SOCK_RAW, htons(3));
+  if (fd < 0) { perror("AF_PACKET capability probe"); return 2; }
+  close(fd);
+  return 0;
+}
+
+static bool drop_all_capabilities() {
+  struct __user_cap_header_struct header;
+  struct __user_cap_data_struct data[2];
+  memset(&header, 0, sizeof(header));
+  memset(data, 0, sizeof(data));
+  header.version = _LINUX_CAPABILITY_VERSION_3;
+  header.pid = 0;
+  return syscall(SYS_capset, &header, data) == 0;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   if (argc > 1 && !strcmp(argv[1], "--wsse-fixture")) return run_wsse_fixture();
+  if (argc > 1 && !strcmp(argv[1], "--capability-probe")) return run_capability_probe();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
   std::string endpoint;
   const char *wsse_env = getenv("NT_WSSE_BODY_BYTES");
@@ -1029,7 +1049,11 @@ int main(int argc, char **argv) {
   if (fd < 0) { perror("AF_PACKET"); return 2; }
   int rb = 8 * 1024 * 1024;
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
-  if (!attach_bpf(fd, ports)) logmsg("WARN: BPF attach failed; continuing unfiltered");
+  if (!attach_bpf(fd, ports)) {
+    logmsg("BPF attach failed; refusing unfiltered capture");
+    close(fd);
+    return 2;
+  }
 
   MmapRing ring;
   bool use_mmap = setup_mmap_ring(fd, ring);
@@ -1043,6 +1067,12 @@ int main(int argc, char **argv) {
     if (!sa.sll_ifindex) { logmsg("bad interface"); close(fd); return 2; }
   }
   if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { perror("bind"); close(fd); return 2; }
+  if (!drop_all_capabilities()) {
+    logmsg("capability drop failed; refusing unsafe capture");
+    if (use_mmap && ring.ring != MAP_FAILED) munmap(ring.ring, ring.ring_size);
+    close(fd);
+    return 2;
+  }
 
   signal(SIGTERM, stop_signal);
   signal(SIGINT, stop_signal);

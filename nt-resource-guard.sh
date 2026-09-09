@@ -21,17 +21,19 @@ command -v taskset >/dev/null 2>&1 || {
     exit 70
 }
 
-# 256 MiB address space, 1,024 descriptors, 32 MiB per regular output file,
-# and no core dumps. The process limit exists in bash on EL6, but not in every
-# POSIX shell, so apply it only when the target /bin/sh supports it.
+# 256 MiB address space, 8 MiB stack, 64 KiB locked memory, 1,024 descriptors,
+# 32 MiB per regular output file, and no core dumps. The process limit exists
+# in bash on EL6, but not every POSIX shell, so apply it when supported.
 ulimit -S -c 0 && ulimit -H -c 0 || exit 70
 ulimit -S -f 65536 && ulimit -H -f 65536 || exit 70
 ulimit -S -n 1024 && ulimit -H -n 1024 || exit 70
 ulimit -S -v 262144 && ulimit -H -v 262144 || exit 70
+ulimit -S -s 8192 && ulimit -H -s 8192 || exit 70
+ulimit -S -l 64 && ulimit -H -l 64 || exit 70
 if (ulimit -u >/dev/null 2>&1); then
     ulimit -S -u 64 && ulimit -H -u 64 || exit 70
 fi
 
-# Lower scheduling priority too. taskset provides the hard one-logical-CPU
+# Lowest scheduling priority too. taskset provides the hard one-logical-CPU
 # ceiling for the complete descendant process tree.
-exec taskset -c "$CPU_CORE" nice -n 10 "$@"
+exec taskset -c "$CPU_CORE" nice -n 19 "$@"

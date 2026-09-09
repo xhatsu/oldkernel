@@ -34,6 +34,9 @@ cp install-oldkernel.sh "$OUT"
     printf '#__RESOURCE_GUARD_B64__\n'
     base64 nt-resource-guard.sh
     printf '#__END_RESOURCE_GUARD__\n'
+    printf '#__SUPERVISOR_B64__\n'
+    base64 nt-supervise.sh
+    printf '#__END_SUPERVISOR__\n'
 } >> "$OUT"
 chmod 755 "$OUT"
 echo "built $OUT ($(wc -c < "$OUT") bytes)"

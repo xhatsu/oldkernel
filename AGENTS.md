@@ -23,10 +23,15 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
    interface address over `lo`; use real ingress or an isolated namespace/veth
    fixture when the configured interface itself must be exercised.
 7. **Host Resource Safety**: Installed runtime processes must launch through
-   `nt-resource-guard.sh`. The full process tree is pinned to one allowed
-   logical CPU and bounded to 256 MiB address space, 1,024 file descriptors,
-   32 MiB per output file, zero core dumps, and (where `/bin/sh` supports it)
-   64 processes. Startup must fail closed when CPU affinity cannot be enforced.
+   `nt-supervise.sh` and `nt-resource-guard.sh`. The agent must run as the
+   dedicated non-login user and startup must fail closed if file capabilities
+   or CPU affinity cannot be enforced. The full process tree is pinned to one
+   allowed logical CPU at nice 19 and bounded to 256 MiB address space, 8 MiB
+   stack, 64 KiB locked memory, 1,024 file descriptors, 32 MiB per output
+   file, zero core dumps, and (where `/bin/sh` supports it) 64 processes.
+   Five short crashes open the supervisor circuit to prevent restart storms.
+   Installation must prove `AF_PACKET` access under `ntsniff`; after socket,
+   BPF, and bind setup, capture processes must drop all capabilities.
 
 ## WSSE Capture State (2026-09-08)
 - Both Python and C++03 capture are header-only by default. `NT_WSSE_BODY_BYTES` or
