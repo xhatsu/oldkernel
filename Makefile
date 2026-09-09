@@ -1,7 +1,7 @@
 # GCC 4.4 / CentOS 6 compatible: C++03, gnu++03 or gnu++98.
 CXX ?= g++
 CXXSTD ?= $(shell $(CXX) -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
-CXXFLAGS ?= -O2 -Wall -Wextra $(CXXSTD)
+CXXFLAGS ?= -O2 -Wall -Wextra $(CXXSTD) -pthread
 
 .PHONY: all cpp cpp-ship cpp-debug fixture pcap-fixture clean
 
@@ -20,6 +20,7 @@ fixture: cpp
 	./nt-sniff-cpp --fixture
 	./nt-sniff-cpp --ring-fixture
 	./nt-sniff-cpp --ship-rate-fixture
+	./nt-sniff-cpp --stats-fixture
 
 pcap-fixture: pcap_test_cpp
 

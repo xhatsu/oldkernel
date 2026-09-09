@@ -22,6 +22,7 @@
 #                NT_WSSE_BODY_BYTES=0..65536 (Python/C++ modes; default 0)
 #                NT_CPU_CORE=N (default: first CPU allowed for the installer)
 #                NT_SHIP_THREADS=1..8 NT_SHIP_RATE_KBPS=64..10000
+#                NT_STATS_INTERVAL_SEC=10..300 (default: 30)
 set -u
 
 PREFIX=/opt/networktracing-legacy
@@ -34,6 +35,7 @@ PORTS="${NT_PORTS:-80,8003,8005,8007,8009,8010,8011}"
 WORKERS="${NT_WORKERS:-1}"   # compatibility input; capture is always single-worker
 SHIPPERS="${NT_SHIP_THREADS:-4}"  # bounded concurrent Hub POST threads
 SHIP_RATE_KBPS="${NT_SHIP_RATE_KBPS:-1024}" # aggregate application egress ceiling
+STATS_INTERVAL_SEC="${NT_STATS_INTERVAL_SEC:-30}"
 KIT_URLS="${NT_HUB:-}"
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
@@ -60,6 +62,7 @@ Usage: install-firstrun-el68.sh --server URL [options]
   --cpu N                   One allowed logical CPU number
   --ship-threads N          Python poster threads, 1..8 (default: 4)
   --ship-rate-kbps N        Egress ceiling, 64..10000 kbit/s (default: 1024)
+  --stats-interval-sec N    Agent statistics interval, 10..300s (default: 30)
   --control-token-file FILE Read the control token from FILE
   --offline                 Use only local/embedded kit; never fetch fallback
   --check                   Preflight only; make no installation changes
@@ -81,6 +84,7 @@ while [ $# -gt 0 ]; do
         --cpu)      need_value "$@"; CPU_CORE="$2"; shift 2 ;;
         --ship-threads) need_value "$@"; SHIPPERS="$2"; shift 2 ;;
         --ship-rate-kbps) need_value "$@"; SHIP_RATE_KBPS="$2"; shift 2 ;;
+        --stats-interval-sec) need_value "$@"; STATS_INTERVAL_SEC="$2"; shift 2 ;;
         --control-token-file) need_value "$@"; TOKEN_INPUT_FILE="$2"; shift 2 ;;
         --offline)  ALLOW_KIT_FETCH=0; shift ;;
         --install)  MODE=install; shift ;;
@@ -122,6 +126,9 @@ case "$SHIPPERS" in ''|*[!0-9]*) die "ship threads must be an integer 1..8" ;; e
 case "$SHIP_RATE_KBPS" in ''|*[!0-9]*) die "ship rate must be an integer 64..10000" ;; esac
 [ "$SHIP_RATE_KBPS" -ge 64 ] && [ "$SHIP_RATE_KBPS" -le 10000 ] \
     || die "ship rate must be in range 64..10000 kbit/s"
+case "$STATS_INTERVAL_SEC" in ''|*[!0-9]*) die "stats interval must be an integer 10..300" ;; esac
+[ "$STATS_INTERVAL_SEC" -ge 10 ] && [ "$STATS_INTERVAL_SEC" -le 300 ] \
+    || die "stats interval must be in range 10..300 seconds"
 
 case "$WSSE_BODY_BYTES" in
     ''|*[!0-9]*) die "WSSE body byte window must be an integer 0..65536" ;;
@@ -380,7 +387,7 @@ if have setcap && have useradd; then
            && chown "$SNIFF_USER" "$PREFIX"/python-capnetraw 2>/dev/null \
            && chmod 750 "$PREFIX/python-capnetraw" 2>/dev/null \
            && setcap cap_net_raw+ep "$PREFIX/python-capnetraw" 2>/dev/null \
-           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/python-capnetraw -c 'import socket; s=socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)); s.close()'" >/dev/null 2>&1; then
+           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -c 'import socket; s=socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)); s.close()'" >/dev/null 2>&1; then
             SNIFF_AS="$SNIFF_USER"
             log "rootless mode: cap_net_raw on private interpreter, user=$SNIFF_USER"
         else
@@ -422,12 +429,12 @@ fi
 # leaves events stranded in sniff.log (proven on el6). Build one pipeline.
 if [ "$CAPTURE_MODE" = "cpp" ]; then
     CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
-    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
+    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
     if [ -f "$PREFIX/nt-sniff-cpp" ] && have setcap && have useradd; then
         chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         chmod 750 "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         if setcap cap_net_raw+ep "$PREFIX/nt-sniff-cpp" 2>/dev/null \
-           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-sniff-cpp --capability-probe -i $IFACE -p $PORTS" >/dev/null 2>&1; then
+           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp --capability-probe -i $IFACE -p $PORTS" >/dev/null 2>&1; then
             SNIFF_AS="$SNIFF_USER"
             log "rootless mode: cap_net_raw on native C++ binary, user=$SNIFF_USER"
         else
@@ -437,20 +444,20 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     fi
     [ "$SNIFF_AS" != root ] \
         || die "safe rootless C++ capture unavailable; refusing to run the agent as root"
-    if [ "$SNIFF_AS" != root ]; then
-        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --wsse-body-bytes $WSSE_BODY_BYTES' >>\$PREFIX/sniff.log 2>&1"
-    else
-        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --wsse-body-bytes $WSSE_BODY_BYTES >>\$PREFIX/sniff.log 2>&1"
-    fi
-    log "native C++ single-binary capture + shipping selected"
+    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --stats-interval-sec $STATS_INTERVAL_SEC --wsse-body-bytes $WSSE_BODY_BYTES'"
+    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
+    RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
+    EXPECTED_SHIP=nt-ship-cpp
+    log "native C++ nonblocking capture + bounded shipper pipeline selected"
 else
     if [ "$SNIFF_AS" != root ]; then
-        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES'"
+        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES'"
     else
         SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES"
     fi
-    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT'"
+    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
+    EXPECTED_SHIP=nt-ship.py
 fi
 
 cat > "$INIT" <<EOF
@@ -472,6 +479,7 @@ PREFIX=$PREFIX
 SNIFF_USER=$SNIFF_AS
 export NT_SHIP_THREADS=$SHIPPERS
 export NT_SHIP_RATE_KBPS=$SHIP_RATE_KBPS
+export NT_STATS_INTERVAL_SEC=$STATS_INTERVAL_SEC
 export NT_WSSE_BODY_BYTES=$WSSE_BODY_BYTES
 CPU_CORE=$CPU_CORE
 PIDFILE=/var/run/networktracing-legacy.pid
@@ -496,8 +504,12 @@ case "\$1" in
             sh -c "$RUN_CMD" >/dev/null 2>&1 &
         supervisor_pid=\$!
         echo "\$supervisor_pid" > "\$PIDFILE"
-        sleep 1
-        if ! pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null; then
+        # EL6 can need about two seconds to traverse guard -> supervisor ->
+        # su -> interpreter/native startup. Keep this bounded but avoid a
+        # false failed-start result on otherwise healthy nodes.
+        sleep 3
+        if { ! pgrep -f "\$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "\$PREFIX/nt-sniff-cpp" >/dev/null; } \
+           || ! pgrep -f "\$PREFIX/$EXPECTED_SHIP" >/dev/null; then
             kill "\$supervisor_pid" 2>/dev/null || true
             rm -f "\$PIDFILE"
             echo "sniffer failed safe startup checks"
@@ -510,7 +522,7 @@ case "\$1" in
         ;;
     stop)
         if [ -s "\$PIDFILE" ]; then
-            supervisor=$(cat "\$PIDFILE" 2>/dev/null || true)
+            supervisor=\$(cat "\$PIDFILE" 2>/dev/null || true)
             case "\$supervisor" in
                 ''|*[!0-9]*) : ;;
                 *)
@@ -518,13 +530,13 @@ case "\$1" in
                     _sw=0
                     while [ \$_sw -lt 5 ] && kill -0 "\$supervisor" 2>/dev/null; do
                         sleep 1
-                        _sw=$((_sw + 1))
+                        _sw=\$((_sw + 1))
                     done
                     kill -0 "\$supervisor" 2>/dev/null && kill -9 "\$supervisor" 2>/dev/null || true
                     ;;
             esac
         fi
-        for pattern in "\$PREFIX/nt-sniff.py" "\$PREFIX/nt-sniff-cpp" "\$PREFIX/nt-ship.py"; do
+        for pattern in "\$PREFIX/nt-sniff.py" "\$PREFIX/nt-sniff-cpp" "\$PREFIX/nt-ship.py" "\$PREFIX/nt-ship-cpp"; do
             for p in \$(pgrep -f "\$pattern" 2>/dev/null || true); do
                 if [ -n "\$p" ] && [ "\$p" != "\$\$" ]; then
                     kill "\$p" 2>/dev/null || true
@@ -596,15 +608,17 @@ if [ "$START_RC" -ne 0 ]; then
     die "service failed to start"
 fi
 sleep 2
-if ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-cpp" >/dev/null; then
+if { ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-cpp" >/dev/null; } \
+   || ! pgrep -f "$PREFIX/$EXPECTED_SHIP" >/dev/null; then
     [ -f "$PREFIX/sniff.log" ] && { echo "--- $PREFIX/sniff.log ---"; cat "$PREFIX/sniff.log"; }
     [ -f "$PREFIX/ship.log" ] && { echo "--- $PREFIX/ship.log ---"; cat "$PREFIX/ship.log"; }
-    die "sniffer not running after start"
+    die "capture/ship pipeline not running after start"
 fi
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
 log "Safety: rootless, cpu=$CPU_CORE (one logical core/SCHED_IDLE/nice 19), memory=256MiB, fds=1024, output-file=32MiB, crash circuit=5"
 log "Network egress: aggregate application payload limit=${SHIP_RATE_KBPS}kbit/s, HTTP body cap=65536 bytes"
+log "Agent statistics: $ENDPOINT/api/agent/stats every ${STATS_INTERVAL_SEC}s, body cap=16384 bytes"
 if [ "$WSSE_BODY_BYTES" -ne 0 ]; then
     log "WSSE UsernameToken inspection: bounded to $WSSE_BODY_BYTES bytes/request"
 else

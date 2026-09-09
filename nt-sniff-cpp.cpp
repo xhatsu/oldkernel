@@ -26,10 +26,12 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <linux/filter.h>
 #include <linux/capability.h>
 #include <linux/if_packet.h>
@@ -55,6 +57,7 @@ static const size_t MAX_WSSE_USERNAME = 200;
 static const size_t MAX_BATCH = 400;
 static const size_t MAX_QUEUE = 4000;
 static const size_t MAX_POST_BYTES = 65536;
+static const size_t MAX_STATS_BYTES = 16384;
 static const unsigned DEFAULT_SHIP_RATE_KBPS = 1024;
 static const int FLUSH_SEC = 5;
 static const int RETRY_SEC = 60;
@@ -580,7 +583,29 @@ static std::string g_endpoint;
 static std::string g_ship_node;
 static std::vector<std::string> g_ship_buf;
 static unsigned g_ship_rate_kbps = DEFAULT_SHIP_RATE_KBPS;
+static unsigned g_stats_interval_sec = 30;
+static size_t g_wsse_body_bytes = 0;
 static double g_next_ship_slot = 0.0;
+static unsigned long long g_capture_packets = 0, g_capture_bytes = 0;
+static unsigned long long g_kernel_drops = 0, g_invalid_frames = 0;
+static unsigned long long g_events_emitted = 0, g_events_in = 0;
+static unsigned long long g_events_pushed = 0, g_events_dropped = 0;
+static unsigned long long g_drop_queue = 0, g_drop_hub = 0, g_drop_oversized = 0;
+static unsigned long long g_batches_pushed = 0, g_batches_failed = 0;
+static unsigned long long g_bytes_pushed = 0, g_stats_dropped = 0;
+static unsigned long long g_output_pipe_drops = 0, g_prev_output_pipe_drops = 0;
+static size_t g_queue_high_water = 0;
+static unsigned g_consecutive_failures = 0, g_last_push_status = 0;
+static time_t g_last_success_at = 0;
+static double g_stats_last_at = 0.0, g_stats_last_cpu = 0.0;
+static unsigned long long g_prev_capture_packets = 0, g_prev_capture_bytes = 0;
+static unsigned long long g_prev_events_emitted = 0, g_prev_events_in = 0;
+static unsigned long long g_prev_events_pushed = 0, g_prev_events_dropped = 0;
+static unsigned long long g_prev_batches_pushed = 0, g_prev_batches_failed = 0;
+static unsigned long long g_prev_bytes_pushed = 0, g_prev_drop_queue = 0;
+static unsigned long long g_prev_drop_hub = 0, g_prev_drop_oversized = 0;
+static unsigned long long g_stats_sequence = 0;
+static std::string g_instance_id;
 
 static std::string shellq(const std::string &s) {
   std::string o = "'";
@@ -588,6 +613,8 @@ static std::string shellq(const std::string &s) {
   return o + "'";
 }
 static std::string number_string(size_t n) { std::ostringstream o; o << n; return o.str(); }
+static std::string ull_string(unsigned long long n) { std::ostringstream o; o << n; return o.str(); }
+static std::string double_string(double n) { std::ostringstream o; o.setf(std::ios::fixed); o.precision(4); o << n; return o.str(); }
 static std::string json_array(const std::vector<std::string> &a) {
   std::string o = "["; for (size_t i = 0; i < a.size(); ++i) { if (i) o += ","; o += a[i]; } return o + "]";
 }
@@ -631,17 +658,30 @@ static int run_ship_rate_fixture() {
   if (bounded_batch_count(events, "fixture") != 0) return 31;
   return 0;
 }
-static bool post(const std::string &endpoint, const std::string &node, const std::vector<std::string> &batch) {
-  std::string body = "{\"node\":" + jsonq(node) + ",\"events\":" + json_array(batch) + "}";
-  if (body.size() > MAX_POST_BYTES) return false;
+static bool post_body(const std::string &endpoint, const std::string &path,
+                      const std::string &body, unsigned timeout_sec) {
   pace_upload(body.size());
-  std::string cmd = "curl -sSf --max-time 10 --limit-rate " +
+  std::string cmd = "curl -sSf --max-time " + number_string(timeout_sec) + " --limit-rate " +
     number_string((size_t)g_ship_rate_kbps * 1000U / 8U) +
-    " -o /dev/null -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + "/api/ingest");
+    " -o /dev/null -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + path);
   FILE *fp = popen(cmd.c_str(), "w"); if (!fp) return false;
   fwrite(body.data(), 1, body.size(), fp);
   int rc = pclose(fp);
   return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+}
+static bool post(const std::string &endpoint, const std::string &node, const std::vector<std::string> &batch) {
+  std::string body = "{\"node\":" + jsonq(node) + ",\"events\":" + json_array(batch) + "}";
+  if (body.size() > MAX_POST_BYTES) return false;
+  bool ok = post_body(endpoint, "/api/ingest", body, 10);
+  if (ok) {
+    g_events_pushed += batch.size();
+    ++g_batches_pushed;
+    g_bytes_pushed += body.size();
+    g_consecutive_failures = 0;
+    g_last_push_status = 200;
+    g_last_success_at = time(NULL);
+  }
+  return ok;
 }
 static void send_batches(const std::string &endpoint, const std::string &node,
                          std::vector<std::string> *buf, bool flush_all) {
@@ -649,6 +689,8 @@ static void send_batches(const std::string &endpoint, const std::string &node,
     size_t n = bounded_batch_count(*buf, node);
     if (!n) {
       buf->erase(buf->begin());
+      ++g_events_dropped;
+      ++g_drop_oversized;
       logmsg("WARN: dropped oversized event; encoded body exceeds 65536 bytes");
       continue;
     }
@@ -659,10 +701,208 @@ static void send_batches(const std::string &endpoint, const std::string &node,
     } else {
       /* Pure in-memory drop when Hub unreachable (zero disk I/O) */
       buf->erase(buf->begin(), buf->begin() + n);
+      g_events_dropped += n;
+      g_drop_hub += n;
+      ++g_batches_failed;
+      ++g_consecutive_failures;
+      g_last_push_status = 0;
       logmsg("WARN: Hub unreachable, dropped " + number_string(n) + " events (in-memory drop, 0 disk I/O)");
       break;
     }
   }
+}
+
+static unsigned count_open_fds() {
+  DIR *dir = opendir("/proc/self/fd");
+  if (!dir) return 0;
+  unsigned count = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) ++count;
+  }
+  closedir(dir);
+  return count;
+}
+
+static void proc_status(size_t *rss, size_t *virt, unsigned *threads,
+                        unsigned *cpu_core) {
+  *rss = 0; *virt = 0; *threads = 1; *cpu_core = 0;
+  std::ifstream in("/proc/self/status");
+  std::string line;
+  while (std::getline(in, line)) {
+    unsigned long value = 0;
+    if (sscanf(line.c_str(), "VmRSS: %lu kB", &value) == 1) *rss = (size_t)value * 1024U;
+    else if (sscanf(line.c_str(), "VmSize: %lu kB", &value) == 1) *virt = (size_t)value * 1024U;
+    else if (sscanf(line.c_str(), "Threads: %lu", &value) == 1) *threads = (unsigned)value;
+    else if (sscanf(line.c_str(), "Cpus_allowed_list: %lu", &value) == 1) *cpu_core = (unsigned)value;
+  }
+}
+
+static unsigned long long update_kernel_drops(int fd) {
+  if (fd < 0) return 0;
+  struct tpacket_stats packet_stats;
+  socklen_t packet_stats_len = sizeof(packet_stats);
+  memset(&packet_stats, 0, sizeof(packet_stats));
+  if (getsockopt(fd, SOL_PACKET, PACKET_STATISTICS,
+                 &packet_stats, &packet_stats_len) != 0) return 0;
+  g_kernel_drops += packet_stats.tp_drops;
+  return packet_stats.tp_drops;
+}
+
+static std::string agent_stats_body(int fd, size_t flows_active,
+                                    size_t pending_requests,
+                                    size_t wsse_body_flows) {
+  double now = wall_seconds();
+  double elapsed = now - g_stats_last_at;
+  if (elapsed < 0.001) elapsed = 0.001;
+  unsigned long long kernel_drop_delta = update_kernel_drops(fd);
+  unsigned long long packet_delta = g_capture_packets - g_prev_capture_packets;
+  unsigned long long packet_bytes_delta = g_capture_bytes - g_prev_capture_bytes;
+  unsigned long long emitted_delta = g_events_emitted - g_prev_events_emitted;
+  unsigned long long in_delta = g_events_in - g_prev_events_in;
+  unsigned long long pushed_delta = g_events_pushed - g_prev_events_pushed;
+  unsigned long long dropped_delta = g_events_dropped - g_prev_events_dropped;
+  unsigned long long batches_pushed_delta = g_batches_pushed - g_prev_batches_pushed;
+  unsigned long long batches_failed_delta = g_batches_failed - g_prev_batches_failed;
+  unsigned long long bytes_delta = g_bytes_pushed - g_prev_bytes_pushed;
+  unsigned long long queue_delta = g_drop_queue - g_prev_drop_queue;
+  unsigned long long hub_delta = g_drop_hub - g_prev_drop_hub;
+  unsigned long long oversized_delta = g_drop_oversized - g_prev_drop_oversized;
+  unsigned long long pipe_drop_delta = g_output_pipe_drops - g_prev_output_pipe_drops;
+  struct rusage usage;
+  memset(&usage, 0, sizeof(usage));
+  getrusage(RUSAGE_SELF, &usage);
+  double user_cpu = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
+  double sys_cpu = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
+  double cpu_total = user_cpu + sys_cpu;
+  double cpu_pct = 100.0 * (cpu_total - g_stats_last_cpu) / elapsed;
+  if (cpu_pct < 0) cpu_pct = 0;
+  size_t rss = 0, virt = 0;
+  unsigned threads = 1, cpu_core = 0;
+  proc_status(&rss, &virt, &threads, &cpu_core);
+  std::string reasons;
+  if (kernel_drop_delta) reasons += "\"kernel_drop\"";
+  if (dropped_delta) { if (!reasons.empty()) reasons += ","; reasons += "\"ship_drop\""; }
+  if (hub_delta) { if (!reasons.empty()) reasons += ","; reasons += "\"hub_unreachable\""; }
+  if (queue_delta || pipe_drop_delta) { if (!reasons.empty()) reasons += ","; reasons += "\"queue_pressure\""; }
+  std::ostringstream out;
+  out << "{\"schema_version\":1,\"type\":\"agent_stats\",\"node\":" << jsonq(g_ship_node)
+      << ",\"instance_id\":" << jsonq(g_instance_id) << ",\"sequence\":" << ++g_stats_sequence
+      << ",\"observed_at\":" << (unsigned long)now << ",\"window_seconds\":" << double_string(elapsed)
+      << ",\"mode\":\"cpp\",\"status\":" << (reasons.empty() ? "\"ok\"" : "\"degraded\"")
+      << ",\"reasons\":[" << reasons << "],\"capture\":{"
+      << "\"packets_total\":" << ull_string(g_capture_packets) << ",\"packets_delta\":" << ull_string(packet_delta)
+      << ",\"packet_bytes_total\":" << ull_string(g_capture_bytes) << ",\"packet_bytes_delta\":" << ull_string(packet_bytes_delta)
+      << ",\"kernel_drops_total\":" << ull_string(g_kernel_drops) << ",\"kernel_drops_delta\":" << ull_string(kernel_drop_delta)
+      << ",\"kernel_drop_percent\":" << double_string(100.0 * kernel_drop_delta / (packet_delta ? packet_delta : 1))
+      << ",\"invalid_frames_total\":" << ull_string(g_invalid_frames)
+      << ",\"events_emitted_total\":" << ull_string(g_events_emitted) << ",\"events_emitted_delta\":" << ull_string(emitted_delta)
+      << ",\"flows_active\":" << flows_active << ",\"pending_requests\":" << pending_requests
+      << ",\"wsse_body_flows_active\":" << wsse_body_flows
+      << ",\"wsse_body_bytes\":" << g_wsse_body_bytes
+      << ",\"output_pipe_drops_total\":" << ull_string(g_output_pipe_drops)
+      << ",\"output_pipe_drops_delta\":" << ull_string(pipe_drop_delta) << "},\"shipping\":{"
+      << "\"events_in_total\":" << ull_string(g_events_in) << ",\"events_in_delta\":" << ull_string(in_delta)
+      << ",\"events_pushed_total\":" << ull_string(g_events_pushed) << ",\"events_pushed_delta\":" << ull_string(pushed_delta)
+      << ",\"events_dropped_total\":" << ull_string(g_events_dropped) << ",\"events_dropped_delta\":" << ull_string(dropped_delta)
+      << ",\"drop_causes\":{\"queue_full_total\":" << ull_string(g_drop_queue) << ",\"queue_full_delta\":" << ull_string(queue_delta)
+      << ",\"hub_failure_total\":" << ull_string(g_drop_hub) << ",\"hub_failure_delta\":" << ull_string(hub_delta)
+      << ",\"oversized_total\":" << ull_string(g_drop_oversized) << ",\"oversized_delta\":" << ull_string(oversized_delta) << "}"
+      << ",\"batches_pushed_total\":" << ull_string(g_batches_pushed) << ",\"batches_pushed_delta\":" << ull_string(batches_pushed_delta)
+      << ",\"batches_failed_total\":" << ull_string(g_batches_failed) << ",\"batches_failed_delta\":" << ull_string(batches_failed_delta)
+      << ",\"bytes_pushed_total\":" << ull_string(g_bytes_pushed) << ",\"bytes_pushed_delta\":" << ull_string(bytes_delta)
+      << ",\"push_events_per_second\":" << double_string(pushed_delta / elapsed)
+      << ",\"push_kbps\":" << double_string(8.0 * bytes_delta / (1000.0 * elapsed))
+      << ",\"drop_events_per_second\":" << double_string(dropped_delta / elapsed)
+      << ",\"drop_percent\":" << double_string(100.0 * dropped_delta / (in_delta ? in_delta : 1))
+      << ",\"queue_depth_events\":" << g_ship_buf.size() << ",\"queue_capacity_events\":" << MAX_QUEUE
+      << ",\"queue_high_water_events\":" << g_queue_high_water << ",\"last_push_http_status\":" << g_last_push_status
+      << ",\"last_success_at\":" << (unsigned long)g_last_success_at << ",\"consecutive_failures\":" << g_consecutive_failures
+      << ",\"stats_samples_dropped_total\":" << ull_string(g_stats_dropped) << "},\"resources\":{"
+      << "\"cpu_user_seconds\":" << double_string(user_cpu) << ",\"cpu_system_seconds\":" << double_string(sys_cpu)
+      << ",\"cpu_percent_one_core\":" << double_string(cpu_pct) << ",\"rss_bytes\":" << rss
+      << ",\"virtual_bytes\":" << virt << ",\"open_fds\":" << count_open_fds() << ",\"threads\":" << threads
+      << "},\"limits\":{\"cpu_core\":" << cpu_core << ",\"address_space_bytes\":268435456"
+      << ",\"ship_rate_kbps\":" << g_ship_rate_kbps << ",\"http_body_max_bytes\":" << MAX_POST_BYTES
+      << ",\"ship_threads_max\":1,\"wsse_body_bytes\":" << g_wsse_body_bytes << "}}";
+  g_prev_capture_packets = g_capture_packets; g_prev_capture_bytes = g_capture_bytes;
+  g_prev_events_emitted = g_events_emitted; g_prev_events_in = g_events_in;
+  g_prev_events_pushed = g_events_pushed; g_prev_events_dropped = g_events_dropped;
+  g_prev_batches_pushed = g_batches_pushed; g_prev_batches_failed = g_batches_failed;
+  g_prev_bytes_pushed = g_bytes_pushed; g_prev_drop_queue = g_drop_queue;
+  g_prev_drop_hub = g_drop_hub; g_prev_drop_oversized = g_drop_oversized;
+  g_prev_output_pipe_drops = g_output_pipe_drops;
+  g_stats_last_cpu = cpu_total; g_stats_last_at = now;
+  return out.str();
+}
+
+static void send_agent_stats(int fd, size_t flows_active,
+                             size_t pending_requests,
+                             size_t wsse_body_flows) {
+  std::string body = agent_stats_body(fd, flows_active, pending_requests,
+                                      wsse_body_flows);
+  if (body.size() > MAX_STATS_BYTES ||
+      !post_body(g_endpoint, "/api/agent/stats", body, 2)) {
+    ++g_stats_dropped;
+  }
+}
+
+static bool write_nonblocking_line(const std::string &line) {
+  if (line.size() + 1 > PIPE_BUF) {
+    ++g_output_pipe_drops;
+    return true;
+  }
+  std::string framed = line + "\n";
+  ssize_t written;
+  do { written = write(STDOUT_FILENO, framed.data(), framed.size()); }
+  while (written < 0 && errno == EINTR && g_running);
+  if (written == (ssize_t)framed.size()) return true;
+  if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    ++g_output_pipe_drops;
+    return true;
+  }
+  if (written < 0 && errno == EPIPE) {
+    logmsg("shipper pipe closed; stopping capture for supervised restart");
+  } else {
+    logmsg("shipper pipe write failed; stopping capture for supervised restart");
+  }
+  g_running = 0;
+  return false;
+}
+
+static void emit_capture_stats_internal(int fd, size_t flows_active,
+                                        size_t pending_requests,
+                                        size_t wsse_body_flows) {
+  std::string full = agent_stats_body(fd, flows_active, pending_requests,
+                                      wsse_body_flows);
+  const std::string marker = "\"capture\":";
+  size_t start = full.find(marker);
+  size_t end = full.find(",\"shipping\":", start);
+  if (start == std::string::npos || end == std::string::npos) {
+    ++g_output_pipe_drops;
+    return;
+  }
+  start += marker.size();
+  write_nonblocking_line("{\"_nt_internal\":\"capture_stats_v1\",\"capture\":" +
+                         full.substr(start, end - start) + "}");
+}
+
+static int run_stats_fixture() {
+  g_ship_node = "fixture-node";
+  g_instance_id = "fixture-1";
+  g_stats_last_at = wall_seconds() - 30.0;
+  g_capture_packets = 100;
+  g_capture_bytes = 6400;
+  g_events_emitted = g_events_in = 10;
+  g_events_pushed = 8;
+  g_events_dropped = g_drop_queue = 2;
+  std::string body = agent_stats_body(-1, 3, 2, 1);
+  if (body.size() > MAX_STATS_BYTES) return 40;
+  if (body.find("\"type\":\"agent_stats\"") == std::string::npos) return 41;
+  if (body.find("\"drop_percent\":20.0000") == std::string::npos) return 42;
+  if (body.find("\"mode\":\"cpp\"") == std::string::npos) return 43;
+  std::cout << body << "\n";
+  return 0;
 }
 
 static void emit_event(const Event &e) {
@@ -681,14 +921,19 @@ static void emit_event(const Event &e) {
   if (e.has_duration) ss << ",\"duration_ms\":" << e.duration_ms; else ss << ",\"duration_ms\":null";
   if (e.has_resp) ss << ",\"resp_bytes\":" << e.resp_bytes; else ss << ",\"resp_bytes\":null";
   ss << "}";
+  ++g_events_emitted;
 
   if (!g_endpoint.empty()) {
+    ++g_events_in;
     if (g_ship_buf.size() >= MAX_QUEUE) {
       g_ship_buf.erase(g_ship_buf.begin());
+      ++g_events_dropped;
+      ++g_drop_queue;
     }
     g_ship_buf.push_back(ss.str());
+    if (g_ship_buf.size() > g_queue_high_water) g_queue_high_water = g_ship_buf.size();
   } else {
-    std::cout << ss.str() << "\n";
+    write_nonblocking_line(ss.str());
   }
 }
 
@@ -768,7 +1013,6 @@ static size_t find_http_start(const std::string &s) {
 }
 
 static bool g_monitored_ports[65536];
-static size_t g_wsse_body_bytes = 0;
 
 static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
                           uint32_t d_ip, unsigned dport,
@@ -1275,6 +1519,7 @@ static int run_capability_probe(const std::string &iface,
   MmapRing ring;
   int fd = open_capture_socket(iface, ports, ring);
   if (fd < 0) return 2;
+
   bool released = release_mmap_ring(fd, ring);
   close(fd);
   if (!released) {
@@ -1290,6 +1535,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--dual-auth-fixture")) return run_dual_auth_fixture();
   if (argc > 1 && !strcmp(argv[1], "--ring-fixture")) return run_ring_fixture();
   if (argc > 1 && !strcmp(argv[1], "--ship-rate-fixture")) return run_ship_rate_fixture();
+  if (argc > 1 && !strcmp(argv[1], "--stats-fixture")) return run_stats_fixture();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
   std::string endpoint;
   bool capability_probe = false;
@@ -1299,6 +1545,8 @@ int main(int argc, char **argv) {
   }
   const char *rate_env = getenv("NT_SHIP_RATE_KBPS");
   if (rate_env && *rate_env) g_ship_rate_kbps = (unsigned)atoi(rate_env);
+  const char *stats_env = getenv("NT_STATS_INTERVAL_SEC");
+  if (stats_env && *stats_env) g_stats_interval_sec = (unsigned)atoi(stats_env);
   for (i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i];
     else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
@@ -1309,6 +1557,7 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(argv[i], "--endpoint") && i + 1 < argc) endpoint = argv[++i];
     else if (!strcmp(argv[i], "--ship-rate-kbps") && i + 1 < argc) g_ship_rate_kbps = (unsigned)atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--stats-interval-sec") && i + 1 < argc) g_stats_interval_sec = (unsigned)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--capability-probe")) capability_probe = true;
     else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i; /* ignored: 0 disk write */
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
@@ -1318,7 +1567,7 @@ int main(int argc, char **argv) {
       }
     }
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [-j workers] [--wsse-body-bytes 0..65536]\n");
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..300] [-j workers] [--wsse-body-bytes 0..65536]\n");
       return 0;
     }
     else { fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
@@ -1326,6 +1575,10 @@ int main(int argc, char **argv) {
   if (ports.empty()) { ports.push_back(80); ports.push_back(8003); ports.push_back(8005); ports.push_back(8007); ports.push_back(8009); ports.push_back(8010); ports.push_back(8011); }
   if (g_ship_rate_kbps < 64 || g_ship_rate_kbps > 10000) {
     fprintf(stderr, "ship rate must be in range 64..10000 kbit/s\n");
+    return 2;
+  }
+  if (g_stats_interval_sec < 10 || g_stats_interval_sec > 300) {
+    fprintf(stderr, "stats interval must be in range 10..300 seconds\n");
     return 2;
   }
   if (ports.size() > MAX_PORTS) {
@@ -1351,10 +1604,24 @@ int main(int argc, char **argv) {
 
   g_endpoint = endpoint;
   g_ship_node = node;
+  g_instance_id = number_string((size_t)time(NULL)) + "-" + number_string((size_t)getpid());
+  g_stats_last_at = wall_seconds();
 
   MmapRing ring;
   int fd = open_capture_socket(iface, ports, ring);
   if (fd < 0) return 2;
+
+  if (g_endpoint.empty()) {
+    int output_flags = fcntl(STDOUT_FILENO, F_GETFL, 0);
+    if (output_flags < 0 ||
+        fcntl(STDOUT_FILENO, F_SETFL, output_flags | O_NONBLOCK) < 0) {
+      logmsg("cannot make shipper pipe non-blocking; refusing unsafe pipeline");
+      release_mmap_ring(fd, ring);
+      close(fd);
+      return 2;
+    }
+    signal(SIGPIPE, SIG_IGN);
+  }
 
   signal(SIGTERM, stop_signal);
   signal(SIGINT, stop_signal);
@@ -1368,6 +1635,8 @@ int main(int argc, char **argv) {
   }
   if (!g_endpoint.empty()) {
     logmsg("single-binary in-memory mode: shipping directly to " + g_endpoint + " (0 disk I/O)");
+  } else {
+    logmsg("non-blocking native pipeline mode enabled; WAN I/O isolated in nt-ship-cpp");
   }
   logmsg("listening");
 
@@ -1405,12 +1674,15 @@ int main(int argc, char **argv) {
             __sync_synchronize();
             volatile_hdr->tp_status = TP_STATUS_KERNEL;
             ring_integrity_failure = true;
+            ++g_invalid_frames;
             g_running = 0;
             logmsg("invalid TPACKET_V2 frame metadata; stopping capture");
             break;
           }
           if (packet_length > 0) {
             const unsigned char *pkt = frame_ptr + packet_offset;
+            ++g_capture_packets;
+            g_capture_bytes += packet_length;
             handle_packet(pkt, packet_length, node, ports, flows, pending);
           }
 
@@ -1434,6 +1706,17 @@ int main(int argc, char **argv) {
         last_flush = now;
       }
     }
+    if (wall_seconds() - g_stats_last_at >= g_stats_interval_sec) {
+      size_t pending_count = 0, wsse_count = 0;
+      for (std::map<PacketKey, std::vector<Pending> >::iterator pi = pending.begin(); pi != pending.end(); ++pi)
+        pending_count += pi->second.size();
+      for (std::map<FlowKey, Flow>::iterator fi = flows.begin(); fi != flows.end(); ++fi)
+        if (fi->second.awaiting_body) ++wsse_count;
+      if (!g_endpoint.empty())
+        send_agent_stats(fd, flows.size(), pending_count, wsse_count);
+      else
+        emit_capture_stats_internal(fd, flows.size(), pending_count, wsse_count);
+    }
   }
 
   /* A response is optional enrichment. Preserve requests still awaiting a
@@ -1444,16 +1727,14 @@ int main(int argc, char **argv) {
 
   if (!g_endpoint.empty() && !g_ship_buf.empty()) {
     send_batches(g_endpoint, g_ship_node, &g_ship_buf, true);
+  } else if (g_endpoint.empty()) {
+    size_t pending_count = 0;
+    emit_capture_stats_internal(fd, 0, pending_count, 0);
   }
 
-  struct tpacket_stats packet_stats;
-  socklen_t packet_stats_len = sizeof(packet_stats);
-  memset(&packet_stats, 0, sizeof(packet_stats));
-  if (getsockopt(fd, SOL_PACKET, PACKET_STATISTICS,
-                 &packet_stats, &packet_stats_len) == 0) {
-    logmsg("packet stats: received=" + number_string(packet_stats.tp_packets) +
-           " dropped=" + number_string(packet_stats.tp_drops));
-  }
+  update_kernel_drops(fd);
+  logmsg("packet stats: received=" + ull_string(g_capture_packets) +
+         " dropped=" + ull_string(g_kernel_drops));
   if (!release_mmap_ring(fd, ring)) {
     logmsg("TPACKET_V2 cleanup failed");
     ring_integrity_failure = true;

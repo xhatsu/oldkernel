@@ -66,6 +66,7 @@ curl -sSf http://10.0.0.10:41000/oldkernel/install-firstrun-el68.sh \
 | `--cpu N` | Pin the complete runtime tree to this one allowed logical CPU. |
 | `--ship-threads N` | Set Python Hub poster threads in `1..8` (default 4); this does not add CPU cores. |
 | `--ship-rate-kbps N` | Bound aggregate Hub application-payload uploads to `64..10000` kbit/s (default 1024). |
+| `--stats-interval-sec N` | Post bounded agent health statistics every `10..300` seconds (default 30). |
 | `--control-token-file FILE` | Read a control token from a protected file instead of putting it in shell history. |
 | `--offline` | Require a local or embedded kit and prohibit fallback downloads; recommended for Ansible. |
 
@@ -86,14 +87,14 @@ nt-resource-guard.sh
         -> nt-sniff.py | nt-ship.py
 ```
 
-C++ mode uses the same guard and supervisor, but `nt-sniff-cpp` captures and
-ships events directly:
+C++ mode uses the same guard and supervisor with native capture and shipping
+separated by a pipe:
 
 ```text
 nt-resource-guard.sh
   -> nt-supervise.sh
      -> nt-resource-guard.sh
-        -> nt-sniff-cpp --endpoint configured-Hub-URL
+        -> nt-sniff-cpp | nt-ship-cpp --endpoint configured-Hub-URL
 ```
 
 The installed service is `/etc/init.d/networktracing-legacy`. Installed files
@@ -124,6 +125,9 @@ The installer refuses to start an unsafe configuration:
   length is bounds-checked before packet parsing.
 - The complete supervisor and worker tree is pinned to one allowed logical
   CPU and runs under `SCHED_IDLE` at nice level 19, below normal host work.
+- Each executable enters the guard again after `su` switches to `ntsniff`.
+  This prevents PAM implementations that reset inherited rlimits from
+  weakening the final unprivileged process boundary.
 - Hard limits are 256 MiB virtual address space, 8 MiB stack, 64 KiB locked
   memory, 1,024 file descriptors, 32 MiB per regular output file, no core
   dumps, and 64 processes when the target `/bin/sh` supports `ulimit -u`.
@@ -238,11 +242,13 @@ sudo NT_CAPTURE_MODE=cpp \
   sh install-oldkernel.sh --server http://10.0.0.10:42000
 ```
 
-The installer compiles `nt-sniff-cpp` and `nt-ship-cpp`, grants the capture
-binary only `CAP_NET_RAW`, verifies it as `ntsniff`, and starts the native
-single-binary capture-and-ship path. `nt-ship-cpp` is still built for fixture
-and compatibility use, but the installed native service ships from
-`nt-sniff-cpp` directly.
+The installer compiles `nt-sniff-cpp` and `nt-ship-cpp`, grants only the
+capture binary `CAP_NET_RAW`, verifies it as `ntsniff`, and starts
+`nt-sniff-cpp | nt-ship-cpp`. Capture stdout is nonblocking and each event is
+one atomic pipe write no larger than `PIPE_BUF`; excess output is counted and
+dropped instead of blocking ring drainage. The shipper main thread drains the
+pipe into a 4,000-event queue while one bounded-stack uploader thread performs
+HTTP. Both processes remain under the same one-core guard.
 
 ### 4.3 SOAP WSSE username capture
 
@@ -353,6 +359,7 @@ where both forms exist.
 | `--cpu N` | No | Select one allowed logical CPU; overrides `NT_CPU_CORE`. |
 | `--ship-threads N` | No | Set Python poster threads to `1..8`; default 4. |
 | `--ship-rate-kbps N` | No | Hard application-payload egress ceiling for both modes, `64..10000` kbit/s; default 1024. |
+| `--stats-interval-sec N` | No | Agent statistics interval in `10..300` seconds; default 30. Statistics use the same Hub and egress budget. |
 | `--control-token-file FILE` | No | Read a 1–4096 byte control token without putting it in shell history. |
 | `--offline` | No | Use only the local or embedded kit and fail if it is incomplete. No fallback download is attempted. |
 | `--install` | No | Explicitly select installation; installation is already the default. |
@@ -377,6 +384,7 @@ For fleet deployment, use the checksum-controlled offline procedure in
 | `NT_WORKERS` | `1` | Accepted for compatibility but forcibly reset to `1` by the safety boundary. |
 | `NT_SHIP_THREADS` | `4` | Python Hub poster threads, internally clamped to `1..8`. |
 | `NT_SHIP_RATE_KBPS` | `1024` | Aggregate shipper application-payload ceiling, clamped to `64..10000` kbit/s. |
+| `NT_STATS_INTERVAL_SEC` | `30` | Interval for `POST /api/agent/stats`, clamped to `10..300` seconds. |
 | `NT_HUB` | Empty | Same bootstrap-kit purpose as `--hub`; it is not the ingest endpoint. |
 | `NT_CONTROL_TOKEN` | Empty | One-time control token written to the protected token file during installation. |
 
@@ -441,7 +449,8 @@ sudo service networktracing-legacy start
 The current Python and C++ shipping paths use bounded in-memory queues and
 drop events when the Hub is unavailable. Although `--spool` is accepted by
 compatibility launchers, current implementations do not persist failed events
-to disk.
+to disk. Native Hub failures use exponential retry spacing up to 60 seconds;
+queue pressure and pipe pressure are visible in agent statistics.
 
 ## 9. Verify a running installation
 
@@ -604,14 +613,15 @@ nt-sniff-cpp [-i IFACE] [-p PORTS] [--endpoint URL]
 |---|---|
 | `-i IFACE` | Bind capture to one interface. |
 | `-p PORTS` | Accept comma-separated ports or multiple port arguments. |
-| `--endpoint URL` | Enable native in-memory batching and POST directly to `URL/api/ingest`. Without it, events are written as JSONL to stdout. |
+| `--endpoint URL` | Enable native in-memory batching to `URL/api/ingest` and health reports to `URL/api/agent/stats`. Without it, events are written as JSONL to stdout. |
+| `--stats-interval-sec N` | Native agent-statistics interval, `10..300` seconds. |
 | `--wsse-body-bytes N` | Bounded native SOAP prefix window. |
 | `-j WORKERS` | Compatibility option; only `1` is accepted. |
 | `--spool PATH` | Accepted for compatibility but ignored; native shipping remains in-memory. |
 | `-h`, `--help` | Print usage. |
 
 `--fixture`, `--wsse-fixture`, `--dual-auth-fixture`, `--ring-fixture`,
-`--ship-rate-fixture`, and `--capability-probe` are
+`--ship-rate-fixture`, `--stats-fixture`, and `--capability-probe` are
 internal validation actions, not production capture modes. The capability
 probe exercises the configured BPF, interface bind, complete V2 ring lifecycle,
 and capability drop rather than merely opening a raw socket.
@@ -633,18 +643,37 @@ python nt-ship.py --endpoint URL [--spool PATH]
 the pending batch queue is small, and excess events are dropped rather than
 building a later network burst.
 
+Before creating poster threads, Python requests a 256 KiB thread stack with
+`threading.stack_size(262144)`. This avoids glibc's much larger default virtual
+stack reservation exhausting the guard's 256 MiB address-space limit on
+64-bit Python 2.6. If the runtime refuses the setting, the shipper logs a
+warning and its existing adaptive thread-start logic uses only the threads it
+can safely create.
+
+Python capture emits bounded internal counter records into the existing pipe;
+the shipper consumes those records and posts the merged v1 document to
+`/api/agent/stats`. Internal records never enter `/api/ingest`. At most one
+unsent statistics sample is retained, and a newer sample replaces it. The full
+server contract and field definitions are in `AGENT-STATS-PROTOCOL.md`.
+
 ### 11.4 `nt-ship-cpp`
 
 ```text
 nt-ship-cpp --endpoint URL
 ```
 
-It reads JSONL from stdin, batches up to 400 events, and posts to the Hub.
-`--spool PATH` is accepted but ignored. `NT_NODE_NAME` overrides the hostname.
+It continuously reads JSONL from stdin into a 4,000-event bounded queue,
+batches up to 400 events, and posts to the Hub from one 512 KiB-stack uploader
+thread. `--ship-rate-kbps` limits aggregate payload egress and
+`--stats-interval-sec` accepts `10..300`. It consumes native capture-stat
+records and posts the merged v1 sample to `/api/agent/stats`; those records
+never enter `/api/ingest`. `--spool PATH` is accepted but ignored.
+`NT_NODE_NAME` overrides the hostname. Unexpected stdin EOF exits nonzero so
+the supervisor restarts the complete pipeline.
 
 ### 11.5 `nt-run-cpp.sh`
 
-This compatibility launcher pipes `nt-sniff-cpp` into the Python shipper:
+This launcher pipes `nt-sniff-cpp` into `nt-ship-cpp`:
 
 ```sh
 NT_HUB_ENDPOINT=http://10.0.0.10:42000 \
@@ -653,8 +682,9 @@ NT_HUB_ENDPOINT=http://10.0.0.10:42000 \
 
 | Variable | Meaning |
 |---|---|
-| `NT_HUB_ENDPOINT` | Required Hub URL passed to `nt-ship.py`. |
-| `NT_SPOOL` | Compatibility spool path passed to `nt-ship.py`; current shipping remains in-memory. |
+| `NT_HUB_ENDPOINT` | Required Hub URL passed to `nt-ship-cpp`. |
+| `NT_SHIP_RATE_KBPS` | Aggregate native upload limit, `64..10000` kbit/s. |
+| `NT_STATS_INTERVAL_SEC` | Health interval, `10..300` seconds. |
 
 This launcher does not add the production supervisor or resource guard by
 itself.

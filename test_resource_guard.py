@@ -58,6 +58,16 @@ def test_installer_routes_service_through_guard():
     assert 'chrt -i 0 nice -n 19' in installer
 
 
+def test_generated_init_defers_runtime_expansions_and_waits_for_el6():
+    with open(INSTALLER, "r") as src:
+        installer = src.read()
+    assert 'supervisor=\\$(cat "\\$PIDFILE" 2>/dev/null || true)' in installer
+    assert '_sw=\\$((_sw + 1))' in installer
+    assert 'echo "\\$supervisor_pid" > "\\$PIDFILE"' in installer
+    startup = installer.split('echo "\\$supervisor_pid" > "\\$PIDFILE"', 1)[1]
+    assert "sleep 3" in startup.split("if ! pgrep", 1)[0]
+
+
 def test_supervisor_opens_circuit_after_five_fast_crashes(tmp_path):
     fake_guard = tmp_path / "guard.sh"
     fake_sleep = tmp_path / "sleep"
@@ -149,10 +159,19 @@ def test_installer_applies_egress_limit_to_both_modes():
     assert 'SHIP_RATE_KBPS="${NT_SHIP_RATE_KBPS:-1024}"' in installer
 
 
+def test_installer_enables_bounded_agent_stats_for_both_modes():
+    with open(INSTALLER, "r") as src:
+        installer = src.read()
+    assert 'STATS_INTERVAL_SEC="${NT_STATS_INTERVAL_SEC:-30}"' in installer
+    assert "export NT_STATS_INTERVAL_SEC=$STATS_INTERVAL_SEC" in installer
+    assert "--stats-interval-sec $STATS_INTERVAL_SEC" in installer
+    assert "/api/agent/stats" in installer
+
+
 def test_both_shipping_modes_have_hard_egress_bounds():
     with open(os.path.join(HERE, "nt-ship.py"), "r") as src:
         python_ship = src.read()
-    with open(os.path.join(HERE, "nt-sniff-cpp.cpp"), "r") as src:
+    with open(os.path.join(HERE, "nt-ship-cpp.cpp"), "r") as src:
         native = src.read()
     assert "MAX_POST_BYTES = 65536" in python_ship
     assert "RateLimiter" in python_ship
@@ -160,3 +179,27 @@ def test_both_shipping_modes_have_hard_egress_bounds():
     assert "MAX_POST_BYTES = 65536" in native
     assert "pace_upload" in native
     assert "--limit-rate" in native
+
+
+def test_native_installer_uses_nonblocking_two_process_pipeline():
+    with open(INSTALLER, "r") as src:
+        installer = src.read()
+    with open(os.path.join(HERE, "nt-sniff-cpp.cpp"), "r") as src:
+        sniffer = src.read()
+    with open(os.path.join(HERE, "nt-ship-cpp.cpp"), "r") as src:
+        shipper = src.read()
+    assert "nt-sniff-cpp -i" in installer and "nt-ship-cpp --endpoint" in installer
+    assert "nt-sniff-cpp -i $IFACE -p $PORTS --endpoint" not in installer
+    assert "O_NONBLOCK" in sniffer and "PIPE_BUF" in sniffer
+    assert "EAGAIN" in sniffer and "EPIPE" in sniffer
+    assert "MAX_QUEUE = 4000" in shipper and "pthread_create" in shipper
+    assert "capture input closed unexpectedly" in shipper
+
+
+def test_runtime_reapplies_limits_after_su_drops_privileges():
+    with open(INSTALLER, "r") as src:
+        installer = src.read()
+    assert "-c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp" in installer
+    assert "-c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp" in installer
+    assert "-c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw" in installer
+    assert "-c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE python -u $PREFIX/nt-ship.py" in installer

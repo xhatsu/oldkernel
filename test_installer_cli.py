@@ -14,7 +14,8 @@ def checked_env(tmp_path):
     env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
     for name in ("NT_IFACE", "NT_PORTS", "NT_CAPTURE_MODE",
                  "NT_WSSE_BODY_BYTES", "NT_CPU_CORE", "NT_SHIP_THREADS",
-                 "NT_SHIP_RATE_KBPS", "NT_HUB", "NT_CONTROL_TOKEN"):
+                 "NT_SHIP_RATE_KBPS", "NT_STATS_INTERVAL_SEC", "NT_HUB",
+                 "NT_CONTROL_TOKEN"):
         env.pop(name, None)
     return env
 
@@ -25,6 +26,7 @@ def test_server_url_and_friendly_flags_reach_preflight(tmp_path):
         "--ports", "80,8001,8080", "--mode", "python",
         "--wsse-bytes", "16384", "--ship-threads", "4", "--offline",
         "--ship-rate-kbps", "512",
+        "--stats-interval-sec", "60",
         "--check"],
         env=checked_env(tmp_path), text=True, capture_output=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -54,6 +56,8 @@ def test_invalid_friendly_values_fail_before_preflight(tmp_path):
         ("--server", "http://hub:43123", "--ship-threads", "9"),
         ("--server", "http://hub:43123", "--ship-rate-kbps", "63"),
         ("--server", "http://hub:43123", "--ship-rate-kbps", "10001"),
+        ("--server", "http://hub:43123", "--stats-interval-sec", "9"),
+        ("--server", "http://hub:43123", "--stats-interval-sec", "301"),
         ("--server", "http://hub:43123", "--ports", too_many_ports),
     )
     for args in bad_args:
@@ -73,3 +77,4 @@ def test_missing_option_value_and_help():
     assert "--server URL" in help_result.stdout
     assert "--offline" in help_result.stdout
     assert "--ship-rate-kbps" in help_result.stdout
+    assert "--stats-interval-sec" in help_result.stdout

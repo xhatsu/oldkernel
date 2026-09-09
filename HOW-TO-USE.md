@@ -45,8 +45,8 @@ The Oldkernel agent captures L7 HTTP/SOAP traffic using native Linux `AF_PACKET`
 │       ▼                                                                │
 │  nt-supervise.sh (Process supervisor & respawn loop)                   │
 │       │                                                                │
-│       ├─► [C++ Mode]: nt-sniff-cpp (Zero-copy TPACKET_V2 RX Ring)      │
-│       │               └─► Direct HTTP Keep-Alive Poster                │
+│       ├─► [C++ Mode]: nt-sniff-cpp ──(nonblocking pipe)─► nt-ship-cpp │
+│       │               (TPACKET_V2 RX)                  (1 uploader)   │
 │       │                                                                │
 │       └─► [Python Mode]: nt-sniff.py ──(stdout)──► nt-ship.py          │
 │                          (Single-worker cBPF)      (8 poster threads)  │
@@ -54,7 +54,7 @@ The Oldkernel agent captures L7 HTTP/SOAP traffic using native Linux `AF_PACKET`
                                        │
                                POST /api/ingest
                                        ▼
-                       Telemetry Hub (http://<hub>:30102)
+                       Telemetry Hub (configured URL)
 ```
 
 ### Recent Hardening & Architecture Updates
@@ -197,6 +197,7 @@ All parameters can be passed as CLI arguments or configured through environment 
 | `--cpu N` | `NT_CPU_CORE` | Installer CPU | Integer logical core | Pins supervisor and sniffer processes to a single logical CPU core using `taskset -c N`. |
 | `--ship-threads N` | `NT_SHIP_THREADS` | `4` | `1..8` | Bounded concurrent shipping threads for Python mode (`nt-ship.py`). |
 | `--ship-rate-kbps N` | `NT_SHIP_RATE_KBPS` | `1024` | `64..10000` | Aggregate application-payload upload ceiling for either capture mode. Each HTTP body is also capped at 64 KiB. |
+| `--stats-interval-sec N` | `NT_STATS_INTERVAL_SEC` | `30` | `10..300` | Interval for bounded health reports to the same Hub at `/api/agent/stats`. |
 | `--control-token-file FILE` | `NT_CONTROL_TOKEN` | Empty | Path to readable file | File containing a shared secret token for remote control operations (`nt-control.py`). |
 | `--offline` | `ALLOW_KIT_FETCH=0` | False | Flag | Disables external kit downloads; forces 100% extraction from embedded payloads. |
 | `--check` | — | False | Flag | Dry-run audit mode: performs all preflight checks without modifying the system. |
@@ -212,9 +213,9 @@ All parameters can be passed as CLI arguments or configured through environment 
 
 The C++ engine is compiled against standard C++03 and libc 2.12 (CentOS 6.x default):
 - **Zero-Copy TPACKET_V2 RX Ring**: Direct kernel ring memory map (4MB, 2048 frames). Drops syscall overhead.
-- **In-Process Shipping**: Ships directly to the Hub over HTTP 1.1 Keep-Alive sockets without piping to a second process.
-- **Resource Footprint**: < 20MB RSS memory and < 5% CPU even under heavy network load.
-- **Crash Immunity**: Strict frame integrity validation, single-worker safety, and a bounded in-memory queue (4,000 events max) with drop-on-overload behavior.
+- **Separated Native Shipping**: `nt-sniff-cpp | nt-ship-cpp` keeps WAN latency out of the capture loop. Only the sniffer has `CAP_NET_RAW`.
+- **Bounded Resource Footprint**: The shipper queue is capped at 4,000 events and its single uploader thread requests a 512 KiB stack; the complete tree remains inside the one-core/256 MiB guard.
+- **Fail-Safe Overload Behavior**: Strict frame validation, single-worker capture, nonblocking atomic pipe output, bounded queues, rate limiting, and drop-on-overload behavior prevent capture from waiting on Hub I/O.
 
 **To install in C++ mode:**
 ```sh
@@ -373,6 +374,8 @@ sh oldkernel/el68-smoke.sh
 #### Q4: What happens if the Hub becomes unreachable?
 **A**: 
 - In C++ mode, events are buffered in memory up to `MAX_QUEUE=4000`. Once full, the oldest events are dropped to protect host memory.
+  The sniffer also drops an event if the nonblocking pipe is full or the JSONL
+  record exceeds `PIPE_BUF`; `output_pipe_drops_*` reports this condition.
 - In Python mode, `nt-ship.py` uses a small bounded in-memory queue and drops
   events on Hub failure or overload. `--spool` remains accepted only for
   compatibility and does not create a disk retry backlog.

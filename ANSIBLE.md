@@ -41,6 +41,7 @@ nt_capture_mode: "cpp"
 nt_wsse_bytes: "16384"
 nt_ship_threads: "4"
 nt_ship_rate_kbps: "1024"
+nt_stats_interval_sec: "30"
 ```
 
 Do not put secrets in these variables unless Ansible Vault protects them.
@@ -93,6 +94,7 @@ not healthy, and rolls through ten percent of the fleet at a time:
           wsse_bytes={{ nt_wsse_bytes }}
           ship_threads={{ nt_ship_threads }}
           ship_rate_kbps={{ nt_ship_rate_kbps }}
+          stats_interval_sec={{ nt_stats_interval_sec }}
       register: nt_desired_copy
 
     - name: Inspect deployed configuration stamp
@@ -146,6 +148,8 @@ not healthy, and rolls through ten percent of the fleet at a time:
           - "{{ nt_ship_threads }}"
           - --ship-rate-kbps
           - "{{ nt_ship_rate_kbps }}"
+          - --stats-interval-sec
+          - "{{ nt_stats_interval_sec }}"
       when: nt_install_required | bool
 
     - name: Record configuration only after successful installation

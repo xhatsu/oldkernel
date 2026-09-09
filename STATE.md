@@ -3,6 +3,82 @@
 
 # STATE.md — Current Project State & Memory
 
+## Native C++ Pipeline Isolation (2026-09-09)
+
+- Installed native mode now runs `nt-sniff-cpp | nt-ship-cpp` under the same
+  guard and supervisor. Only `nt-sniff-cpp` has `CAP_NET_RAW`.
+- Capture uses one atomic nonblocking write per JSONL record (maximum
+  `PIPE_BUF`). Full-pipe and oversized-record loss increments
+  `output_pipe_drops_total`; WAN latency can no longer block TPACKET_V2 ring
+  drainage.
+- `nt-ship-cpp` continuously drains stdin into a 4,000-event deque and uses one
+  512 KiB-stack pthread for bounded 64 KiB uploads. Hub failures back off up to
+  60 seconds; queue overflow drops oldest events. Unexpected capture EOF exits
+  74 so the five-crash supervisor circuit governs restart storms.
+- Native capture records are merged by the shipper into the existing v1
+  `/api/agent/stats` contract. Stats are coalesced and failed samples are not
+  rapidly retried.
+- A live `/proc` audit found that this host's `su`/PAM restores several rlimits
+  after the outer guard. Runtime commands now re-enter `nt-resource-guard.sh`
+  as `ntsniff` after `su`; capability probes use that same final boundary.
+- Final verification: 49 pytest tests passed; optimized C++03 builds and all
+  fixtures passed without warnings; ASAN+UBSAN fixtures passed with leak
+  detection disabled because LeakSanitizer cannot run under the container's
+  ptrace policy. Both sample PCAPs passed offline (247: 200/200 Python/C++;
+  249: 11,216/11,394). The privileged veth phase was unavailable in this
+  container. The regenerated one-file installer is 257,225 bytes.
+- The live service was upgraded using its existing configured Hub URL,
+  `enp0s6`, port 18080, CPU 0, 1024 kbit/s upload cap, 30-second stats, and
+  16,384-byte WSSE window. It remained stable beyond multiple stats windows.
+  `/proc` proves both processes are UID 997, CPU 0, SCHED_IDLE, 256 MiB address
+  space, 32 MiB file size, 8 MiB stack, 64 KiB locked memory, 1,024 FDs, and
+  zero core dumps. Native RSS was about 7.5 MiB capture plus 3.1 MiB shipper;
+  only `nt-sniff-cpp` had `cap_net_raw=ep`.
+- The installed native serializer's bounded stats fixture was POSTed to the
+  configured `/api/agent/stats`; the Hub returned HTTP success with
+  `{"ok":true,"accepted":true,"schema_version":1}`.
+
+## CentOS 6.8 Installer Reliability (2026-09-09)
+- Escaped the generated SysV service's PID-file command substitution and `_sw`
+  arithmetic expression so `set -u` cannot evaluate runtime-only variables
+  while the installer here-doc is being rendered.
+- Increased the bounded initial service verification delay from one to three
+  seconds for the guard -> supervisor -> `su` -> capture startup path.
+- Python shipping now requests a 262,144-byte stack before creating poster
+  threads. Unsupported settings warn and retain adaptive partial thread
+  startup rather than weakening the 256 MiB address-space guard.
+- The real resource guard successfully started eight poster-style Python 3
+  threads plus the main thread at 225,444 KiB virtual size and 16,868 KiB RSS,
+  pinned to CPU 0. This reproduces the tight virtual-memory condition while
+  remaining below the 262,144 KiB ceiling; production defaults to four.
+- The corrected bundle was installed locally. Its generated init script
+  retained the runtime expressions literally; stop removed the supervisor,
+  capture process, and PID file, and the independent three-second start check
+  brought the guarded service back successfully.
+
+## Agent Statistics Reporting (2026-09-09)
+- Defined `POST /api/agent/stats` on the exact configured Hub base URL; it uses
+  no fixed port and remains separate from `/api/ingest` request events.
+- `AGENT-STATS-PROTOCOL.md` defines the versioned payload, cumulative and
+  interval capture/shipping counters, kernel and shipping drop rates, push
+  rates, bounded resource gauges, safety-limit reporting, idempotency, and
+  low-cardinality server metric mappings.
+- Python capture now sends bounded internal snapshots through its existing
+  pipe; the shipper intercepts and merges shipping/resource data without
+  forwarding internal records to normal ingest. Native C++03 builds the same
+  v1 payload in-process.
+- Delivery is one 16 KiB maximum coalesced sample every 30 seconds by default,
+  sharing the existing bandwidth budget with no disk retry backlog. Installer
+  option `--stats-interval-sec` validates `10..300` seconds.
+- Live endpoint verification against `http://129.150.59.233:30102` returned
+  HTTP 200 with `accepted:true` for the contract fixture, actual Python shipper
+  serialization, and actual C++03 serializer output.
+- The local installed native service was upgraded with the guarded bundle and
+  exercised against that Hub. Its real periodic sample reached sequence 15
+  with status `ok`, zero capture/shipping drops, one thread, about 7.5 MiB RSS,
+  CPU affinity 0, and SCHED_IDLE. After the accelerated 10-second test, the
+  running service was restored to the 30-second production interval.
+
 ## Strict TPACKET_V2 Hardening (2026-09-09)
 - Python and native shipping now have an always-on aggregate egress scheduler,
   a 64 KiB HTTP-body ceiling, and a bounded drop-on-overload queue. Installer
@@ -47,12 +123,13 @@
 - Current behavior is explicit: `NT_WORKERS` is forced to one, C++ native mode
   ships directly, and accepted `--spool` parameters do not enable disk spooling
   in the present bounded in-memory implementations.
-- Verification after egress, CLI, ring, and dual-identity hardening: all 42
-  non-PCAP pytest tests, native optimized fixtures, ASAN/UBSAN edge tests, and
+- Verification after agent-stats, egress, CLI, ring, and dual-identity
+  hardening: all 47 non-PCAP pytest tests, native optimized fixtures,
+  ASAN/UBSAN edge tests, and
   the CentOS static runbook passed. Offline Python/C++ processing retained the
   established sample-PCAP event counts: 200/200 and 11,216/11,394, with native
   secret-scrubbing checks passing. The self-contained bundle was rebuilt at
-  197,430 bytes.
+  234,086 bytes.
 - Added an Ansible fleet design that copies one checksum-controlled embedded
   bundle from the controller, uses `command.argv`, deploys in rolling batches,
   and records configuration only after a successful install. New `--offline`

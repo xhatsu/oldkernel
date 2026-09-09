@@ -36,10 +36,19 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
    Five short crashes open the supervisor circuit to prevent restart storms.
    Installation must prove `AF_PACKET` access under `ntsniff`; after socket,
    BPF, and bind setup, capture processes must drop all capabilities.
+   Python poster threads must request a 256 KiB stack before creation so the
+   process remains viable under the 256 MiB virtual-address-space ceiling.
+   The generated SysV script must retain runtime PID/arithmetic expansions
+   literally and allow three seconds for the guarded EL6 process tree to start.
 8. **Shipping Egress Safety**: Both capture modes must enforce the validated
    `NT_SHIP_RATE_KBPS` aggregate application-payload ceiling (`64..10000`,
    default `1024`), cap encoded HTTP request bodies at 64 KiB, bound all
    in-memory queues, and drop excess events instead of accumulating retries.
+9. **Agent Statistics Contract**: Agent health telemetry uses the same exact
+   Hub base URL but the separate `POST /api/agent/stats` contract documented
+   in `AGENT-STATS-PROTOCOL.md`. It must share the existing egress budget,
+   remain bounded/coalesced, contain no captured identity or payload data, and
+   never enter the normal request-event stream.
    Both shipping modes must enforce the configured `64..10000` kbit/s
    application-payload ceiling (default 1024), cap each HTTP body at 64 KiB,
    and drop overload rather than create an unbounded queue or later burst.
@@ -51,6 +60,18 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
    network headers are not permitted. Monitored ports are capped at 30 so all
    classic-BPF 8-bit branch offsets remain representable. `PACKET_FANOUT` is
    not permitted; both capture engines must reject worker counts other than 1.
+10. **Native Pipeline Isolation**: Installed C++ mode is
+   `nt-sniff-cpp | nt-ship-cpp`. Capture stdout is nonblocking and emitted in
+   atomic records no larger than `PIPE_BUF`; pipe pressure drops and counts an
+   event rather than blocking TPACKET_V2 drainage. The shipper has a bounded
+   4,000-event queue and one 512 KiB-stack uploader thread. Only the sniffer
+   binary carries `CAP_NET_RAW`; unexpected pipe closure restarts the complete
+   supervised pipeline.
+11. **Post-Privilege Limits**: Every capture and ship executable must enter
+   `nt-resource-guard.sh` again after `su` changes to `ntsniff`, because PAM may
+   reset root-applied rlimits during session setup. The outer guard remains the
+   supervisor boundary; the inner guard proves the final unprivileged process
+   actually retains CPU scheduling and memory/file/process limits.
 
 ## WSSE Capture State (2026-09-08)
 - Both Python and C++03 capture are header-only by default. `NT_WSSE_BODY_BYTES` or

@@ -28,6 +28,9 @@ from xml.parsers import expat
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 ETH_P_VLAN = 0x8100
+SOL_PACKET = 263
+PACKET_STATISTICS = 6
+DEFAULT_STATS_INTERVAL = 30
 
 try:
     import nt_control
@@ -62,6 +65,15 @@ WSSE_NAMESPACES = set((
 def log(msg):
     sys.stderr.write("nt-sniff: %s\n" % msg)
     sys.stderr.flush()
+
+
+def stats_interval_seconds():
+    try:
+        value = int(os.environ.get("NT_STATS_INTERVAL_SEC",
+                                   str(DEFAULT_STATS_INTERVAL)))
+    except ValueError:
+        value = DEFAULT_STATS_INTERVAL
+    return max(10, min(value, 300))
 
 
 def drop_capture_capabilities():
@@ -871,6 +883,67 @@ def main():
 
     flows = {}
     running = [True]
+    stats_interval = stats_interval_seconds()
+    stats_state = {"packets_total": 0, "packet_bytes_total": 0,
+                   "events_emitted_total": 0, "kernel_drops_total": 0,
+                   "last_packets": 0, "last_packet_bytes": 0,
+                   "last_events": 0, "last_at": time.time()}
+
+    def write_events(items):
+        if not items:
+            return
+        w = sys.stdout.write
+        for item in items:
+            w(json.dumps(item) + "\n")
+        sys.stdout.flush()
+        stats_state["events_emitted_total"] += len(items)
+
+    def emit_capture_stats(force=False):
+        now = time.time()
+        elapsed = now - stats_state["last_at"]
+        if not force and elapsed < stats_interval:
+            return
+        dropped_delta = 0
+        try:
+            raw_stats = s.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8)
+            _, dropped_delta = struct.unpack("II", raw_stats[:8])
+        except (socket.error, struct.error):
+            dropped_delta = 0
+        stats_state["kernel_drops_total"] += dropped_delta
+        packets_delta = (stats_state["packets_total"] -
+                         stats_state["last_packets"])
+        bytes_delta = (stats_state["packet_bytes_total"] -
+                       stats_state["last_packet_bytes"])
+        events_delta = (stats_state["events_emitted_total"] -
+                        stats_state["last_events"])
+        waiting_wsse = 0
+        for flow in flows.values():
+            if flow.event is not None and flow.body_goal:
+                waiting_wsse += 1
+        pending_count = sum(len(items) for items in pending.values())
+        drop_pct = 100.0 * dropped_delta / max(1, packets_delta)
+        capture = {
+            "packets_total": stats_state["packets_total"],
+            "packets_delta": packets_delta,
+            "packet_bytes_total": stats_state["packet_bytes_total"],
+            "packet_bytes_delta": bytes_delta,
+            "kernel_drops_total": stats_state["kernel_drops_total"],
+            "kernel_drops_delta": dropped_delta,
+            "kernel_drop_percent": round(drop_pct, 4),
+            "invalid_frames_total": 0,
+            "events_emitted_total": stats_state["events_emitted_total"],
+            "events_emitted_delta": events_delta,
+            "flows_active": len(flows),
+            "pending_requests": pending_count,
+            "wsse_body_flows_active": waiting_wsse}
+        sys.stdout.write(json.dumps({"_nt_internal": "capture_stats_v1",
+                                     "capture": capture},
+                                    separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        stats_state["last_packets"] = stats_state["packets_total"]
+        stats_state["last_packet_bytes"] = stats_state["packet_bytes_total"]
+        stats_state["last_events"] = stats_state["events_emitted_total"]
+        stats_state["last_at"] = now
 
     def stop(signum, frame):
         running[0] = False
@@ -896,6 +969,7 @@ def main():
     dbg_rx = 0
     dbg_last = time.time()
     while running[0]:
+        emit_capture_stats()
         # Poll independently of socket idle time. A busy monitored interface
         # may never raise socket.timeout, but control changes must still apply.
         if control_client is not None and time.time() >= control_next:
@@ -919,6 +993,8 @@ def main():
         try:
             pkt = s.recv(65535)
             dbg_rx += 1
+            stats_state["packets_total"] += 1
+            stats_state["packet_bytes_total"] += len(pkt)
             if dbg and time.time() - dbg_last > 5:
                 log("DEBUG rx=%d" % dbg_rx)
                 dbg_last = time.time()
@@ -931,10 +1007,7 @@ def main():
                 out_s = []
                 sweep_idle(flows, now, out_s, pending)
                 sweep_pending(pending, now, out_s)
-                for ev in out_s:
-                    sys.stdout.write(json.dumps(ev) + "\n")
-                if out_s:
-                    sys.stdout.flush()
+                write_events(out_s)
                 last_sweep = now
             continue
         except socket.error as e:
@@ -992,28 +1065,20 @@ def main():
                            ports, node_host, out, pending, now,
                            wsse_body_bytes)
         if out:
-            w = sys.stdout.write
-            for ev in out:
-                w(json.dumps(ev) + "\n")
-            sys.stdout.flush()
+            write_events(out)
 
         if maintenance_due(now, last_sweep):
             out_s = []
             sweep_idle(flows, now, out_s, pending)
             sweep_pending(pending, now, out_s)
-            for ev in out_s:
-                sys.stdout.write(json.dumps(ev) + "\n")
-            if out_s:
-                sys.stdout.flush()
+            write_events(out_s)
             last_sweep = now
 
     out_s = []
     drain_incomplete_wsse(flows, out_s, pending, time.time())
     drain_pending(pending, out_s)
-    for ev in out_s:
-        sys.stdout.write(json.dumps(ev) + "\n")
-    if out_s:
-        sys.stdout.flush()
+    write_events(out_s)
+    emit_capture_stats(force=True)
     log("stopped (%d pending requests flushed)" % len(out_s))
 
 

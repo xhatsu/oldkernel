@@ -5,7 +5,7 @@ from pathlib import Path
 # 1. Test Sniffer under AddressSanitizer & UndefinedBehaviorSanitizer
 src_sniff = Path(__file__).with_name('nt-sniff-cpp.cpp')
 out_sniff = Path('/tmp/nt-sniff-cpp-edge-test')
-cmd_sniff = ['g++','-std=gnu++03','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(src_sniff),'-o',str(out_sniff)]
+cmd_sniff = ['g++','-std=gnu++03','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread',str(src_sniff),'-o',str(out_sniff)]
 r = subprocess.run(cmd_sniff, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 if r.returncode:
     print('Sniffer compile failed:', r.stderr); sys.exit(r.returncode)
@@ -49,10 +49,21 @@ rate = subprocess.run([str(out_sniff), '--ship-rate-fixture'],
 assert rate.returncode == 0, rate.stderr
 print('Native shipper 64 KiB batch ceiling fixture: PASS')
 
+stats = subprocess.run([str(out_sniff), '--stats-fixture'],
+                       text=True, capture_output=True)
+assert stats.returncode == 0, stats.stderr
+stats_body = json.loads(stats.stdout)
+assert stats_body['schema_version'] == 1
+assert stats_body['type'] == 'agent_stats'
+assert stats_body['mode'] == 'cpp'
+assert stats_body['shipping']['drop_percent'] == 20.0
+assert len(stats.stdout.encode('utf-8')) <= 16384
+print('Native agent statistics v1 fixture: PASS')
+
 # 2. Test Shipper under AddressSanitizer & UndefinedBehaviorSanitizer
 src_ship = Path(__file__).with_name('nt-ship-cpp.cpp')
 out_ship = Path('/tmp/nt-ship-cpp-edge-test')
-cmd_ship = ['g++','-std=gnu++03','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(src_ship),'-o',str(out_ship)]
+cmd_ship = ['g++','-std=gnu++03','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread',str(src_ship),'-o',str(out_ship)]
 r = subprocess.run(cmd_ship, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 if r.returncode:
     print('Shipper compile failed:', r.stderr); sys.exit(r.returncode)
@@ -65,6 +76,13 @@ bad_ship_rate = subprocess.run([str(out_ship), '--endpoint', 'http://127.0.0.1',
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True)
 assert bad_ship_rate.returncode == 2
-print('Shipper ASAN build & CLI: PASS')
+ship_stats = json.loads(subprocess.check_output(
+    [str(out_ship), '--stats-fixture'], text=True))
+assert ship_stats['schema_version'] == 1
+assert ship_stats['type'] == 'agent_stats' and ship_stats['mode'] == 'cpp'
+assert ship_stats['shipping']['drop_percent'] == 20.0
+assert ship_stats['limits']['wsse_body_bytes'] == 8192
+assert len(json.dumps(ship_stats, separators=(',', ':')).encode('utf-8')) <= 16384
+print('Shipper bounded egress and statistics fixtures: PASS')
 
 print('ALL CPP EDGE TESTS PASSED')

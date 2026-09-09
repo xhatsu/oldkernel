@@ -68,7 +68,7 @@ Optional settings remain flags on that command, for example
  │              │                                                          │
  │              ▼  (UNIX Pipe)                                             │
  │        nt-ship.py / nt-ship-cpp                                         │
- │        · Multi-threaded batching (≤400 events / 5 s flush interval)     │
+ │        · Bounded batching (≤400 events / 5 s flush interval)            │
  │        · POST {node, events[]} ──► Hub /api/ingest                      │
  │        · Bounded in-memory queue; drops safely while Hub is unavailable │
  │                                                                         │
@@ -230,6 +230,15 @@ Both shipping modes enforce an aggregate application egress ceiling of 1024
 kbit/s by default and cap HTTP request bodies at 64 KiB. Override the bounded
 rate with `--ship-rate-kbps N` (`64..10000`); overload drops events instead of
 accumulating a later burst.
+Both installed modes report capture drops, push/drop rates, bounded queue
+pressure, process resources, and enforced limits to the same configured Hub at
+`/api/agent/stats` every 30 seconds by default. Configure the interval with
+`--stats-interval-sec N` (`10..300`). Stats share the upload budget, are capped
+at 16 KiB, and never enter the normal trace-event stream.
+Python poster threads reserve 256 KiB stacks instead of inheriting the large
+glibc default, keeping virtual memory bounded under the 256 MiB runtime guard.
+The generated SysV service waits three seconds for the full guarded EL6
+process tree before declaring startup failure.
 
 ### 2. Production Installation (Python Mode)
 Installs the standard Python 2.6 capture pipeline:
@@ -244,6 +253,13 @@ For high-throughput environments (>1,000 requests/sec), compile and run native C
 sudo NT_CAPTURE_MODE=cpp NT_IFACE=eth0 NT_PORTS=80,8003,8005,8009,8010 \
   sh install-oldkernel.sh --server "$HUB_URL"
 ```
+
+Native mode installs `nt-sniff-cpp | nt-ship-cpp`. The capture process makes
+single-write, nonblocking JSONL deliveries to the pipe and never performs Hub
+I/O. The shipper continuously drains into a 4,000-event bounded queue while
+one 512 KiB-stack uploader thread handles rate-limited HTTP. Pipe or queue
+pressure drops events and reports counters rather than stalling packet-ring
+drainage. Only `nt-sniff-cpp` receives `CAP_NET_RAW`.
 
 ### 4. Verification & Live Event Proof
 Check service status and logs:
