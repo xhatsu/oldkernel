@@ -21,6 +21,7 @@
 # Env overrides: NT_IFACE=eth1 NT_PORTS=80,... NT_HUB=http://KIT:PORT/oldkernel
 #                NT_WSSE_BODY_BYTES=0..65536 (Python/C++ modes; default 0)
 #                NT_CPU_CORE=N (default: first CPU allowed for the installer)
+#                NT_SHIP_THREADS=1..8 NT_SHIP_RATE_KBPS=64..10000
 set -u
 
 PREFIX=/opt/networktracing-legacy
@@ -31,7 +32,8 @@ ENDPOINT=""
 IFACE="${NT_IFACE:-}"
 PORTS="${NT_PORTS:-80,8003,8005,8007,8009,8010,8011}"
 WORKERS="${NT_WORKERS:-1}"   # compatibility input; capture is always single-worker
-SHIPPERS="${NT_SHIP_THREADS:-8}"  # concurrent hub POST threads
+SHIPPERS="${NT_SHIP_THREADS:-4}"  # bounded concurrent Hub POST threads
+SHIP_RATE_KBPS="${NT_SHIP_RATE_KBPS:-1024}" # aggregate application egress ceiling
 KIT_URLS="${NT_HUB:-}"
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
@@ -56,7 +58,8 @@ Usage: install-firstrun-el68.sh --server URL [options]
   --mode python|cpp         Capture engine (default: python)
   --wsse-bytes N            SOAP prefix window, 0..65536 (default: 0)
   --cpu N                   One allowed logical CPU number
-  --ship-threads N          Python poster threads, 1..32
+  --ship-threads N          Python poster threads, 1..8 (default: 4)
+  --ship-rate-kbps N        Egress ceiling, 64..10000 kbit/s (default: 1024)
   --control-token-file FILE Read the control token from FILE
   --offline                 Use only local/embedded kit; never fetch fallback
   --check                   Preflight only; make no installation changes
@@ -77,6 +80,7 @@ while [ $# -gt 0 ]; do
         --wsse-body-bytes|--wsse-bytes) need_value "$@"; WSSE_BODY_BYTES="$2"; shift 2 ;;
         --cpu)      need_value "$@"; CPU_CORE="$2"; shift 2 ;;
         --ship-threads) need_value "$@"; SHIPPERS="$2"; shift 2 ;;
+        --ship-rate-kbps) need_value "$@"; SHIP_RATE_KBPS="$2"; shift 2 ;;
         --control-token-file) need_value "$@"; TOKEN_INPUT_FILE="$2"; shift 2 ;;
         --offline)  ALLOW_KIT_FETCH=0; shift ;;
         --install)  MODE=install; shift ;;
@@ -113,8 +117,11 @@ for port_value do
 done
 [ "$PORT_COUNT" -le 30 ] || die "at most 30 monitored ports are allowed by the safe cBPF program"
 case "$CAPTURE_MODE" in python|cpp) : ;; *) die "mode must be python or cpp" ;; esac
-case "$SHIPPERS" in ''|*[!0-9]*) die "ship threads must be an integer 1..32" ;; esac
-[ "$SHIPPERS" -ge 1 ] && [ "$SHIPPERS" -le 32 ] || die "ship threads must be in range 1..32"
+case "$SHIPPERS" in ''|*[!0-9]*) die "ship threads must be an integer 1..8" ;; esac
+[ "$SHIPPERS" -ge 1 ] && [ "$SHIPPERS" -le 8 ] || die "ship threads must be in range 1..8"
+case "$SHIP_RATE_KBPS" in ''|*[!0-9]*) die "ship rate must be an integer 64..10000" ;; esac
+[ "$SHIP_RATE_KBPS" -ge 64 ] && [ "$SHIP_RATE_KBPS" -le 10000 ] \
+    || die "ship rate must be in range 64..10000 kbit/s"
 
 case "$WSSE_BODY_BYTES" in
     ''|*[!0-9]*) die "WSSE body byte window must be an integer 0..65536" ;;
@@ -431,9 +438,9 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     [ "$SNIFF_AS" != root ] \
         || die "safe rootless C++ capture unavailable; refusing to run the agent as root"
     if [ "$SNIFF_AS" != root ]; then
-        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --wsse-body-bytes $WSSE_BODY_BYTES' >>\$PREFIX/sniff.log 2>&1"
+        RUN_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --wsse-body-bytes $WSSE_BODY_BYTES' >>\$PREFIX/sniff.log 2>&1"
     else
-        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --wsse-body-bytes $WSSE_BODY_BYTES >>\$PREFIX/sniff.log 2>&1"
+        RUN_CMD="exec $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --wsse-body-bytes $WSSE_BODY_BYTES >>\$PREFIX/sniff.log 2>&1"
     fi
     log "native C++ single-binary capture + shipping selected"
 else
@@ -464,6 +471,7 @@ cat > "$INIT" <<EOF
 PREFIX=$PREFIX
 SNIFF_USER=$SNIFF_AS
 export NT_SHIP_THREADS=$SHIPPERS
+export NT_SHIP_RATE_KBPS=$SHIP_RATE_KBPS
 export NT_WSSE_BODY_BYTES=$WSSE_BODY_BYTES
 CPU_CORE=$CPU_CORE
 PIDFILE=/var/run/networktracing-legacy.pid
@@ -596,6 +604,7 @@ fi
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
 log "Safety: rootless, cpu=$CPU_CORE (one logical core/SCHED_IDLE/nice 19), memory=256MiB, fds=1024, output-file=32MiB, crash circuit=5"
+log "Network egress: aggregate application payload limit=${SHIP_RATE_KBPS}kbit/s, HTTP body cap=65536 bytes"
 if [ "$WSSE_BODY_BYTES" -ne 0 ]; then
     log "WSSE UsernameToken inspection: bounded to $WSSE_BODY_BYTES bytes/request"
 else

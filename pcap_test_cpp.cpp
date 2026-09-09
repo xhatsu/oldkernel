@@ -101,6 +101,7 @@ int main(int argc, char **argv) {
     handle_packet(pkt_ptr, pkt_len, node, ports, flows, pending);
   }
 
+  flush_incomplete_wsse(flows, pending);
   flush_all_pending(pending);
   std::cout.flush();
   return 0;

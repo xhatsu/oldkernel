@@ -5,7 +5,7 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 
 ### Key Components
 - **`nt-sniff.py`**: AF_PACKET raw packet sniffer with classic BPF filter (`SO_ATTACH_FILTER`), TCP flow reassembly, HTTP/1.x header parsing, Basic auth extraction, W3C traceparent generation/parsing, and response correlation.
-- **`nt-ship.py`**: Multi-threaded JSONL event shipper with disk spooling and backoff retries to Hub `/api/ingest`.
+- **`nt-ship.py`**: Multi-threaded JSONL event shipper with a bounded in-memory queue, aggregate upload pacing, and drop-on-overload behavior for Hub `/api/ingest`; the compatibility spool argument performs no disk writes.
 - **`nt_control.py` / `nt-control.py`**: Python 2.6-compatible remote control client supporting atomic desired state application (`remote-desired.json`), heartbeat reporting, and port reconfiguration.
 - **`nt-sniff-cpp.cpp` / `nt-ship-cpp.cpp`**: High-performance C++03 replacement sniffer and shipper for >1000 rps environments.
 - **`install-oldkernel.sh`**: SysV installer script supporting `--check`, `--install`, and `--uninstall`. Manages rootless `ntsniff` user with `cap_net_raw` file capabilities.
@@ -36,6 +36,13 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
    Five short crashes open the supervisor circuit to prevent restart storms.
    Installation must prove `AF_PACKET` access under `ntsniff`; after socket,
    BPF, and bind setup, capture processes must drop all capabilities.
+8. **Shipping Egress Safety**: Both capture modes must enforce the validated
+   `NT_SHIP_RATE_KBPS` aggregate application-payload ceiling (`64..10000`,
+   default `1024`), cap encoded HTTP request bodies at 64 KiB, bound all
+   in-memory queues, and drop excess events instead of accumulating retries.
+   Both shipping modes must enforce the configured `64..10000` kbit/s
+   application-payload ceiling (default 1024), cap each HTTP body at 64 KiB,
+   and drop overload rather than create an unbounded queue or later burst.
 8. **Native Packet Ring Safety**: C++ capture uses only `TPACKET_V2` with a
    fixed, validated 4 MiB RX ring. It must attach cBPF and bind the interface
    before creating the ring, reject malformed kernel frame metadata, use
@@ -51,6 +58,8 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   window, with at most 256 body-buffering flows.
 - Only namespaced OASIS 2004 and legacy 2002/07, 2002/12, or 2003/06
   UsernameToken usernames may become event `user` plus `scheme=wsse`.
+  For dual-auth SOAP, WSSE is primary while nullable `basic_user` and
+  `wsse_user` report both validated usernames in the same event.
   Credential material and SOAP bodies never enter event JSON or logs.
 - C++03 matches the Python opt-in WSSE contract: bounded `Content-Length` XML
   prefixes, 256 concurrent body flows, supported namespace validation, and no

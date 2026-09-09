@@ -139,3 +139,24 @@ def test_python_capture_has_no_packet_fanout_path():
         python_capture = src.read()
     assert "PACKET_FANOUT" not in python_capture
     assert "only one capture worker is permitted" in python_capture
+
+
+def test_installer_applies_egress_limit_to_both_modes():
+    with open(INSTALLER, "r") as src:
+        installer = src.read()
+    assert "export NT_SHIP_RATE_KBPS=$SHIP_RATE_KBPS" in installer
+    assert "--ship-rate-kbps $SHIP_RATE_KBPS" in installer
+    assert 'SHIP_RATE_KBPS="${NT_SHIP_RATE_KBPS:-1024}"' in installer
+
+
+def test_both_shipping_modes_have_hard_egress_bounds():
+    with open(os.path.join(HERE, "nt-ship.py"), "r") as src:
+        python_ship = src.read()
+    with open(os.path.join(HERE, "nt-sniff-cpp.cpp"), "r") as src:
+        native = src.read()
+    assert "MAX_POST_BYTES = 65536" in python_ship
+    assert "RateLimiter" in python_ship
+    assert "put_nowait" in python_ship
+    assert "MAX_POST_BYTES = 65536" in native
+    assert "pace_upload" in native
+    assert "--limit-rate" in native

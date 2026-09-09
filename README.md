@@ -82,7 +82,7 @@ Optional settings remain flags on that command, for example
                     (Events tagged source_probe="pcap-http" or "pcap-http-cpp")
 ```
 
-### Event Contract Schema (Identical to Modern eBPF Agent)
+### Event Contract Schema (Modern-agent compatible, with identity extensions)
 
 ```json
 {
@@ -94,6 +94,8 @@ Optional settings remain flags on that command, for example
   "path": "/SALE_SERVICE/bpm/sale/createOrder",
   "user": "vtp_app",
   "scheme": "basic",
+  "basic_user": "vtp_app",
+  "wsse_user": null,
   "caller": "10.207.58.79",
   "caller_port": 39687,
   "dst_ip": "10.240.147.249",
@@ -109,6 +111,11 @@ Optional settings remain flags on that command, for example
   "source_probe": "pcap-http"
 }
 ```
+
+For a SOAP request carrying both mechanisms, WSSE is the primary identity:
+`user`/`scheme` contain the WSSE username and `wsse`, while `basic_user` and
+`wsse_user` preserve both validated usernames. Only one request event is
+emitted. Both identity-specific fields are `null` when absent.
 
 ---
 
@@ -219,6 +226,10 @@ CPU in its allowed cpuset; set `NT_CPU_CORE=N` to choose another allowed core.
 will not fall back to running as root. Installation proves raw-socket access
 under that account, and the running sniffer drops `CAP_NET_RAW` permanently
 after its filtered packet socket is configured.
+Both shipping modes enforce an aggregate application egress ceiling of 1024
+kbit/s by default and cap HTTP request bodies at 64 KiB. Override the bounded
+rate with `--ship-rate-kbps N` (`64..10000`); overload drops events instead of
+accumulating a later burst.
 
 ### 2. Production Installation (Python Mode)
 Installs the standard Python 2.6 capture pipeline:

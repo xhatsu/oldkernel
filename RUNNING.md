@@ -64,7 +64,8 @@ curl -sSf http://10.0.0.10:41000/oldkernel/install-firstrun-el68.sh \
 | `--mode python\|cpp` | Select the capture implementation; Python is the default. |
 | `--wsse-bytes N` | Inspect a bounded `0..65536` byte SOAP prefix; zero is the safe header-only default. |
 | `--cpu N` | Pin the complete runtime tree to this one allowed logical CPU. |
-| `--ship-threads N` | Set Python Hub poster threads in `1..32`; this does not add CPU cores. |
+| `--ship-threads N` | Set Python Hub poster threads in `1..8` (default 4); this does not add CPU cores. |
+| `--ship-rate-kbps N` | Bound aggregate Hub application-payload uploads to `64..10000` kbit/s (default 1024). |
 | `--control-token-file FILE` | Read a control token from a protected file instead of putting it in shell history. |
 | `--offline` | Require a local or embedded kit and prohibit fallback downloads; recommended for Ansible. |
 
@@ -115,6 +116,9 @@ The installer refuses to start an unsafe configuration:
   headers. BPF attachment and interface binding happen before ring creation.
 - Neither capture engine contains a `PACKET_FANOUT` setup path. Both accept
   only one capture worker, avoiding the CVE-2017-6346 fanout race surface.
+- A SOAP request containing both valid Basic and WSSE identities produces one
+  event. WSSE is primary in `user`/`scheme`; nullable `basic_user` and
+  `wsse_user` retain both usernames without retaining either credential.
 - Native startup fails if V2 ring setup or mapping fails; it never silently
   falls back to another capture path. Every kernel-provided frame offset and
   length is bounds-checked before packet parsing.
@@ -293,7 +297,8 @@ Important details:
 - If `NT_CPU_CORE` is omitted, the first CPU in `Cpus_allowed_list` is used.
 - `NT_PORTS` is a comma-separated list without spaces. TLS payload on port
   8443 remains unreadable even if that port is monitored.
-- `NT_SHIP_THREADS` affects Python mode. Runtime code clamps it to `1..32`.
+- `NT_SHIP_THREADS` affects Python mode. Runtime code clamps it to `1..8`.
+- `NT_SHIP_RATE_KBPS` affects both modes and is validated in `64..10000`.
 - `NT_WORKERS` is always overridden to `1` by the host safety boundary.
 
 ### 4.5 Explicit bootstrap source
@@ -346,7 +351,8 @@ where both forms exist.
 | `--mode cpp` | No | Select native C++03 capture and direct native shipping. |
 | `--wsse-bytes N`, `--wsse-body-bytes N` | No | Set the SOAP prefix window to `0..65536`; overrides `NT_WSSE_BODY_BYTES`. |
 | `--cpu N` | No | Select one allowed logical CPU; overrides `NT_CPU_CORE`. |
-| `--ship-threads N` | No | Set Python poster threads to `1..32`; overrides `NT_SHIP_THREADS`. |
+| `--ship-threads N` | No | Set Python poster threads to `1..8`; default 4. |
+| `--ship-rate-kbps N` | No | Hard application-payload egress ceiling for both modes, `64..10000` kbit/s; default 1024. |
 | `--control-token-file FILE` | No | Read a 1–4096 byte control token without putting it in shell history. |
 | `--offline` | No | Use only the local or embedded kit and fail if it is incomplete. No fallback download is attempted. |
 | `--install` | No | Explicitly select installation; installation is already the default. |
@@ -369,7 +375,8 @@ For fleet deployment, use the checksum-controlled offline procedure in
 | `NT_WSSE_BODY_BYTES` | `0` | SOAP body prefix window in bytes, from `0` through `65536`. |
 | `NT_CPU_CORE` | First allowed CPU | Logical CPU number used by the complete supervisor/agent tree. |
 | `NT_WORKERS` | `1` | Accepted for compatibility but forcibly reset to `1` by the safety boundary. |
-| `NT_SHIP_THREADS` | `8` from installer | Python Hub poster threads. The shipper clamps the value to `1..32`; invalid runtime values fall back to `4`. |
+| `NT_SHIP_THREADS` | `4` | Python Hub poster threads, internally clamped to `1..8`. |
+| `NT_SHIP_RATE_KBPS` | `1024` | Aggregate shipper application-payload ceiling, clamped to `64..10000` kbit/s. |
 | `NT_HUB` | Empty | Same bootstrap-kit purpose as `--hub`; it is not the ingest endpoint. |
 | `NT_CONTROL_TOKEN` | Empty | One-time control token written to the protected token file during installation. |
 
@@ -603,7 +610,8 @@ nt-sniff-cpp [-i IFACE] [-p PORTS] [--endpoint URL]
 | `--spool PATH` | Accepted for compatibility but ignored; native shipping remains in-memory. |
 | `-h`, `--help` | Print usage. |
 
-`--fixture`, `--wsse-fixture`, `--ring-fixture`, and `--capability-probe` are
+`--fixture`, `--wsse-fixture`, `--dual-auth-fixture`, `--ring-fixture`,
+`--ship-rate-fixture`, and `--capability-probe` are
 internal validation actions, not production capture modes. The capability
 probe exercises the configured BPF, interface bind, complete V2 ring lifecycle,
 and capability drop rather than merely opening a raw socket.
@@ -620,7 +628,10 @@ python nt-ship.py --endpoint URL [--spool PATH]
 | `--spool PATH` | Compatibility option. The current implementation accepts the value but uses bounded in-memory drop behavior rather than disk spooling. |
 | `-h`, `--help` | Print help. |
 
-`NT_SHIP_THREADS` selects poster threads and is clamped to `1..32`.
+`NT_SHIP_THREADS` selects poster threads and is clamped to `1..8`.
+`NT_SHIP_RATE_KBPS` limits aggregate uploads. HTTP bodies are capped at 64 KiB,
+the pending batch queue is small, and excess events are dropped rather than
+building a later network burst.
 
 ### 11.4 `nt-ship-cpp`
 

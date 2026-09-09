@@ -27,9 +27,11 @@ def soap(namespace, username="billing.fixture"):
             u'</soap:Envelope>') % (namespace, username)
 
 
-def request(body):
+def request(body, authorization=None):
     raw = body.encode("utf-8")
-    head = (b"POST /soap HTTP/1.1\r\nHost: fixture\r\n"
+    auth = (("Authorization: %s\r\n" % authorization).encode("ascii")
+            if authorization else b"")
+    head = (b"POST /soap HTTP/1.1\r\nHost: fixture\r\n" + auth +
             b"Content-Type: application/soap+xml; charset=utf-8\r\n"
             b"Content-Length: %d\r\n\r\n" % len(raw))
     return head, raw
@@ -58,6 +60,8 @@ def test_opt_in_wsse_extracts_only_username_across_segments(namespace):
     assert len(out) == 1
     assert out[0]["user"] == "billing.fixture"
     assert out[0]["scheme"] == "wsse"
+    assert out[0]["basic_user"] is None
+    assert out[0]["wsse_user"] == "billing.fixture"
     serialized = json.dumps(out[0])
     for forbidden in ("SENSITIVE_PASSWORD", "SENSITIVE_NONCE",
                       "PasswordDigest", "soap:Envelope", "soap_body"):
@@ -72,6 +76,8 @@ def test_default_remains_header_only_and_never_retains_body():
     assert len(out) == 1
     assert out[0]["user"] is None
     assert out[0]["scheme"] is None
+    assert out[0]["basic_user"] is None
+    assert out[0]["wsse_user"] is None
     assert "SENSITIVE" not in repr(out)
 
 
@@ -91,6 +97,86 @@ def test_wsse_configuration_bounds():
     assert nt_sniff.parse_args(["--wsse-body-bytes", "4096"])[4] == 4096
     with pytest.raises(SystemExit):
         nt_sniff.parse_wsse_body_bytes(nt_sniff.MAX_WSSE_BODY_BYTES + 1)
+
+
+def test_dual_auth_reports_wsse_primary_and_both_users():
+    head, raw = request(soap(OASIS_2004, "soap.user"),
+                        "Basic YmFzaWMudXNlcjpwYXNzd29yZA==")
+    flows, out = feed((head + raw,), 8192)
+
+    assert flows == {}
+    assert len(out) == 1
+    assert out[0]["user"] == "soap.user"
+    assert out[0]["scheme"] == "wsse"
+    assert out[0]["basic_user"] == "basic.user"
+    assert out[0]["wsse_user"] == "soap.user"
+    assert "password" not in json.dumps(out[0]).lower()
+
+
+def test_basic_identity_survives_rejected_or_disabled_wsse():
+    wrong_ns = soap("urn:not-wsse", "wrong.user")
+    head, raw = request(wrong_ns, "Basic YmFzaWMudXNlcjpwYXNzd29yZA==")
+    _, out = feed((head + raw,), 8192)
+    assert out[0]["user"] == "basic.user"
+    assert out[0]["scheme"] == "basic"
+    assert out[0]["basic_user"] == "basic.user"
+    assert out[0]["wsse_user"] is None
+
+    head, raw = request(soap(OASIS_2004, "hidden.wsse"),
+                        "Basic YmFzaWMudXNlcjpwYXNzd29yZA==")
+    _, out = feed((head + raw,), 0)
+    assert out[0]["user"] == "basic.user"
+    assert out[0]["scheme"] == "basic"
+    assert out[0]["basic_user"] == "basic.user"
+    assert out[0]["wsse_user"] is None
+
+
+def test_invalid_basic_allows_valid_wsse_without_basic_identity():
+    head, raw = request(soap(OASIS_2004, "soap.only"), "Basic !!!")
+    _, out = feed((head + raw,), 8192)
+    assert out[0]["user"] == "soap.only"
+    assert out[0]["scheme"] == "wsse"
+    assert out[0]["basic_user"] is None
+    assert out[0]["wsse_user"] == "soap.only"
+
+
+def test_wsse_flow_limit_falls_back_to_basic_without_growing_limit():
+    flows = {}
+    for index in range(nt_sniff.MAX_WSSE_BODY_FLOWS):
+        flow = nt_sniff.Flow()
+        flow.event = {"user": None}
+        flow.body_goal = 1
+        flows[("held", index)] = flow
+    out = []
+    key = ("192.0.2.2", 51000, "192.0.2.1", 18080)
+    meta = ("192.0.2.1", 18080, "192.0.2.2", 51000)
+    head, raw = request(soap(OASIS_2004, "not.buffered"),
+                        "Basic YmFzaWMudXNlcjpwYXNzd29yZA==")
+
+    nt_sniff.handle_payload(flows, key, None, head + raw, meta, set([18080]),
+                            "fixture", out, None, 10.0, 8192)
+
+    assert len(out) == 1
+    assert out[0]["user"] == "basic.user"
+    assert out[0]["scheme"] == "basic"
+    assert out[0]["basic_user"] == "basic.user"
+    assert out[0]["wsse_user"] is None
+    assert len(flows) == nt_sniff.MAX_WSSE_BODY_FLOWS
+
+
+def test_new_keepalive_request_flushes_incomplete_dual_auth_as_basic():
+    body = b"<s:Envelope>incomplete"
+    first = (b"POST /soap HTTP/1.1\r\nHost: fixture\r\n"
+             b"Authorization: Basic YmFzaWMudXNlcjpwYXNzd29yZA==\r\n"
+             b"Content-Type: application/soap+xml\r\n"
+             b"Content-Length: 4096\r\n\r\n" + body)
+    second = (b"GET /next HTTP/1.1\r\nHost: fixture\r\n"
+              b"Authorization: Basic c2Vjb25kLnVzZXI6cGFzcw==\r\n\r\n")
+    flows, out = feed((first, second), 8192)
+
+    assert flows == {}
+    assert [event["user"] for event in out] == ["basic.user", "second.user"]
+    assert out[0]["wsse_user"] is None
 
 
 def test_response_correlation_preserves_pipelined_requests():

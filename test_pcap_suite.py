@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import struct, os, sys, time, json, subprocess, importlib.util, signal
+__test__ = False
 
 OLD_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = "/home/ubuntu/Viettel/Data"
@@ -74,6 +75,7 @@ def test_offline_python(pcap_path, ports, wsse_bytes):
                 nt_sniff.handle_payload(flows, key, None, pay, (dst_ip, dp, src_ip, sp),
                                         ports_set, node_host, out, pending, now, wsse_bytes)
 
+    nt_sniff.drain_incomplete_wsse(flows, out, pending, time.time())
     nt_sniff.drain_pending(pending, out)
     elapsed = time.time() - t0
     return {

@@ -19,6 +19,7 @@ cpp-debug:
 fixture: cpp
 	./nt-sniff-cpp --fixture
 	./nt-sniff-cpp --ring-fixture
+	./nt-sniff-cpp --ship-rate-fixture
 
 pcap-fixture: pcap_test_cpp
 

@@ -54,6 +54,8 @@ static const size_t MAX_WSSE_BODY_FLOWS = 256;
 static const size_t MAX_WSSE_USERNAME = 200;
 static const size_t MAX_BATCH = 400;
 static const size_t MAX_QUEUE = 4000;
+static const size_t MAX_POST_BYTES = 65536;
+static const unsigned DEFAULT_SHIP_RATE_KBPS = 1024;
 static const int FLUSH_SEC = 5;
 static const int RETRY_SEC = 60;
 static const unsigned FLOW_TTL = 15;
@@ -93,6 +95,18 @@ static long long now_ms() {
 }
 static std::string num(long v) { std::ostringstream o; o << v; return o.str(); }
 static bool valid_port(unsigned p) { return p > 0 && p <= 65535; }
+
+static uint16_t read_u16(const unsigned char *p) {
+  uint16_t value;
+  memcpy(&value, p, sizeof(value));
+  return value;
+}
+
+static uint32_t read_u32(const unsigned char *p) {
+  uint32_t value;
+  memcpy(&value, p, sizeof(value));
+  return value;
+}
 static bool has_method(const std::string &m) {
   return m == "GET" || m == "POST" || m == "PUT" || m == "DELETE" ||
          m == "PATCH" || m == "HEAD" || m == "OPTIONS";
@@ -172,6 +186,7 @@ static std::string make_traceparent(std::string *tid) {
 
 struct Event {
   long ts; std::string host, src, service, method, path, user, scheme, probe;
+  std::string basic_user, wsse_user;
   std::string host_hdr, user_agent, xff, caller, dst_ip, traceparent, trace_id;
   unsigned caller_port, dst_port, req_bytes, resp_bytes; int status; long duration_ms;
   bool has_status, has_duration, has_resp;
@@ -263,8 +278,12 @@ static bool parse_request(const char *data, size_t len, Event *e, RequestMeta *m
 
       if (hname_len == 13 && !strncasecmp(p, "authorization", 13)) {
         if (val_len > 6 && !strncasecmp(val_start, "Basic ", 6)) {
-          e->user = b64decode_user(val_start + 6, val_len - 6);
-          e->scheme = "basic";
+          std::string basic_user = b64decode_user(val_start + 6, val_len - 6);
+          if (!basic_user.empty()) {
+            e->basic_user = basic_user;
+            e->user = basic_user;
+            e->scheme = "basic";
+          }
         } else if (val_len > 7 && !strncasecmp(val_start, "Bearer ", 7)) {
           e->scheme = "bearer";
         }
@@ -560,6 +579,8 @@ static bool parse_response(const char *data, size_t len, int *status, unsigned *
 static std::string g_endpoint;
 static std::string g_ship_node;
 static std::vector<std::string> g_ship_buf;
+static unsigned g_ship_rate_kbps = DEFAULT_SHIP_RATE_KBPS;
+static double g_next_ship_slot = 0.0;
 
 static std::string shellq(const std::string &s) {
   std::string o = "'";
@@ -570,9 +591,53 @@ static std::string number_string(size_t n) { std::ostringstream o; o << n; retur
 static std::string json_array(const std::vector<std::string> &a) {
   std::string o = "["; for (size_t i = 0; i < a.size(); ++i) { if (i) o += ","; o += a[i]; } return o + "]";
 }
+static double wall_seconds() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+static void pace_upload(size_t bytes) {
+  const double bytes_per_sec = (double)g_ship_rate_kbps * 1000.0 / 8.0;
+  double now = wall_seconds();
+  if (g_next_ship_slot < now || g_next_ship_slot - now > 60.0) g_next_ship_slot = now;
+  double slot = g_next_ship_slot;
+  g_next_ship_slot += (double)bytes / bytes_per_sec;
+  while (slot > (now = wall_seconds())) {
+    double remaining = slot - now;
+    useconds_t delay = (useconds_t)(remaining > 0.5 ? 500000 : remaining * 1000000.0);
+    if (delay) usleep(delay);
+  }
+}
+static size_t bounded_batch_count(const std::vector<std::string> &buf,
+                                  const std::string &node) {
+  size_t size = std::string("{\"node\":").size() + jsonq(node).size() +
+                std::string(",\"events\":[]}").size();
+  size_t n = 0, limit = buf.size() < MAX_BATCH ? buf.size() : MAX_BATCH;
+  while (n < limit) {
+    size_t extra = buf[n].size() + (n ? 1 : 0);
+    if (extra > MAX_POST_BYTES - size) break;
+    size += extra;
+    ++n;
+  }
+  return n;
+}
+static int run_ship_rate_fixture() {
+  std::vector<std::string> events;
+  events.push_back(std::string(40000, 'x'));
+  events.push_back(std::string(40000, 'y'));
+  if (bounded_batch_count(events, "fixture") != 1) return 30;
+  events.clear();
+  events.push_back(std::string(MAX_POST_BYTES + 1, 'x'));
+  if (bounded_batch_count(events, "fixture") != 0) return 31;
+  return 0;
+}
 static bool post(const std::string &endpoint, const std::string &node, const std::vector<std::string> &batch) {
   std::string body = "{\"node\":" + jsonq(node) + ",\"events\":" + json_array(batch) + "}";
-  std::string cmd = "curl -sSf --max-time 10 -o /dev/null -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + "/api/ingest");
+  if (body.size() > MAX_POST_BYTES) return false;
+  pace_upload(body.size());
+  std::string cmd = "curl -sSf --max-time 10 --limit-rate " +
+    number_string((size_t)g_ship_rate_kbps * 1000U / 8U) +
+    " -o /dev/null -H 'Content-Type: application/json' --data-binary @- " + shellq(endpoint + "/api/ingest");
   FILE *fp = popen(cmd.c_str(), "w"); if (!fp) return false;
   fwrite(body.data(), 1, body.size(), fp);
   int rc = pclose(fp);
@@ -581,7 +646,12 @@ static bool post(const std::string &endpoint, const std::string &node, const std
 static void send_batches(const std::string &endpoint, const std::string &node,
                          std::vector<std::string> *buf, bool flush_all) {
   while (!buf->empty() && (flush_all || buf->size() >= MAX_BATCH)) {
-    size_t n = buf->size() >= MAX_BATCH ? MAX_BATCH : buf->size();
+    size_t n = bounded_batch_count(*buf, node);
+    if (!n) {
+      buf->erase(buf->begin());
+      logmsg("WARN: dropped oversized event; encoded body exceeds 65536 bytes");
+      continue;
+    }
     std::vector<std::string> batch(buf->begin(), buf->begin() + n);
     if (post(endpoint, node, batch)) {
       buf->erase(buf->begin(), buf->begin() + n);
@@ -599,7 +669,10 @@ static void emit_event(const Event &e) {
   std::ostringstream ss;
   ss << "{\"ts\":" << e.ts << ",\"host\":" << jsonq(e.host) << ",\"src\":\"pcap\",\"service\":" << jsonq(e.service)
      << ",\"method\":" << jsonq(e.method) << ",\"path\":" << jsonq(e.path) << ",\"user\":" << jsonq(e.user)
-     << ",\"scheme\":" << jsonq(e.scheme) << ",\"source_probe\":\"pcap-http-cpp\",\"host_hdr\":" << jsonq(e.host_hdr)
+     << ",\"scheme\":" << jsonq(e.scheme)
+     << ",\"basic_user\":" << (e.basic_user.empty() ? "null" : jsonq(e.basic_user))
+     << ",\"wsse_user\":" << (e.wsse_user.empty() ? "null" : jsonq(e.wsse_user))
+     << ",\"source_probe\":\"pcap-http-cpp\",\"host_hdr\":" << jsonq(e.host_hdr)
      << ",\"user_agent\":" << jsonq(e.user_agent) << ",\"x_forwarded_for\":" << jsonq(e.xff)
      << ",\"caller\":" << jsonq(e.caller) << ",\"caller_port\":" << e.caller_port << ",\"dst_ip\":" << jsonq(e.dst_ip)
      << ",\"dst_port\":" << e.dst_port << ",\"traceparent\":" << jsonq(e.traceparent) << ",\"trace_id\":" << jsonq(e.trace_id)
@@ -618,6 +691,10 @@ static void emit_event(const Event &e) {
     std::cout << ss.str() << "\n";
   }
 }
+
+static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
+                          uint32_t d_ip, unsigned dport,
+                          std::map<PacketKey, std::vector<Pending> > &pending);
 
 static void flush_oldest(std::map<PacketKey, std::vector<Pending> > &pending) {
   if (pending.empty()) return;
@@ -639,11 +716,28 @@ static void flush_all_pending(std::map<PacketKey, std::vector<Pending> > &pendin
   }
   pending.clear();
 }
+static void flush_incomplete_wsse(std::map<FlowKey, Flow> &flows,
+                                  std::map<PacketKey, std::vector<Pending> > &pending) {
+  std::map<FlowKey, Flow>::iterator f;
+  for (f = flows.begin(); f != flows.end(); ++f) {
+    if (f->second.awaiting_body && !f->second.event.basic_user.empty()) {
+      queue_request(f->second.event, f->first.s_ip, f->first.sport,
+                    f->first.d_ip, f->first.dport, pending);
+    }
+  }
+  flows.clear();
+}
 static void sweep(std::map<FlowKey, Flow> &flows, std::map<PacketKey, std::vector<Pending> > &pending, time_t now) {
   std::map<FlowKey, Flow>::iterator f, fn;
   for (f = flows.begin(); f != flows.end();) {
     fn = f; ++fn;
-    if ((unsigned)(now - f->second.touched) > FLOW_TTL) flows.erase(f);
+    if ((unsigned)(now - f->second.touched) > FLOW_TTL) {
+      if (f->second.awaiting_body && !f->second.event.basic_user.empty()) {
+        queue_request(f->second.event, f->first.s_ip, f->first.sport,
+                      f->first.d_ip, f->first.dport, pending);
+      }
+      flows.erase(f);
+    }
     f = fn;
   }
   long long current_ms = (long long)now * 1000LL;
@@ -706,17 +800,17 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   (void)ports;
   if (n < 34) return false;
   size_t off = 14;
-  unsigned short et = ntohs(*(const unsigned short *)(buf + 12));
-  if (et == ETH_P_8021Q) { if (n < 38) return false; et = ntohs(*(const unsigned short *)(buf + 16)); off = 18; }
+  unsigned short et = ntohs(read_u16(buf + 12));
+  if (et == ETH_P_8021Q) { if (n < 38) return false; et = ntohs(read_u16(buf + 16)); off = 18; }
   if (et != ETH_P_IP || n < off + 20) return false;
   unsigned char ihl = (unsigned char)(buf[off] & 15) * 4;
   if ((buf[off] >> 4) != 4 || buf[off + 9] != 6 || n < off + ihl + 20) return false;
 
-  uint32_t s_ip = *(const uint32_t *)(buf + off + 12);
-  uint32_t d_ip = *(const uint32_t *)(buf + off + 16);
+  uint32_t s_ip = read_u32(buf + off + 12);
+  uint32_t d_ip = read_u32(buf + off + 16);
   size_t to = off + ihl;
-  unsigned sport = ntohs(*(const unsigned short *)(buf + to));
-  unsigned dport = ntohs(*(const unsigned short *)(buf + to + 2));
+  unsigned sport = ntohs(read_u16(buf + to));
+  unsigned dport = ntohs(read_u16(buf + to + 2));
   unsigned doff = (buf[to + 12] >> 4) * 4;
   if (n < to + doff) return false;
   const char *payload = (const char *)(buf + to + doff);
@@ -761,6 +855,11 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   FlowKey fk;
   fk.s_ip = s_ip; fk.sport = (uint16_t)sport; fk.d_ip = d_ip; fk.dport = (uint16_t)dport;
   if (tcp_flags & 0x05) { /* FIN or RST */
+    std::map<FlowKey, Flow>::iterator existing = flows.find(fk);
+    if (existing != flows.end() && existing->second.awaiting_body &&
+        !existing->second.event.basic_user.empty()) {
+      queue_request(existing->second.event, s_ip, sport, d_ip, dport, pending);
+    }
     flows.erase(fk);
     return true;
   }
@@ -770,16 +869,26 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   }
   Flow &fl = flows[fk]; fl.touched = now;
   if (fl.awaiting_body) {
-    size_t remaining = fl.body_goal > fl.buf.size() ? fl.body_goal - fl.buf.size() : 0;
-    if (remaining) fl.buf.append(payload, plen < remaining ? plen : remaining);
-    std::string username = extract_wsse_username(fl.buf);
-    if (!username.empty() || fl.buf.size() >= fl.body_goal) {
-      Event event = fl.event;
-      if (!username.empty()) { event.user = username; event.scheme = "wsse"; }
-      flows.erase(fk);
-      queue_request(event, s_ip, sport, d_ip, dport, pending);
+    std::string next_segment(payload, plen);
+    if (!fl.event.basic_user.empty() && find_http_start(next_segment) == 0) {
+      Event previous = fl.event;
+      fl = Flow();
+      fl.touched = now;
+      queue_request(previous, s_ip, sport, d_ip, dport, pending);
+    } else {
+      size_t remaining = fl.body_goal > fl.buf.size() ? fl.body_goal - fl.buf.size() : 0;
+      if (remaining) fl.buf.append(payload, plen < remaining ? plen : remaining);
+      std::string username = extract_wsse_username(fl.buf);
+      if (!username.empty() || fl.buf.size() >= fl.body_goal) {
+        Event event = fl.event;
+        if (!username.empty()) {
+          event.wsse_user = username; event.user = username; event.scheme = "wsse";
+        }
+        flows.erase(fk);
+        queue_request(event, s_ip, sport, d_ip, dport, pending);
+      }
+      return true;
     }
-    return true;
   }
   fl.buf.append(payload, plen);
   if (fl.buf.size() > MAX_HEADER) { flows.erase(fk); return false; }
@@ -792,7 +901,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     Event e; RequestMeta meta; e.ts = now; e.host = node; e.service = "port:" + num(dport); e.caller = ip_to_str(s_ip); e.caller_port = sport; e.dst_ip = ip_to_str(d_ip); e.dst_port = dport; e.req_bytes = (unsigned)(end + 4);
     if (!parse_request(fl.buf.data(), end, &e, &meta)) { fl.buf.erase(0, end + 4); continue; }
     fl.buf.erase(0, end + 4);
-    if (e.user == "-anonymous-" && g_wsse_body_bytes &&
+    if (g_wsse_body_bytes &&
         is_soap_content_type(meta.content_type) && meta.has_content_length &&
         meta.content_length > 0 &&
         lower(meta.transfer_encoding).find("chunked") == std::string::npos &&
@@ -805,7 +914,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
       std::string username = extract_wsse_username(fl.buf);
       if (!username.empty() || fl.buf.size() >= fl.body_goal) {
         Event event = fl.event;
-        if (!username.empty()) { event.user = username; event.scheme = "wsse"; }
+        if (!username.empty()) {
+          event.wsse_user = username; event.user = username; event.scheme = "wsse";
+        }
         flows.erase(fk);
         queue_request(event, s_ip, sport, d_ip, dport, pending);
       }
@@ -1058,6 +1169,45 @@ static int run_wsse_fixture() {
   return 0;
 }
 
+static int run_dual_auth_fixture() {
+  const std::string body =
+    "<s:Envelope xmlns:s='urn:soap' xmlns:w='http://docs.oasis-open.org/wss/2004/01/"
+    "oasis-200401-wss-wssecurity-secext-1.0.xsd'><s:Header><w:UsernameToken>"
+    "<w:Username>soap.user</w:Username><w:Password>SENSITIVE_PASSWORD</w:Password>"
+    "</w:UsernameToken></s:Header></s:Envelope>";
+  std::ostringstream request;
+  request << "POST /soap HTTP/1.1\r\nHost: fixture\r\n"
+          << "Authorization: Basic YmFzaWMudXNlcjpwYXNzd29yZA==\r\n"
+          << "Content-Type: application/soap+xml\r\nContent-Length: "
+          << body.size() << "\r\n\r\n" << body;
+  const std::string payload = request.str();
+
+  std::vector<unsigned char> packet(14 + 20 + 20 + payload.size(), 0);
+  packet[12] = 0x08; packet[13] = 0x00;
+  packet[14] = 0x45; packet[23] = IPPROTO_TCP;
+  packet[26] = 192; packet[27] = 0; packet[28] = 2; packet[29] = 2;
+  packet[30] = 192; packet[31] = 0; packet[32] = 2; packet[33] = 1;
+  unsigned short sport = htons(51000), dport = htons(8080);
+  memcpy(&packet[34], &sport, sizeof(sport));
+  memcpy(&packet[36], &dport, sizeof(dport));
+  packet[46] = 5U << 4; packet[47] = 0x18;
+  memcpy(&packet[54], payload.data(), payload.size());
+
+  g_wsse_body_bytes = 8192;
+  memset(g_monitored_ports, 0, sizeof(g_monitored_ports));
+  g_monitored_ports[8080] = true;
+  g_endpoint.clear();
+  init_rng();
+  std::vector<unsigned> ports(1, 8080);
+  std::map<FlowKey, Flow> flows;
+  std::map<PacketKey, std::vector<Pending> > pending;
+  if (!handle_packet(&packet[0], packet.size(), "cpp-dual-fixture",
+                     ports, flows, pending)) return 9;
+  if (!flows.empty() || pending.size() != 1) return 10;
+  flush_all_pending(pending);
+  return 0;
+}
+
 static bool parse_wsse_size(const char *value, size_t *result) {
   if (!value || !*value) return false;
   size_t n = 0;
@@ -1137,7 +1287,9 @@ static int run_capability_probe(const std::string &iface,
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   if (argc > 1 && !strcmp(argv[1], "--wsse-fixture")) return run_wsse_fixture();
+  if (argc > 1 && !strcmp(argv[1], "--dual-auth-fixture")) return run_dual_auth_fixture();
   if (argc > 1 && !strcmp(argv[1], "--ring-fixture")) return run_ring_fixture();
+  if (argc > 1 && !strcmp(argv[1], "--ship-rate-fixture")) return run_ship_rate_fixture();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
   std::string endpoint;
   bool capability_probe = false;
@@ -1145,6 +1297,8 @@ int main(int argc, char **argv) {
   if (wsse_env && !parse_wsse_size(wsse_env, &g_wsse_body_bytes)) {
     fprintf(stderr, "wsse body bytes must be in range 0..65536\n"); return 2;
   }
+  const char *rate_env = getenv("NT_SHIP_RATE_KBPS");
+  if (rate_env && *rate_env) g_ship_rate_kbps = (unsigned)atoi(rate_env);
   for (i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "-i") && i + 1 < argc) iface = argv[++i];
     else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
@@ -1154,6 +1308,7 @@ int main(int argc, char **argv) {
       }
     }
     else if (!strcmp(argv[i], "--endpoint") && i + 1 < argc) endpoint = argv[++i];
+    else if (!strcmp(argv[i], "--ship-rate-kbps") && i + 1 < argc) g_ship_rate_kbps = (unsigned)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--capability-probe")) capability_probe = true;
     else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i; /* ignored: 0 disk write */
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
@@ -1163,12 +1318,16 @@ int main(int argc, char **argv) {
       }
     }
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [-j workers] [--wsse-body-bytes 0..65536]\n");
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [-j workers] [--wsse-body-bytes 0..65536]\n");
       return 0;
     }
     else { fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
   }
   if (ports.empty()) { ports.push_back(80); ports.push_back(8003); ports.push_back(8005); ports.push_back(8007); ports.push_back(8009); ports.push_back(8010); ports.push_back(8011); }
+  if (g_ship_rate_kbps < 64 || g_ship_rate_kbps > 10000) {
+    fprintf(stderr, "ship rate must be in range 64..10000 kbit/s\n");
+    return 2;
+  }
   if (ports.size() > MAX_PORTS) {
     fprintf(stderr, "at most 30 monitored ports are supported by the safe cBPF program\n");
     return 2;
@@ -1279,6 +1438,7 @@ int main(int argc, char **argv) {
 
   /* A response is optional enrichment. Preserve requests still awaiting a
    * response when SIGTERM/restart ends capture. */
+  flush_incomplete_wsse(flows, pending);
   flush_all_pending(pending);
   if (g_endpoint.empty()) std::cout.flush();
 

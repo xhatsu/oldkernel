@@ -366,7 +366,9 @@ def basic_user(value):
                 return None, None
             if b":" in raw:
                 user = raw.split(b":", 1)[0]
-                return user.decode("utf-8", "replace")[:64], "basic"
+                user = user.decode("utf-8", "replace")[:64]
+                if user:
+                    return user, "basic"
         except Exception:
             return None, None
     elif scheme == "bearer":
@@ -508,6 +510,8 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
         "path": (h.get("_path") or "-").split("?", 1)[0][:120],
         "user": user,
         "scheme": scheme,
+        "basic_user": user if scheme == "basic" and user else None,
+        "wsse_user": None,
         "pid": None,
         "source_probe": "pcap-http",
         "host_hdr": h.get("host"),
@@ -563,6 +567,7 @@ def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
         fl.buf.extend(bytearray(payload[:remaining]))
     username = extract_wsse_username(fl.buf)
     if username:
+        fl.event["wsse_user"] = username
         fl.event["user"] = username
         fl.event["scheme"] = "wsse"
     if username or len(fl.buf) >= fl.body_goal:
@@ -591,6 +596,15 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             enforce_limit(flows, time.time())
     fl.touched = time.time()
 
+    if (fl.event is not None and fl.event.get("basic_user") and
+            any(payload.startswith(method.encode("ascii") + b" ")
+                for method in METHODS)):
+        # A new keep-alive request started before the bounded WSSE window
+        # completed. Preserve the Basic event, then parse the new request.
+        _emit_request(flows, key, fl, meta, out, pending_tbl, now)
+        handle_payload(flows, key, rev_key, payload, meta, ports, node_host,
+                       out, pending_tbl, now, wsse_body_bytes)
+        return
     if fl.event is not None:
         _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now)
         return
@@ -628,7 +642,7 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
     initial_body = bytes(fl.buf[idx + 4:])
     fl.buf = bytearray()
 
-    if (fl.event.get("user") or not wsse_body_bytes or
+    if (not wsse_body_bytes or
             not is_soap_content_type(hdrs.get("content-type"))):
         _emit_request(flows, key, fl, meta, out, pending_tbl, now)
         return
@@ -647,13 +661,32 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
     _try_wsse_body(flows, key, fl, initial_body, meta, out, pending_tbl, now)
 
 
-def sweep_idle(flows, now):
+def sweep_idle(flows, now, out=None, pending_tbl=None):
     stale = []
     for k, fl in flows.items():
         if now - fl.touched > FLOW_TTL:
             stale.append(k)
     for k in stale:
-        del flows[k]
+        fl = flows.get(k)
+        if (out is not None and fl is not None and fl.event is not None and
+                fl.event.get("basic_user")):
+            src_ip, sport, dst_ip, dport = k
+            _emit_request(flows, k, fl, (dst_ip, dport, src_ip, sport),
+                          out, pending_tbl, now)
+        else:
+            flows.pop(k, None)
+
+
+def drain_incomplete_wsse(flows, out, pending_tbl, now=None):
+    """Fall back to the retained pre-WSSE identity during clean shutdown."""
+    for key in list(flows.keys()):
+        fl = flows.get(key)
+        if (fl is None or fl.event is None or
+                not fl.event.get("basic_user")):
+            continue
+        src_ip, sport, dst_ip, dport = key
+        _emit_request(flows, key, fl, (dst_ip, dport, src_ip, sport),
+                      out, pending_tbl, now)
 
 
 def _flush_oldest_pending(pending_tbl, out):
@@ -895,8 +928,8 @@ def main():
                 dbg_last = time.time()
             now = time.time()
             if maintenance_due(now, last_sweep):
-                sweep_idle(flows, now)
                 out_s = []
+                sweep_idle(flows, now, out_s, pending)
                 sweep_pending(pending, now, out_s)
                 for ev in out_s:
                     sys.stdout.write(json.dumps(ev) + "\n")
@@ -965,8 +998,8 @@ def main():
             sys.stdout.flush()
 
         if maintenance_due(now, last_sweep):
-            sweep_idle(flows, now)
             out_s = []
+            sweep_idle(flows, now, out_s, pending)
             sweep_pending(pending, now, out_s)
             for ev in out_s:
                 sys.stdout.write(json.dumps(ev) + "\n")
@@ -975,6 +1008,7 @@ def main():
             last_sweep = now
 
     out_s = []
+    drain_incomplete_wsse(flows, out_s, pending, time.time())
     drain_pending(pending, out_s)
     for ev in out_s:
         sys.stdout.write(json.dumps(ev) + "\n")

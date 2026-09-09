@@ -4,6 +4,10 @@
 # STATE.md — Current Project State & Memory
 
 ## Strict TPACKET_V2 Hardening (2026-09-09)
+- Python and native shipping now have an always-on aggregate egress scheduler,
+  a 64 KiB HTTP-body ceiling, and a bounded drop-on-overload queue. Installer
+  option `--ship-rate-kbps` accepts 64..10000 kbit/s and defaults to 1024;
+  Python poster concurrency now defaults to 4 and is capped at 8.
 - Native capture now uses only a fixed, overflow-checked 4 MiB TPACKET_V2 RX
   ring. BPF attachment and interface binding precede ring creation; V3, TX
   rings, private areas, packet reserve, and virtual network headers remain
@@ -30,8 +34,9 @@
 - Simplified the self-contained installer directly instead of adding a
   wrapper. `--server URL` accepts the exact Hub ingest URL without assuming a
   port, while friendly
-  `--iface`, `--ports`, `--cpu`, `--ship-threads`, `--wsse-bytes`, and token
-  file options are parsed and validated by the same fail-closed installer.
+  `--iface`, `--ports`, `--cpu`, `--ship-threads`, `--ship-rate-kbps`,
+  `--wsse-bytes`, and token file options are parsed and validated by the same
+  fail-closed installer.
 - Added `RUNNING.md` as the canonical detailed guide for local and embedded
   installation, Python/C++ selection, custom interfaces/ports/CPU/WSSE/control
   settings, service lifecycle, safety verification, live route validation,
@@ -42,12 +47,12 @@
 - Current behavior is explicit: `NT_WORKERS` is forced to one, C++ native mode
   ships directly, and accepted `--spool` parameters do not enable disk spooling
   in the present bounded in-memory implementations.
-- Verification after the direct CLI and ring hardening: 33 non-PCAP pytest tests,
-  four focused installer CLI tests, native optimized fixtures, ASAN/UBSAN edge
-  tests, the CentOS static runbook, and offline Python/C++ processing of both
-  sample PCAPs passed. The EL6 smoke probe correctly rejected this Linux 6.8,
-  Python 3 sandbox at the target-only kernel, Python 2, setcap, and rootless
-  `AF_PACKET` gates.
+- Verification after egress, CLI, ring, and dual-identity hardening: all 42
+  non-PCAP pytest tests, native optimized fixtures, ASAN/UBSAN edge tests, and
+  the CentOS static runbook passed. Offline Python/C++ processing retained the
+  established sample-PCAP event counts: 200/200 and 11,216/11,394, with native
+  secret-scrubbing checks passing. The self-contained bundle was rebuilt at
+  197,430 bytes.
 - Added an Ansible fleet design that copies one checksum-controlled embedded
   bundle from the controller, uses `command.argv`, deploys in rolling batches,
   and records configuration only after a successful install. New `--offline`
@@ -55,12 +60,19 @@
   require the explicitly configured Hub ingest URL but no bootstrap service.
 
 ## Native C++03 WSSE Body Capture (2026-09-08)
+- Dual-auth SOAP requests are inspected even after Basic succeeds. Both modes
+  emit one event with WSSE primary plus nullable `basic_user` and `wsse_user`;
+  invalid, disabled, or capacity-rejected WSSE safely retains Basic as primary.
+- A new keep-alive request terminates an incomplete dual-auth WSSE window and
+  emits the retained Basic identity before parsing the new request. Idle and
+  clean-shutdown fallback do the same, preventing bounded inspection from
+  losing otherwise valid Basic events.
 - `nt-sniff-cpp` now accepts `NT_WSSE_BODY_BYTES` and
   `--wsse-body-bytes 0..65536`, remaining header-only by default.
-- Anonymous XML requests with a positive `Content-Length` may buffer a bounded
+- Eligible XML requests with a positive `Content-Length` may buffer a bounded
   SOAP prefix; chunked requests, DTD/entities, unsupported or missing WSSE
   namespaces, invalid/control-character usernames, and overflow body flows
-  remain anonymous. Basic authentication continues to take precedence.
+  retain their pre-WSSE identity. A validated WSSE username takes precedence.
 - The dependency-free C++03 XML scanner implements scoped namespace bindings,
   four approved WSSE namespace URIs, bounded UTF-8 username normalization, and
   extra depth/attribute/namespace ceilings. Only the username is copied into
@@ -108,7 +120,7 @@
   - Remote control capabilities (`nt_control.py`, `nt-control.py`, `test_nt_control.py`).
   - Remote upstream updates: Test scripts (`nt-test.py`, `nt-test.sh`), unbuffered Python stdout (`-u`), `ETH_P_ALL` capture socket binding, response parsing prioritization, C++ command argument handling and curl stdin pipe fixes.
 - **Verification & Test Status**:
-  - `make clean && make all && make fixture`: PASS (C++03 sniffer and shipper built with zero warnings; fixture emits all 24 contract fields).
+  - `make clean && make all && make fixture`: PASS (C++03 sniffer and shipper built with zero warnings; fixture emits all 26 contract fields).
   - `python3 cpp-edge-test.py`: PASS under AddressSanitizer & UndefinedBehaviorSanitizer for both sniffer and shipper.
   - `pytest test_nt_control.py`: 4/4 tests PASS.
   - `python3 -m py_compile`: nt-sniff.py, nt-ship.py, nt-control.py, nt_control.py compiled cleanly.
@@ -156,8 +168,8 @@
 - Python remote control is polled during sustained traffic. Port/interface and
   restart changes re-exec the capable interpreter in place with updated args;
   stop tasks exit capture instead of being acknowledged without effect.
-- Python shipper now sends the final partial batch on stdin EOF and clamps
-  `NT_SHIP_THREADS` to 1..32. Regression suite: 9 tests passed.
+- Python shipper sends the final partial batch on stdin EOF. Its current
+  host-safety contract defaults `NT_SHIP_THREADS` to 4 and caps it at 8.
 - `install-firstrun-el68.sh` regenerated from the reviewed sources (126672 bytes).
 - C++03 optimized build/fixture and ASAN+UBSAN edge fixture pass. The existing
   live `cpp-e2e.sh` loopback capture failed on this host (`capture output file

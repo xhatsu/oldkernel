@@ -195,7 +195,8 @@ All parameters can be passed as CLI arguments or configured through environment 
 | `--mode MODE` | `NT_CAPTURE_MODE` | `python` | `python` or `cpp` | Capture engine: `cpp` (native zero-copy, recommended) or `python` (standard Python 2.6). |
 | `--wsse-bytes N`<br>`--wsse-body-bytes N` | `NT_WSSE_BODY_BYTES` | `0` (disabled) | `0..65536` | Prefix window into HTTP request body to inspect for SOAP/WSSE XML credentials. |
 | `--cpu N` | `NT_CPU_CORE` | Installer CPU | Integer logical core | Pins supervisor and sniffer processes to a single logical CPU core using `taskset -c N`. |
-| `--ship-threads N` | `NT_SHIP_THREADS` | `8` | `1..32` | Number of concurrent shipping threads for Python mode (`nt-ship.py`). |
+| `--ship-threads N` | `NT_SHIP_THREADS` | `4` | `1..8` | Bounded concurrent shipping threads for Python mode (`nt-ship.py`). |
+| `--ship-rate-kbps N` | `NT_SHIP_RATE_KBPS` | `1024` | `64..10000` | Aggregate application-payload upload ceiling for either capture mode. Each HTTP body is also capped at 64 KiB. |
 | `--control-token-file FILE` | `NT_CONTROL_TOKEN` | Empty | Path to readable file | File containing a shared secret token for remote control operations (`nt-control.py`). |
 | `--offline` | `ALLOW_KIT_FETCH=0` | False | Flag | Disables external kit downloads; forces 100% extraction from embedded payloads. |
 | `--check` | — | False | Flag | Dry-run audit mode: performs all preflight checks without modifying the system. |
@@ -213,7 +214,7 @@ The C++ engine is compiled against standard C++03 and libc 2.12 (CentOS 6.x defa
 - **Zero-Copy TPACKET_V2 RX Ring**: Direct kernel ring memory map (4MB, 2048 frames). Drops syscall overhead.
 - **In-Process Shipping**: Ships directly to the Hub over HTTP 1.1 Keep-Alive sockets without piping to a second process.
 - **Resource Footprint**: < 20MB RSS memory and < 5% CPU even under heavy network load.
-- **Crash Immunity**: Strict frame integrity validation, single-worker safety, and bounded queue spooling (4,000 events max).
+- **Crash Immunity**: Strict frame integrity validation, single-worker safety, and a bounded in-memory queue (4,000 events max) with drop-on-overload behavior.
 
 **To install in C++ mode:**
 ```sh
@@ -372,7 +373,9 @@ sh oldkernel/el68-smoke.sh
 #### Q4: What happens if the Hub becomes unreachable?
 **A**: 
 - In C++ mode, events are buffered in memory up to `MAX_QUEUE=4000`. Once full, the oldest events are dropped to protect host memory.
-- In Python mode, `nt-ship.py` spools batches to disk under `/opt/networktracing-legacy/spool/` with a bounded disk quota.
+- In Python mode, `nt-ship.py` uses a small bounded in-memory queue and drops
+  events on Hub failure or overload. `--spool` remains accepted only for
+  compatibility and does not create a disk retry backlog.
 
 #### Q5: Can I run multiple capture workers (`-j 2`)?
 **A**: No. The Linux 2.6.32 kernel lacks `PACKET_FANOUT` support. Spawning multiple workers without fanout causes every packet to be captured multiple times. Single-worker mode is strictly enforced.
