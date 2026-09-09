@@ -1224,9 +1224,11 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
 
   std::vector<Pending> &queue = pending[rk];
   if (queue.size() >= MAX_PENDING_PER_FLOW) {
-    emit_event(queue[0].ev);
+    if (!queue[0].is_tombstone) {
+      emit_event(queue[0].ev);
+      if (g_total_pending_count > 0) --g_total_pending_count;
+    }
     queue.erase(queue.begin());
-    if (g_total_pending_count > 0) --g_total_pending_count;
   }
   uint64_t req_id = ++g_req_id_seq;
   queue.push_back(Pending(req_id, gen, e, now_ms(), started_mono));
@@ -1279,13 +1281,16 @@ static void flush_incomplete_wsse(std::map<FlowKey, Flow> &flows,
 static void flush_all_pending(std::map<PacketKey, std::vector<Pending> > &pending) {
   for (std::map<PacketKey, std::vector<Pending> >::iterator p = pending.begin(); p != pending.end(); ++p) {
     for (size_t i = 0; i < p->second.size(); ++i) {
-      emit_event(p->second[i].ev);
+      if (!p->second[i].is_tombstone) {
+        emit_event(p->second[i].ev);
+      }
     }
   }
   pending.clear();
   g_pending_fifo.clear();
   g_total_pending_count = 0;
 }
+
 
 static void sweep(std::map<FlowKey, Flow> &flows,
                   std::map<PacketKey, std::vector<Pending> > &pending,
@@ -1313,7 +1318,19 @@ static void sweep(std::map<FlowKey, Flow> &flows,
       Pending &entry = p->second[i];
       if (entry.is_tombstone) {
         if (now_mono - entry.tombstone_mono_ms > 10000LL) {
+          // Tombstone expired un-consumed: flush all remaining entries in this
+          // queue immediately (ordering is now ambiguous – a very-late response
+          // must not silently attach to the next real request).
           p->second.erase(p->second.begin() + i);
+          while (i < p->second.size()) {
+            Pending &tail = p->second[i];
+            if (!tail.is_tombstone) {
+              emit_event(tail.ev);
+              if (g_total_pending_count > 0) --g_total_pending_count;
+            }
+            p->second.erase(p->second.begin() + i);
+          }
+          // Leave i unchanged; inner while exits on next check
         } else {
           ++i;
         }
@@ -1336,6 +1353,7 @@ static void sweep(std::map<FlowKey, Flow> &flows,
     g_pending_fifo.pop_front();
   }
 }
+
 
 static bool drain_ooo_segments(Flow &fl) {
   bool drained = true;
@@ -1559,8 +1577,12 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
 
           int st = 0; size_t cl = 0; bool has_cl = false, is_chunked = false, is_close = false;
           if (!parse_response(rfl.buf.data(), end + 2, &st, &cl, &has_cl, &is_chunked, &is_close)) {
-            rfl.buf_erase(0, end + 4);
-            continue;
+            // Ambiguous framing (conflicting Content-Length, bad status, etc.).
+            // Discard the header and mark the stream broken so body bytes are
+            // not re-scanned as a new response – prevents fabricated statuses.
+            rfl.clear_buffers();
+            rfl.is_broken = true;
+            break;
           }
 
           if (st >= 100 && st <= 199 && st != 101) {
@@ -1767,8 +1789,10 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(rk);
     if (p != pending.end()) {
       for (size_t i = 0; i < p->second.size(); ++i) {
-        emit_event(p->second[i].ev);
-        if (g_total_pending_count > 0) --g_total_pending_count;
+        if (!p->second[i].is_tombstone) {
+          emit_event(p->second[i].ev);
+          if (g_total_pending_count > 0) --g_total_pending_count;
+        }
       }
       pending.erase(p);
     }

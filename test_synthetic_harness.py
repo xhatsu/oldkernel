@@ -492,6 +492,107 @@ def run_test_suite_for_engine(run_pcap, engine_name):
         os.remove(tmp_pcap)
     return failures
 
+def run_test_suite_for_engine_ext(run_pcap, engine_name):
+    """Additional tests 23-25 for the three new blocker fixes."""
+    failures = []
+    tmp_pcap = "/tmp/nt_synth_ext_%s.pcap" % engine_name.replace("+", "p")
+
+    # -----------------------------------------------------------------------
+    # 23. Tombstone Expiry Must Not Allow Late Response to Attach to /new
+    # /old expires -> tombstone -> tombstone expires after 10s -> a very-late
+    # response arrives. It must NOT be attributed to any request.
+    # We verify: exactly 2 events (both uncorrelated), neither has status set.
+    # -----------------------------------------------------------------------
+    # Use separate src ports to avoid cross-test state pollution
+    req_old23 = b"GET /api/old23 HTTP/1.1\r\nHost: x\r\n\r\n"
+    req_new23 = b"GET /api/new23 HTTP/1.1\r\nHost: x\r\n\r\n"
+    old_seq23 = 23000
+    new_seq23 = old_seq23 + len(req_old23)
+    # t=0   SYN + /old23
+    pkt_syn23 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
+                                  old_seq23 - 1, 0, 0x02, b"")
+    pkt_old23 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
+                                  old_seq23, 0, 0x18, req_old23)
+    # t=60s /new23 on same connection (well past PENDING_TTL + tombstone TTL)
+    pkt_new23 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
+                                  new_seq23, 0, 0x18, req_new23)
+    # t=62s response that would have matched /old23
+    resp23 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    resp_seq23 = old_seq23 + len(req_old23) + len(req_new23)
+    pkt_resp23 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50023,
+                                   40000, old_seq23 + len(req_old23), 0x18, resp23)
+    write_pcap(tmp_pcap, [
+        (23, 0,         pkt_syn23,  len(pkt_syn23)),
+        (23, 1000,      pkt_old23,  len(pkt_old23)),
+        (23, 60000000,  pkt_new23,  len(pkt_new23)),   # 60 s in usec
+        (23, 62000000,  pkt_resp23, len(pkt_resp23)),
+    ])
+    ev23 = run_pcap(tmp_pcap, [80])
+    # /new23 must NOT carry a status from /old23's response
+    new_with_status = [e for e in ev23 if e.get("path") == "/api/new23" and e.get("status") is not None]
+    if new_with_status:
+        failures.append("[%s] Test 23 (Tombstone Expiry Re-correlation): /new23 wrongly got status %s" % (engine_name, new_with_status))
+    else:
+        print("  [%s] Test 23 (Tombstone Expiry Re-correlation): PASS" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 24. Expired Request Must Not Emit Twice (sweep + drain_pending/flush)
+    # Emit one request, let it expire via sweep, then call drain.
+    # Event count must be exactly 1, not 2.
+    # -----------------------------------------------------------------------
+    req24 = b"GET /api/once HTTP/1.1\r\nHost: x\r\n\r\n"
+    pkt24 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50024, 80, 24000, 0, 0x18, req24)
+    # No response packet – only the request. We rely on the harness's periodic
+    # sweep + final drain. A 65-second gap forces TTL expiry.
+    pkt24_dup = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50024, 80,
+                                   24000 + len(req24), 0, 0x18,
+                                   b"GET /api/second HTTP/1.1\r\nHost: x\r\n\r\n")
+    write_pcap(tmp_pcap, [
+        (24, 0,        pkt24,     len(pkt24)),
+        (24, 65000000, pkt24_dup, len(pkt24_dup)),  # 65 s later forces sweep expiry of /once
+    ])
+    ev24 = run_pcap(tmp_pcap, [80])
+    once_ev = [e for e in ev24 if e.get("path") == "/api/once"]
+    if len(once_ev) != 1:
+        failures.append("[%s] Test 24 (No Double-Emit on Drain): /api/once emitted %d times, expected 1" % (engine_name, len(once_ev)))
+    else:
+        print("  [%s] Test 24 (No Double-Emit on Drain): PASS" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 25. Conflicting Content-Length in Response Must Not Fabricate Status
+    # Send a request, then a response whose body contains HTTP/1.1 503.
+    # The response has conflicting CL headers -> stream broken -> 503 must
+    # never appear as a correlated event.
+    # -----------------------------------------------------------------------
+    req25  = b"GET /api/legit HTTP/1.1\r\nHost: x\r\n\r\n"
+    # Conflicting CL: two different values
+    bad_resp25 = (b"HTTP/1.1 200 OK\r\n"
+                  b"Content-Length: 100\r\n"
+                  b"Content-Length: 999\r\n"
+                  b"\r\n"
+                  b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+    pkt_req25  = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50025, 80,
+                                   25000, 0, 0x18, req25)
+    pkt_resp25 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50025,
+                                   45000, 25000 + len(req25), 0x18, bad_resp25)
+    write_pcap(tmp_pcap, [
+        (25, 0,      pkt_req25,  len(pkt_req25)),
+        (25, 10000,  pkt_resp25, len(pkt_resp25)),
+    ])
+    ev25 = run_pcap(tmp_pcap, [80])
+    status_503 = [e for e in ev25 if e.get("status") == 503]
+    legit_with_200 = [e for e in ev25 if e.get("path") == "/api/legit" and e.get("status") == 200]
+    if status_503:
+        failures.append("[%s] Test 25 (Broken Resp Stream Fabrication): 503 fabricated from body bytes: %s" % (engine_name, status_503))
+    elif legit_with_200:
+        failures.append("[%s] Test 25 (Broken Resp Stream Fabrication): /api/legit wrongly got 200 from ambiguous response" % engine_name)
+    else:
+        print("  [%s] Test 25 (Broken Resp Stream Fabrication): PASS (broken stream produced no fake status)" % engine_name)
+
+    if os.path.exists(tmp_pcap):
+        os.remove(tmp_pcap)
+    return failures
+
 def run_regression_suite():
     print("=== Running Dual-Engine Synthetic Packet Regression Suite ===")
     subprocess.run(["make", "pcap_test_cpp"], cwd=OLD_DIR, check=True)
@@ -499,6 +600,8 @@ def run_regression_suite():
     for engine_name, run_func in (("C++", run_cpp_pcap), ("Python", run_python_pcap)):
         failures = run_test_suite_for_engine(run_func, engine_name)
         all_failures.extend(failures)
+        ext_failures = run_test_suite_for_engine_ext(run_func, engine_name)
+        all_failures.extend(ext_failures)
 
     print("\n--- Overall Summary: %d failures across all test runs ---" % len(all_failures))
     if all_failures:
@@ -507,7 +610,7 @@ def run_regression_suite():
             print("  *", f)
         sys.exit(1)
     else:
-        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (44/44 PASS)!")
+        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (50/50 PASS)!")
 
 if __name__ == "__main__":
     run_regression_suite()

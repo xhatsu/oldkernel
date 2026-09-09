@@ -1366,7 +1366,17 @@ def sweep_pending(pending_tbl, now, out):
             tomb_ts = item[3] if len(item) > 3 else 0.0
             if is_tomb:
                 if now - tomb_ts > 10.0:
+                    # Tombstone expired un-consumed: ordering is now ambiguous.
+                    # Flush all remaining entries immediately so no subsequent
+                    # response can silently attach to the next real request.
                     lst.pop(i)
+                    while i < len(lst):
+                        tail = lst[i]
+                        tail_tomb = tail[2] if len(tail) > 2 else False
+                        if not tail_tomb:
+                            out.append(tail[0])
+                        lst.pop(i)
+                    # Leave i unchanged; the while condition will exit naturally
                 else:
                     i += 1
             elif now - item[1] > PENDING_TTL:
@@ -1381,6 +1391,7 @@ def sweep_pending(pending_tbl, now, out):
                 i += 1
         if not lst:
             pending_tbl.pop(rk, None)
+
 
 
 def drain_pending(pending_tbl, out):

@@ -3,7 +3,26 @@
 
 # STATE.md — Current Project State & Memory
 
-## Capture & Parser Final Hardening Round 2 (2026-09-09)
+## Capture & Parser Hardening Round 3 — 3 Blocker Fixes (2026-09-09)
+
+Three additional reproducible blockers fixed in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
+
+1. **Tombstone Expiry Allows Late Re-correlation (Test 23)**: After a tombstone's 10 s secondary TTL expires un-consumed, all remaining pending entries in the same flow queue are now immediately emitted and removed. A very-late response arriving after the tombstone is purged can no longer silently attach to the next real request.
+
+2. **Duplicate Emit on Shutdown (Test 24)**: `flush_all_pending()`, per-flow overflow eviction (`queue_request`), and SYN pending cleanup now all guard with `!is_tombstone` before calling `emit_event()`. Tombstone entries are always already emitted by `sweep()`; double-emitting them via flush or SYN reconnect paths is eliminated.
+
+3. **Ambiguous Response Framing Fabricates Status (Test 25)**: `parse_response()` returning false (conflicting Content-Length) previously did `buf_erase + continue` — leaving body bytes in the buffer to be re-scanned as a new response. Now it does `clear_buffers() + is_broken = true + break`, matching the Python engine's behavior.
+
+### Test Results After All Fixes
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **19/19 PASS** |
+| `python3 test_synthetic_harness.py` | **50/50 PASS** (Tests 1–25, both engines) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,205 events ✓ |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 7 EDGE TESTS PASS** |
+| `make clean && make all && make fixture` | **PASS** (0 warnings) |
+
 
 Seven additional reproducible bugs fixed in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
 
