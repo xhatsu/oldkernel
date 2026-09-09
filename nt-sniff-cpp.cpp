@@ -267,6 +267,7 @@ struct Flow {
   bool is_broken;
   bool correlation_disabled;
   bool syn_seen;
+  bool corr_eligible;
   time_t touched;
   long long first_byte_mono_ms;
   uint32_t generation;
@@ -292,7 +293,7 @@ struct Flow {
   size_t wsse_goal;
 
   Flow() : next_seq(0), has_seq(false), is_broken(false), correlation_disabled(false),
-           syn_seen(false), touched(time(NULL)), first_byte_mono_ms(0), generation(0),
+           syn_seen(false), corr_eligible(true), touched(time(NULL)), first_byte_mono_ms(0), generation(0),
            state(HTTP_STATE_HEADER), body_remaining(0), chunk_payload_remaining(0),
            chunk_reading_len(true), chunk_reading_crlf(false), chunk_reading_trailer(false),
            awaiting_wsse(false), wsse_goal(0) {}
@@ -440,6 +441,49 @@ static bool is_correlation_disabled(const PacketKey &key, bool syn_seen) {
   if (g_corr_disabled.count(key)) return true;
   if (g_corr_capacity_reached && !syn_seen) return true;
   return false;
+}
+
+static void invalidate_connection_correlation(std::map<FlowKey, Flow> &flows, const PacketKey &rk) {
+  corr_disabled_insert(rk);
+  std::map<FlowKey, Flow>::iterator rit = flows.find(rk);
+  if (rit != flows.end()) {
+    rit->second.corr_eligible = false;
+  }
+  FlowKey cfk;
+  cfk.s_ip = rk.d_ip; cfk.sport = rk.dport;
+  cfk.d_ip = rk.s_ip; cfk.dport = rk.sport;
+  std::map<FlowKey, Flow>::iterator cit = flows.find(cfk);
+  if (cit != flows.end()) {
+    cit->second.corr_eligible = false;
+  }
+}
+
+static bool is_correlation_allowed(const PacketKey &rk,
+                                   const std::map<FlowKey, Flow> &flows,
+                                   uint32_t gen,
+                                   bool syn_seen,
+                                   bool corr_eligible) {
+  if (g_corr_disabled.count(rk) > 0) return false;
+  if (!corr_eligible) return false;
+
+  std::map<FlowKey, Flow>::const_iterator rit = flows.find(rk);
+  if (rit != flows.end()) {
+    if (!rit->second.corr_eligible || rit->second.is_broken) return false;
+  }
+
+  FlowKey cfk;
+  cfk.s_ip = rk.d_ip; cfk.sport = rk.dport;
+  cfk.d_ip = rk.s_ip; cfk.dport = rk.sport;
+  std::map<FlowKey, Flow>::const_iterator cit = flows.find(cfk);
+  if (cit != flows.end()) {
+    if (!cit->second.corr_eligible || cit->second.is_broken) return false;
+  }
+
+  if (g_corr_capacity_reached) {
+    if (!syn_seen || gen == 0) return false;
+  }
+
+  return true;
 }
 
 
@@ -1251,10 +1295,12 @@ static void emit_event(const Event &e) {
 
 static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
                           uint32_t d_ip, unsigned dport,
+                          std::map<FlowKey, Flow> &flows,
                           std::map<PacketKey, std::vector<Pending> > &pending,
                           long long first_byte_mono_ms = 0,
                           uint32_t gen = 0,
-                          bool syn_seen = false) {
+                          bool syn_seen = false,
+                          bool corr_eligible = true) {
   PacketKey rk;
   rk.s_ip = d_ip; rk.sport = (uint16_t)dport;
   rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
@@ -1262,8 +1308,7 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
   long long mono_now = now_monotonic_ms();
   long long started_mono = (first_byte_mono_ms > 0) ? first_byte_mono_ms : mono_now;
 
-  bool verified = syn_seen || (gen > 0);
-  if (is_correlation_disabled(rk, verified)) {
+  if (!is_correlation_allowed(rk, flows, gen, syn_seen, corr_eligible)) {
     emit_event(e);
     return;
   }
@@ -1284,14 +1329,14 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
             it->second.erase(it->second.begin());
           }
           pending.erase(it);
-          corr_disabled_insert(ref.key);
+          invalidate_connection_correlation(flows, ref.key);
           break;
         }
       }
     }
   }
 
-  if (is_correlation_disabled(rk, verified)) {
+  if (!is_correlation_allowed(rk, flows, gen, syn_seen, corr_eligible)) {
     emit_event(e);
     return;
   }
@@ -1307,7 +1352,7 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
       queue.erase(queue.begin());
     }
     pending.erase(rk);
-    corr_disabled_insert(rk);
+    invalidate_connection_correlation(flows, rk);
     emit_event(e);
     return;
   }
@@ -1351,8 +1396,8 @@ static void flush_incomplete_wsse(std::map<FlowKey, Flow> &flows,
   for (std::map<FlowKey, Flow>::iterator f = flows.begin(); f != flows.end(); ++f) {
     if (f->second.awaiting_wsse) {
       queue_request(f->second.wsse_event, f->first.s_ip, f->first.sport,
-                    f->first.d_ip, f->first.dport, pending, f->second.first_byte_mono_ms,
-                    f->second.generation, f->second.syn_seen);
+                    f->first.d_ip, f->first.dport, flows, pending, f->second.first_byte_mono_ms,
+                    f->second.generation, f->second.syn_seen, f->second.corr_eligible);
 
       f->second.awaiting_wsse = false;
     }
@@ -1417,7 +1462,7 @@ static void sweep(std::map<FlowKey, Flow> &flows,
             }
             p->second.erase(p->second.begin() + i);
           }
-          corr_disabled_insert(disabled_key);
+          invalidate_connection_correlation(flows, disabled_key);
           // Leave i unchanged; inner while exits on next check
 
         } else {
@@ -1509,11 +1554,15 @@ static void evict_oldest_flow_if_needed(std::map<FlowKey, Flow> &flows,
     }
     if (oldest->second.awaiting_wsse) {
       queue_request(oldest->second.wsse_event, oldest->first.s_ip, oldest->first.sport,
-                    oldest->first.d_ip, oldest->first.dport, pending, oldest->second.first_byte_mono_ms,
-                    oldest->second.generation, oldest->second.syn_seen);
+                    oldest->first.d_ip, oldest->first.dport, flows, pending, oldest->second.first_byte_mono_ms,
+                    oldest->second.generation, oldest->second.syn_seen, oldest->second.corr_eligible);
 
       oldest->second.awaiting_wsse = false;
     }
+    PacketKey rk;
+    rk.s_ip = oldest->first.d_ip; rk.sport = oldest->first.dport;
+    rk.d_ip = oldest->first.s_ip; rk.dport = oldest->first.sport;
+    invalidate_connection_correlation(flows, rk);
     oldest->second.clear_buffers();
     flows.erase(oldest);
   }
@@ -1578,8 +1627,30 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     if (tcp_flags & 0x02) { // SYN from server
       evict_oldest_flow_if_needed(flows, pending);
       Flow &rfl = flows[rfk];
+      uint32_t gen = rfl.generation;
+      bool syn = rfl.syn_seen;
+      bool eligible = rfl.corr_eligible;
+      if (gen == 0) {
+        FlowKey cfk; cfk.s_ip = d_ip; cfk.sport = (uint16_t)dport; cfk.d_ip = s_ip; cfk.dport = (uint16_t)sport;
+        std::map<FlowKey, Flow>::iterator cfit = flows.find(cfk);
+        if (cfit != flows.end() && cfit->second.generation > 0) {
+          gen = cfit->second.generation;
+          syn = cfit->second.syn_seen;
+          eligible = cfit->second.corr_eligible;
+        }
+      }
       rfl.clear_buffers();
-      rfl = Flow();
+      rfl.buf.clear();
+      rfl.ooo.clear();
+      rfl.state = Flow::HTTP_STATE_HEADER;
+      rfl.body_remaining = 0;
+      rfl.chunk_payload_remaining = 0;
+      rfl.chunk_reading_len = true;
+      rfl.chunk_reading_crlf = false;
+      rfl.chunk_reading_trailer = false;
+      rfl.generation = gen;
+      rfl.syn_seen = syn || true;
+      rfl.corr_eligible = (gen > 0) ? eligible : true;
       rfl.has_seq = true;
       rfl.next_seq = seq + 1;
       rfl.is_broken = false;
@@ -1672,6 +1743,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
             // not re-scanned as a new response – prevents fabricated statuses.
             rfl.clear_buffers();
             rfl.is_broken = true;
+            invalidate_connection_correlation(flows, rfk);
             break;
           }
 
@@ -1683,9 +1755,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           PacketKey pk;
           pk.s_ip = s_ip; pk.sport = (uint16_t)sport;
           pk.d_ip = d_ip; pk.dport = (uint16_t)dport;
-          bool verified = rfl.syn_seen || (rfl.generation > 0);
+          bool allowed = is_correlation_allowed(pk, flows, rfl.generation, rfl.syn_seen, rfl.corr_eligible);
           std::map<PacketKey, std::vector<Pending> >::iterator p =
-              is_correlation_disabled(pk, verified) ? pending.end() : pending.find(pk);
+              allowed ? pending.find(pk) : pending.end();
           bool is_head = false;
 
           if (p != pending.end() && !p->second.empty()) {
@@ -1902,9 +1974,17 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     }
     uint32_t next_gen = fl.generation + 1;
     fl.clear_buffers();
-    fl = Flow();
+    fl.buf.clear();
+    fl.ooo.clear();
+    fl.state = Flow::HTTP_STATE_HEADER;
+    fl.body_remaining = 0;
+    fl.chunk_payload_remaining = 0;
+    fl.chunk_reading_len = true;
+    fl.chunk_reading_crlf = false;
+    fl.chunk_reading_trailer = false;
     fl.generation = next_gen;
     fl.syn_seen = true;
+    fl.corr_eligible = true;
     fl.has_seq = true;
     fl.next_seq = seq + 1;
     fl.touched = now;
@@ -1916,9 +1996,22 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
       rfit->second.clear_buffers();
     }
     Flow &resp_fl = flows[rk];
-    resp_fl = Flow();
+    resp_fl.clear_buffers();
+    resp_fl.buf.clear();
+    resp_fl.ooo.clear();
+    resp_fl.state = Flow::HTTP_STATE_HEADER;
+    resp_fl.body_remaining = 0;
+    resp_fl.chunk_payload_remaining = 0;
+    resp_fl.chunk_reading_len = true;
+    resp_fl.chunk_reading_crlf = false;
+    resp_fl.chunk_reading_trailer = false;
     resp_fl.generation = next_gen;
     resp_fl.syn_seen = true;
+    resp_fl.corr_eligible = true;
+    resp_fl.has_seq = false;
+    resp_fl.next_seq = 0;
+    resp_fl.is_broken = false;
+    resp_fl.touched = now;
     return true;
 
   }
@@ -2038,7 +2131,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           fl.wsse_buf.clear();
           fl.wsse_goal = meta.content_length < g_wsse_body_bytes ? meta.content_length : g_wsse_body_bytes;
         } else {
-          queue_request(e, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
+          queue_request(e, s_ip, sport, d_ip, dport, flows, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen, fl.corr_eligible);
         }
 
         if (meta.has_content_length && meta.content_length > 0) {
@@ -2073,7 +2166,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
             if (!username.empty()) {
               ev.wsse_user = username; ev.user = username; ev.scheme = "wsse";
             }
-            queue_request(ev, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
+            queue_request(ev, s_ip, sport, d_ip, dport, flows, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen, fl.corr_eligible);
             fl.awaiting_wsse = false;
           }
         }
@@ -2082,7 +2175,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
         fl.body_remaining -= to_consume;
         if (fl.body_remaining == 0) {
           if (fl.awaiting_wsse) {
-            queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
+            queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, flows, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen, fl.corr_eligible);
             fl.awaiting_wsse = false;
           }
           fl.state = Flow::HTTP_STATE_HEADER;
@@ -2186,7 +2279,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   // FIN / RST Lifecycle: process after payload
   if (tcp_flags & 0x05) {
     if (fl.awaiting_wsse) {
-      queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
+      queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, flows, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen, fl.corr_eligible);
       fl.awaiting_wsse = false;
     }
 
@@ -2598,8 +2691,99 @@ static int run_lockout_fixture() {
     fprintf(stderr, "Lockout fixture failed: key with verified SYN must allow correlation\n");
     return 1;
   }
+
+  // Test packet-sequence Reproduction 1: An old SYN does not bypass an evicted lockout.
+  // Connection 10.0.0.1:50001 -> 10.0.0.2:80 loses ordering and its lockout is evicted.
+  // Existing syn_seen=true must NOT allow correlation for /new, and old response must not correlate.
+  {
+    std::map<FlowKey, Flow> test_flows;
+    PacketKey rk;
+    rk.s_ip = 0x0a000002; rk.sport = 80;
+    rk.d_ip = 0x0a000001; rk.dport = 50001;
+    FlowKey fk;
+    fk.s_ip = 0x0a000001; fk.sport = 50001;
+    fk.d_ip = 0x0a000002; fk.dport = 80;
+
+    // Step 1: Connection starts with client SYN (generation 1, syn_seen = true, corr_eligible = true)
+    Flow &cfl = test_flows[fk];
+    cfl.generation = 1; cfl.syn_seen = true; cfl.corr_eligible = true;
+    Flow &sfl = test_flows[rk];
+    sfl.generation = 1; sfl.syn_seen = true; sfl.corr_eligible = true;
+
+    // Step 2: Connection loses ordering (e.g. tombstone expired unconsumed or queue overflow)
+    invalidate_connection_correlation(test_flows, rk);
+    if (cfl.corr_eligible || sfl.corr_eligible) {
+      fprintf(stderr, "Lockout fixture failed: correlation eligibility not disabled on ordering loss\n");
+      return 1;
+    }
+
+    // Step 3: 2048 other connections time out, evicting rk from g_corr_disabled
+    for (unsigned i = 0; i < 2050; ++i) {
+      PacketKey k;
+      k.s_ip = 0x0a000002; k.sport = 8080;
+      k.d_ip = 0x0a000001; k.dport = (uint16_t)(10000 + (i % 55000));
+      corr_disabled_insert(k);
+    }
+    // rk is now evicted from g_corr_disabled
+    if (g_corr_disabled.count(rk) > 0) {
+      fprintf(stderr, "Lockout fixture failed: rk was not evicted as expected\n");
+      return 1;
+    }
+
+    // Step 4: /new arrives on this connection without a new SYN.
+    // Must NOT be allowed to correlate despite cfl.syn_seen == true!
+    if (is_correlation_allowed(rk, test_flows, cfl.generation, cfl.syn_seen, cfl.corr_eligible)) {
+      fprintf(stderr, "Lockout fixture failed: old SYN bypassed evicted lockout for /new\n");
+      return 1;
+    }
+
+    // Server direction must also not allow correlation:
+    if (is_correlation_allowed(rk, test_flows, sfl.generation, sfl.syn_seen, sfl.corr_eligible)) {
+      fprintf(stderr, "Lockout fixture failed: server direction allowed correlation on evicted lockout\n");
+      return 1;
+    }
+  }
+
+  // Test packet-sequence Reproduction 2: SYN-ACK preserves verification under capacity fallback.
+  // Under active capacity fallback, fresh client SYN sets verification, and server SYN-ACK
+  // must preserve generation and eligibility rather than resetting it.
+  {
+    std::map<FlowKey, Flow> test_flows;
+    PacketKey rk;
+    rk.s_ip = 0x0a000002; rk.sport = 80;
+    rk.d_ip = 0x0a000001; rk.dport = 50002;
+    FlowKey fk;
+    fk.s_ip = 0x0a000001; fk.sport = 50002;
+    fk.d_ip = 0x0a000002; fk.dport = 80;
+
+    // Client SYN establishes verification
+    Flow &cfl = test_flows[fk];
+    cfl.generation = 1; cfl.syn_seen = true; cfl.corr_eligible = true;
+    Flow &sfl = test_flows[rk];
+    sfl.generation = 1; sfl.syn_seen = true; sfl.corr_eligible = true;
+
+    // Server SYN-ACK arrives: preserve generation and eligibility
+    uint32_t gen = sfl.generation;
+    bool syn = sfl.syn_seen;
+    bool eligible = sfl.corr_eligible;
+    sfl.clear_buffers();
+    sfl.generation = gen;
+    sfl.syn_seen = syn || true;
+    sfl.corr_eligible = (gen > 0) ? eligible : true;
+
+    // Both directions must remain eligible for correlation under capacity fallback!
+    if (!is_correlation_allowed(rk, test_flows, cfl.generation, cfl.syn_seen, cfl.corr_eligible)) {
+      fprintf(stderr, "Lockout fixture failed: client direction lost verification after SYN-ACK\n");
+      return 1;
+    }
+    if (!is_correlation_allowed(rk, test_flows, sfl.generation, sfl.syn_seen, sfl.corr_eligible)) {
+      fprintf(stderr, "Lockout fixture failed: server direction lost verification after SYN-ACK\n");
+      return 1;
+    }
+  }
+
   corr_disabled_clear();
-  fprintf(stderr, "Lockout registry 10k bounded fixture: PASS (size=%lu, capacity_fallback=verified)\n",
+  fprintf(stderr, "Lockout registry 10k bounded fixture: PASS (size=%lu, capacity_fallback=verified, reproductions=passed)\n",
           (unsigned long)MAX_CORR_DISABLED);
   return 0;
 }

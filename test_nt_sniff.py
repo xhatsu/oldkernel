@@ -316,3 +316,83 @@ def test_bounded_lockout_registry_10k_connections():
     assert nt_sniff.is_correlation_disabled(evicted_rk, syn_seen=True) is False
     nt_sniff.corr_disabled_clear()
 
+
+def test_old_syn_does_not_bypass_evicted_lockout():
+    nt_sniff.corr_disabled_clear()
+    flows = {}
+    resp_flows = {}
+    pending = {}
+    out = []
+
+    key = ("10.0.0.1", 50026, "10.0.0.2", 80)
+    meta = ("10.0.0.2", 80, "10.0.0.1", 50026)
+    rk = ("10.0.0.2", 80, "10.0.0.1", 50026)
+
+    # 1. Connection starts with client SYN
+    nt_sniff.handle_payload(flows, key, None, b"", meta, {80}, "node", out,
+                            pending_tbl=pending, now=100.0, seq=1000, flags=0x02, resp_flows=resp_flows)
+    assert flows[key].syn_seen is True
+    assert flows[key].generation == 1
+    assert flows[key].corr_eligible is True
+
+    # 2. Connection loses ordering (e.g. invalidate_connection_correlation)
+    nt_sniff.invalidate_connection_correlation(flows, resp_flows, rk)
+    assert flows[key].corr_eligible is False
+    assert resp_flows[rk].corr_eligible is False
+
+    # 3. Flood 2050 distinct connections to saturate registry and evict rk
+    for i in range(2050):
+        dummy_rk = ("10.0.0.2", 80, "10.0.0.1", 10000 + i)
+        nt_sniff.corr_disabled_insert(dummy_rk)
+    assert rk not in nt_sniff.corr_disabled  # evicted!
+    assert nt_sniff.corr_capacity_reached is True
+
+    # 4. /new arrives on old connection (syn_seen is True from old SYN, but corr_eligible is False)
+    assert nt_sniff.is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                          gen=flows[key].generation, syn_seen=flows[key].syn_seen,
+                                          corr_eligible=flows[key].corr_eligible) is False
+    nt_sniff.corr_disabled_clear()
+
+
+def test_synack_preserves_verification_under_capacity_fallback():
+    nt_sniff.corr_disabled_clear()
+    # Saturate registry to activate capacity fallback
+    for i in range(2050):
+        dummy_rk = ("10.0.0.2", 80, "10.0.0.1", 10000 + i)
+        nt_sniff.corr_disabled_insert(dummy_rk)
+    assert nt_sniff.corr_capacity_reached is True
+
+    flows = {}
+    resp_flows = {}
+    pending = {}
+    out = []
+
+    key = ("10.0.0.1", 50027, "10.0.0.2", 80)
+    meta = ("10.0.0.2", 80, "10.0.0.1", 50027)
+    rk = ("10.0.0.2", 80, "10.0.0.1", 50027)
+
+    # 1. Fresh client SYN arrives
+    nt_sniff.handle_payload(flows, key, None, b"", meta, {80}, "node", out,
+                            pending_tbl=pending, now=170.0, seq=2000, flags=0x02, resp_flows=resp_flows)
+    assert flows[key].syn_seen is True
+    assert flows[key].generation == 1
+    assert resp_flows[rk].generation == 1
+    assert resp_flows[rk].syn_seen is True
+    assert resp_flows[rk].corr_eligible is True
+
+    # 2. Server SYN-ACK arrives: must preserve generation and eligibility
+    nt_sniff.handle_response(resp_flows, rk, b"", 170.1, out, pending,
+                            seq=5000, flags=0x12, flows=flows)
+    assert resp_flows[rk].generation == 1
+    assert resp_flows[rk].syn_seen is True
+    assert resp_flows[rk].corr_eligible is True
+
+    # Both directions must be allowed to correlate under capacity fallback
+    assert nt_sniff.is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                          gen=flows[key].generation, syn_seen=flows[key].syn_seen,
+                                          corr_eligible=flows[key].corr_eligible) is True
+    assert nt_sniff.is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                          gen=resp_flows[rk].generation, syn_seen=resp_flows[rk].syn_seen,
+                                          corr_eligible=resp_flows[rk].corr_eligible) is True
+    nt_sniff.corr_disabled_clear()
+

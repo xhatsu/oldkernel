@@ -3,27 +3,25 @@
 
 # STATE.md — Current Project State & Memory
 
-## Capture & Parser Hardening Round 3 — Blocker Fixes & Bounded Memory (2026-09-09)
+## Capture & Parser Hardening Round 4 — Generation-Scoped Eligibility & SYN-ACK Verification (2026-09-09)
 
-Four critical issues fixed in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
+Two critical edge cases resolved in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
 
-1. **Persistent Correlation Lockout on Unresolved Tombstone Expiry or Eviction (Test 23)**: When an unresolved tombstone is discarded after its 10-second retention, or when ordering information is lost due to queue/flow eviction, response correlation is permanently disabled for that connection (`g_corr_disabled` in C++, `corr_disabled` in Python). Subsequent requests on that connection emit immediately with null response fields and are never queued; incoming responses are framed but discarded. The lockout persists until a verified new TCP connection (client SYN) resets the state and restores correlation.
+1. **Generation-Scoped Correlation Eligibility (Test 26)**: Addressed reproduction where an old SYN bypassed an evicted lockout. A connection that loses ordering now has `corr_eligible` latched to `false` for that generation across both flow directions (`FlowKey` and reverse key). Even when the 4-tuple is evicted from `g_corr_disabled` due to 2,048+ other connections timing out, the connection remains ineligible for response correlation. Requests emit immediately with null status; late responses do not correlate. Only a fresh TCP connection (client SYN) resets sequence state and restores correlation eligibility.
 
-2. **Duplicate Emit on Shutdown (Test 24)**: `flush_all_pending()`, per-flow overflow eviction (`queue_request`), and SYN pending cleanup now all guard with `!is_tombstone` before calling `emit_event()`. Tombstone entries are always already emitted by `sweep()`; double-emitting them via flush or SYN reconnect paths is eliminated.
+2. **SYN-ACK Verification Preservation (Test 27)**: Addressed reproduction where server SYN-ACK wiped verification under capacity fallback. When processing server SYN-ACK (`flags & 0x02` from server in Direction A), `rfl.generation`, `rfl.syn_seen`, and `rfl.corr_eligible` are now preserved from the client SYN rather than reset with a blank `Flow()`. When capacity fallback is active, legitimate request/response pairs correlate properly with status 200.
 
-3. **Ambiguous Response Framing Fabricates Status (Test 25)**: `parse_response()` returning false (conflicting Content-Length) previously did `buf_erase + continue` — leaving body bytes in the buffer to be re-scanned as a new response. Now it does `clear_buffers() + is_broken = true + break`, matching the Python engine's behavior.
-
-4. **Bounded Lockout Registry & Unverified Ordering Fallback**: `g_corr_disabled` / `corr_disabled` is strictly bounded to `MAX_CORR_DISABLED = 2048` entries using a FIFO eviction queue. When capacity is reached (`corr_capacity_reached`), evicted entries are NOT re-enabled for correlation; instead, any connection whose ordering cannot be verified (`!syn_seen`) safely falls back to emitting requests with null response fields. Verified connections (observed client SYN) correlate normally. Prevents unbounded memory growth across thousands of timed-out connections.
-
-### Test Results After All Fixes
+### Test Results After Round 4 Fixes
 
 | Suite | Result |
 |---|---|
-| `pytest test_nt_sniff.py` | **20/20 PASS** |
-| `python3 test_synthetic_harness.py` | **50/50 PASS** (Tests 1–25, both engines) |
+| `pytest test_nt_sniff.py` | **22/22 PASS** |
+| `python3 test_synthetic_harness.py` | **54/54 PASS** (Tests 1–27, both engines) |
+| `./nt-sniff-cpp --lockout-fixture` | **PASS** (10k bounded registry + packet sequence reproductions) |
 | `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,204 events ✓ |
-| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL EDGE TESTS PASS** (including lockout 10k fixture) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL EDGE TESTS PASS** |
 | `make clean && make all && make fixture` | **PASS** (0 warnings) |
+| `sh build-firstrun.sh` | **355,327 bytes** bundle rebuilt |
 
 
 

@@ -305,7 +305,8 @@ class Flow(object):
                  "buf", "ooo", "state", "body_remaining", "chunk_remaining",
                  "chunk_payload_remaining", "chunk_reading_len", "chunk_reading_crlf",
                  "chunk_reading_trailer", "awaiting_wsse", "wsse_event", "wsse_buf",
-                 "wsse_goal", "event", "hdrs", "head_bytes", "body_goal", "generation")
+                 "wsse_goal", "event", "hdrs", "head_bytes", "body_goal", "generation",
+                 "syn_seen", "corr_eligible")
 
     def __init__(self):
         self.next_seq = 0
@@ -331,6 +332,8 @@ class Flow(object):
         self.head_bytes = 0
         self.body_goal = 0
         self.generation = 0
+        self.syn_seen = False
+        self.corr_eligible = True
 
 
 def _drain_ooo(fl):
@@ -355,15 +358,16 @@ def _drain_ooo(fl):
                 break
 
 
+def seq_in_window(seq, base, window):
+    return 0 <= seq_diff(seq, base) < window
+
+
 # ------------------------------------------------- response correlation ----
 PENDING_TTL = 5.0        # flush unmatched requests after this many seconds
 PENDING_MAX = 8192       # hard cap; overflow flushes oldest first
 PENDING_PER_FLOW = 32    # bound a single pipelined/hostile keep-alive flow
 SWEEP_INTERVAL = 1.0     # honor PENDING_TTL even when the socket goes idle
 
-# pending[(src_ip, sport, dst_ip, dport)]  -- key is the RESPONSE tuple:
-# server->client. Value: [event, req_ts]. A list per key handles HTTP
-# keep-alive pipelining (several requests before responses arrive).
 pending = {}
 MAX_CORR_DISABLED = 2048
 corr_disabled = set()
@@ -405,6 +409,41 @@ def is_correlation_disabled(rk, syn_seen):
     if corr_capacity_reached and not syn_seen:
         return True
     return False
+
+
+def invalidate_connection_correlation(flows, resp_flows, rk):
+    corr_disabled_insert(rk)
+    if resp_flows is not None:
+        rfl = resp_flows.get(rk)
+        if rfl is not None:
+            rfl.corr_eligible = False
+    if flows is not None:
+        cfk = (rk[2], rk[3], rk[0], rk[1])
+        cfl = flows.get(cfk)
+        if cfl is not None:
+            cfl.corr_eligible = False
+
+
+def is_correlation_allowed(rk, flows=None, resp_flows=None, gen=0, syn_seen=False, corr_eligible=True):
+    if rk in corr_disabled:
+        return False
+    if not corr_eligible:
+        return False
+    if resp_flows is not None:
+        rfl = resp_flows.get(rk)
+        if rfl is not None:
+            if not getattr(rfl, "corr_eligible", True) or getattr(rfl, "is_broken", False):
+                return False
+    if flows is not None:
+        cfk = (rk[2], rk[3], rk[0], rk[1])
+        cfl = flows.get(cfk)
+        if cfl is not None:
+            if not getattr(cfl, "corr_eligible", True) or getattr(cfl, "is_broken", False):
+                return False
+    if corr_capacity_reached:
+        if not syn_seen or gen == 0:
+            return False
+    return True
 
 
 def pending_del(rk):
@@ -488,12 +527,27 @@ def parse_response_head(payload):
 
 
 
-def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, flags=0, is_truncated=False):
+def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, flags=0, is_truncated=False, flows=None):
     if flags & 0x02 and seq is not None:
-        rfl = resp_flows[rk] = Flow()
+        rfl = resp_flows.get(rk)
+        gen = rfl.generation if rfl is not None else 0
+        syn = rfl.syn_seen if rfl is not None else False
+        eligible = rfl.corr_eligible if rfl is not None else True
+        if gen == 0 and flows is not None:
+            cfk = (rk[2], rk[3], rk[0], rk[1])
+            cfl = flows.get(cfk)
+            if cfl is not None and cfl.generation > 0:
+                gen = cfl.generation
+                syn = cfl.syn_seen
+                eligible = cfl.corr_eligible
+        rfl = Flow()
+        rfl.generation = gen
+        rfl.syn_seen = syn or True
+        rfl.corr_eligible = eligible if gen > 0 else True
         rfl.has_seq = True
         rfl.next_seq = (seq + 1) & 0xFFFFFFFF
         rfl.touched = now
+        resp_flows[rk] = rfl
         return
 
     rfl = resp_flows.get(rk)
@@ -549,14 +603,17 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                 elif rfl.buf.find(b"\r\n\r\n") != -1:
                     rfl.buf = bytearray()
                     rfl.is_broken = True
+                    invalidate_connection_correlation(flows, resp_flows, rk)
                 break
 
             if 100 <= st <= 199 and st != 101:
                 del rfl.buf[:head_len]
                 continue
 
-            verified = (rfl.generation > 0)
-            ent = pending_tbl.get(rk) if not is_correlation_disabled(rk, verified) else None
+            allowed = is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                             gen=rfl.generation, syn_seen=rfl.syn_seen,
+                                             corr_eligible=rfl.corr_eligible)
+            ent = pending_tbl.get(rk) if allowed else None
             is_head = False
 
             if ent:
@@ -917,7 +974,7 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     return ev if (dport in ports or h.get("_method")) else None
 
 
-def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
+def _emit_request(flows, key, fl, meta, out, pending_tbl, now, resp_flows=None):
     """Discard capture buffers, then emit/queue the sanitized event only."""
     dst_ip, dport, src_ip, sport = meta
     ev = fl.wsse_event if fl.awaiting_wsse else fl.event
@@ -930,8 +987,9 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
         out.append(ev)
         return
     rk = (dst_ip, dport, src_ip, sport)
-    verified = (fl.generation > 0)
-    if is_correlation_disabled(rk, verified):
+    if not is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                  gen=fl.generation, syn_seen=fl.syn_seen,
+                                  corr_eligible=fl.corr_eligible):
         out.append(ev)
         return
     ent = pending_tbl.get(rk)
@@ -942,14 +1000,16 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
     elif len(ent) >= PENDING_PER_FLOW:
         while pending_tbl.get(rk):
             pending_pop(rk, out, pending_tbl)
-        corr_disabled_insert(rk)
+        invalidate_connection_correlation(flows, resp_flows, rk)
         out.append(ev)
         return
     started = fl.first_byte_ts if fl.first_byte_ts > 0 else (now if now is not None else time.time())
-    ent.append([ev, started])
+    ent.append([ev, started, False, 0.0, fl.generation])
 
 
-def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_tbl, now, generation=0):
+def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_tbl, now,
+                             generation=0, syn_seen=False, corr_eligible=True,
+                             flows=None, resp_flows=None):
     dst_ip, dport, src_ip, sport = meta
     if not ev:
         return
@@ -958,8 +1018,9 @@ def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_t
         out.append(ev)
         return
     rk = (dst_ip, dport, src_ip, sport)
-    verified = (generation > 0)
-    if is_correlation_disabled(rk, verified):
+    if not is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                  gen=generation, syn_seen=syn_seen,
+                                  corr_eligible=corr_eligible):
         out.append(ev)
         return
     ent = pending_tbl.get(rk)
@@ -970,7 +1031,7 @@ def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_t
     elif len(ent) >= PENDING_PER_FLOW:
         while pending_tbl.get(rk):
             pending_pop(rk, out, pending_tbl)
-        corr_disabled_insert(rk)
+        invalidate_connection_correlation(flows, resp_flows, rk)
         out.append(ev)
         return
     started = first_byte_ts if first_byte_ts > 0 else (now if now is not None else time.time())
@@ -992,7 +1053,9 @@ def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
         fl.wsse_event["scheme"] = "wsse"
     if username or len(fl.wsse_buf) >= fl.wsse_goal:
         _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
-                                 meta, out, pending_tbl, now, generation=fl.generation)
+                                 meta, out, pending_tbl, now, generation=fl.generation,
+                                 syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
+                                 flows=flows)
         fl.awaiting_wsse = False
         return True
     return False
@@ -1024,19 +1087,28 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                     if not is_tomb:
                         out.append(item[0])
 
-        if resp_flows is not None and rk in resp_flows:
-            resp_flows.pop(rk, None)
         if rev_key is not None and rev_key in flows:
             flows.pop(rev_key, None)
 
         old_gen = fl.generation if fl is not None else 0
+        next_gen = old_gen + 1
         fl = Flow()
-        fl.generation = old_gen + 1
+        fl.generation = next_gen
+        fl.syn_seen = True
+        fl.corr_eligible = True
         fl.has_seq = True
         fl.next_seq = (seq + 1) & 0xFFFFFFFF
         fl.touched = now
         fl.first_byte_ts = 0.0
         flows[key] = fl
+
+        if resp_flows is not None:
+            rfl = Flow()
+            rfl.generation = next_gen
+            rfl.syn_seen = True
+            rfl.corr_eligible = True
+            rfl.touched = now
+            resp_flows[rk] = rfl
         return
 
     fl = flows.get(key)
@@ -1174,7 +1246,9 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                 fl.wsse_buf = bytearray()
                 fl.wsse_goal = min(content_length, wsse_body_bytes, MAX_WSSE_BODY_BYTES)
             else:
-                _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now, generation=fl.generation)
+                _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
+                                         generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
+                                         flows=flows, resp_flows=resp_flows)
             fl.event = None
 
             if content_length > 0:
@@ -1207,14 +1281,18 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                         ev["wsse_user"] = username
                         ev["user"] = username
                         ev["scheme"] = "wsse"
-                    _emit_request_to_pending(ev, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now, generation=fl.generation)
+                    _emit_request_to_pending(ev, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
+                                             generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
+                                             flows=flows, resp_flows=resp_flows)
                     fl.awaiting_wsse = False
 
             del fl.buf[:to_consume]
             fl.body_remaining -= to_consume
             if fl.body_remaining == 0:
                 if fl.awaiting_wsse:
-                    _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now, generation=fl.generation)
+                    _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
+                                             generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
+                                             flows=flows, resp_flows=resp_flows)
                     fl.awaiting_wsse = False
                 fl.state = HTTP_STATE_HEADER
                 fl.first_byte_ts = now if fl.buf else 0.0
@@ -1294,7 +1372,9 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
 
     if flags & 0x05:
         if fl.awaiting_wsse and fl.wsse_event:
-            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now)
+            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
+                                     generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
+                                     flows=flows, resp_flows=resp_flows)
             fl.awaiting_wsse = False
         flows.pop(key, None)
     elif seq is None and fl.state == HTTP_STATE_HEADER and not fl.buf and not fl.ooo and not fl.awaiting_wsse:
@@ -1388,7 +1468,7 @@ def process_packet(pkt, ports, node_host, flows, resp_flows, pending_tbl, out, n
     if sport in ports and dport not in ports:
         rk = (src_ip, sport, dst_ip, dport)
         handle_response(resp_flows, rk, payload, now, out, pending_tbl,
-                        seq=seq, flags=flags, is_truncated=is_truncated)
+                        seq=seq, flags=flags, is_truncated=is_truncated, flows=flows)
         return True
 
     # Request direction: Client -> Server
@@ -1405,7 +1485,7 @@ def process_packet(pkt, ports, node_host, flows, resp_flows, pending_tbl, out, n
     return False
 
 
-def _flush_oldest_pending(pending_tbl, out):
+def _flush_oldest_pending(pending_tbl, out, flows=None, resp_flows=None):
     """Overflow guard: emit all events for the oldest pending key and lock it out."""
     oldest_key, oldest_ts = None, None
     for rk, lst in pending_tbl.items():
@@ -1417,11 +1497,11 @@ def _flush_oldest_pending(pending_tbl, out):
     if oldest_key is not None:
         while pending_tbl.get(oldest_key):
             pending_pop(oldest_key, out, pending_tbl)
-        corr_disabled_insert(oldest_key)
+        invalidate_connection_correlation(flows, resp_flows, oldest_key)
         pending_tbl.pop(oldest_key, None)
 
 
-def sweep_pending(pending_tbl, now, out):
+def sweep_pending(pending_tbl, now, out, flows=None, resp_flows=None):
     """TTL flush: emit requests whose responses never showed up."""
     for rk in list(pending_tbl.keys()):
         lst = pending_tbl.get(rk)
@@ -1444,7 +1524,7 @@ def sweep_pending(pending_tbl, now, out):
                         if not tail_tomb:
                             out.append(tail[0])
                         lst.pop(i)
-                    corr_disabled_insert(rk)
+                    invalidate_connection_correlation(flows, resp_flows, rk)
                     # Leave i unchanged; the while condition will exit naturally
                 else:
                     i += 1
@@ -1756,7 +1836,7 @@ def main():
             if maintenance_due(now, last_sweep):
                 out_s = []
                 sweep_idle(flows, now, out_s, pending, resp_flows)
-                sweep_pending(pending, now, out_s)
+                sweep_pending(pending, now, out_s, flows=flows, resp_flows=resp_flows)
                 write_events(out_s)
                 last_sweep = now
             continue
@@ -1775,7 +1855,7 @@ def main():
         if maintenance_due(now, last_sweep):
             out_s = []
             sweep_idle(flows, now, out_s, pending, resp_flows)
-            sweep_pending(pending, now, out_s)
+            sweep_pending(pending, now, out_s, flows=flows, resp_flows=resp_flows)
             write_events(out_s)
             last_sweep = now
 

@@ -616,6 +616,89 @@ def run_test_suite_for_engine_ext(run_pcap, engine_name):
     else:
         print("  [%s] Test 25 (Broken Resp Stream Fabrication): PASS (broken stream produced no fake status)" % engine_name)
 
+    # -----------------------------------------------------------------------
+    # 26. Old SYN Must Not Bypass Evicted Lockout
+    # Connection loses ordering -> lockout inserted.
+    # Registry capacity overflow evicts the lockout.
+    # A subsequent /new request on the old connection (without a fresh SYN)
+    # must NOT correlate with /old's late response.
+    # -----------------------------------------------------------------------
+    req_old26 = b"GET /api/old26 HTTP/1.1\r\nHost: x\r\n\r\n"
+    req_new26 = b"GET /api/new26 HTTP/1.1\r\nHost: x\r\n\r\n"
+    old_seq26 = 26000
+    new_seq26 = old_seq26 + len(req_old26)
+
+    pkt_syn26 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50026, 80,
+                                  old_seq26 - 1, 0, 0x02, b"")
+    pkt_old26 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50026, 80,
+                                  old_seq26, 0, 0x18, req_old26)
+
+    pkts26 = [
+        (100, 0, pkt_syn26, len(pkt_syn26)),
+        (100, 1000, pkt_old26, len(pkt_old26)),
+        (135, 0, pkt_sweep1, len(pkt_sweep1)), # 35s later: /old expires to tombstone
+        (150, 0, pkt_sweep2, len(pkt_sweep2)), # 15s later: tombstone expires -> correlation disabled
+    ]
+
+    # Flood 2050 distinct connection timeouts to saturate registry and evict 50026's key
+    flood_req = b"GET /f HTTP/1.1\r\nHost: x\r\n\r\n"
+    for i in range(2050):
+        sport = 10000 + (i % 55000)
+        p_req = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport, 80, 1000, 0, 0x18, flood_req)
+        pkts26.append((105, i, p_req, len(p_req)))
+    pkt_sweep_flood1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 59998, 9999, 1000, 0, 0x10, b"")
+    pkts26.append((145, 0, pkt_sweep_flood1, len(pkt_sweep_flood1)))
+    pkt_sweep_flood2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 59998, 9999, 1001, 0, 0x10, b"")
+    pkts26.append((156, 0, pkt_sweep_flood2, len(pkt_sweep_flood2)))
+
+    # /new arrives on old connection at t=160 (no fresh SYN!)
+    pkt_new26 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50026, 80,
+                                  new_seq26, 0, 0x18, req_new26)
+    resp26 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_resp26 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50026,
+                                   40000, old_seq26 + len(req_old26), 0x18, resp26)
+    pkts26.append((160, 0, pkt_new26, len(pkt_new26)))
+    pkts26.append((161, 0, pkt_resp26, len(pkt_resp26)))
+
+    write_pcap(tmp_pcap, pkts26)
+    ev26 = run_pcap(tmp_pcap, [80])
+    new_with_status26 = [e for e in ev26 if e.get("path") == "/api/new26" and e.get("status") is not None]
+    if new_with_status26:
+        failures.append("[%s] Test 26 (Old SYN Evicted Lockout Bypass): /api/new26 wrongly correlated with status %s" % (engine_name, new_with_status26))
+    else:
+        print("  [%s] Test 26 (Old SYN Evicted Lockout Bypass): PASS (old SYN did not bypass evicted lockout)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 27. SYN-ACK Preserves Verification Under Capacity Fallback
+    # After capacity fallback activates, fresh client SYN sets verification,
+    # and server SYN-ACK must preserve generation/eligibility rather than resetting.
+    # -----------------------------------------------------------------------
+    req27 = b"GET /api/synack27 HTTP/1.1\r\nHost: x\r\n\r\n"
+    seq27 = 27000
+    pkt_syn27 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50027, 80,
+                                  seq27 - 1, 0, 0x02, b"")
+    pkt_synack27 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50027,
+                                     70000, seq27, 0x12, b"") # SYN-ACK
+    pkt_req27 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50027, 80,
+                                  seq27, 70001, 0x18, req27)
+    resp27 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_resp27 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50027,
+                                   70001, seq27 + len(req27), 0x18, resp27)
+
+    pkts27 = list(pkts26[:2 + 2050 + 2])
+    pkts27.append((170, 0, pkt_syn27, len(pkt_syn27)))
+    pkts27.append((170, 1000, pkt_synack27, len(pkt_synack27))) # SYN-ACK
+    pkts27.append((171, 0, pkt_req27, len(pkt_req27)))
+    pkts27.append((172, 0, pkt_resp27, len(pkt_resp27)))
+
+    write_pcap(tmp_pcap, pkts27)
+    ev27 = run_pcap(tmp_pcap, [80])
+    synack_ev27 = [e for e in ev27 if e.get("path") == "/api/synack27" and e.get("status") == 200]
+    if not synack_ev27:
+        failures.append("[%s] Test 27 (SYN-ACK Preserves Verification): /api/synack27 failed to correlate with 200 OK after SYN-ACK: %s" % (engine_name, [e for e in ev27 if e.get("path") == "/api/synack27"]))
+    else:
+        print("  [%s] Test 27 (SYN-ACK Preserves Verification): PASS (SYN-ACK preserved verification, status 200 correlated)" % engine_name)
+
     if os.path.exists(tmp_pcap):
         os.remove(tmp_pcap)
     return failures
@@ -637,7 +720,7 @@ def run_regression_suite():
             print("  *", f)
         sys.exit(1)
     else:
-        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (50/50 PASS)!")
+        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (54/54 PASS)!")
 
 if __name__ == "__main__":
     run_regression_suite()
