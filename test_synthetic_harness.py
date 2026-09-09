@@ -72,8 +72,9 @@ def run_cpp_pcap(pcap_file, ports, wsse_bytes=0):
     return events
 
 def run_python_pcap(pcap_file, ports, wsse_bytes=0):
-    nt_sniff.corr_disabled.clear()
+    nt_sniff.corr_disabled_clear()
     flows = {}
+
     resp_flows = {}
     pending = {}
     out = []

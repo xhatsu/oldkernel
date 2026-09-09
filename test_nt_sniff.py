@@ -289,3 +289,30 @@ def test_control_stop_requests_process_exit(tmp_path):
     assert action == "stop"
     assert status == "stop requested"
     assert client.reports == [(9, "done", "stop requested")]
+
+
+def test_bounded_lockout_registry_10k_connections():
+    nt_sniff.corr_disabled_clear()
+    pending = {}
+    out = []
+    # Add 10,000 requests on distinct client ports
+    for i in range(10000):
+        rk = ("10.0.0.2", 8080, "10.0.0.1", 10000 + i)
+        pending[rk] = [[{"path": "/item/%d" % i, "method": "GET"}, 100.0, True, 100.0, 0]]
+    # Sweep at t=120s (tombstone TTL expired)
+    nt_sniff.sweep_pending(pending, 120.0, out)
+    assert len(pending) == 0
+    assert len(nt_sniff.corr_disabled) <= nt_sniff.MAX_CORR_DISABLED
+    assert len(nt_sniff.corr_disabled) == 2048
+    assert nt_sniff.corr_capacity_reached is True
+
+    # Evicted connection (port 10000) arrives without SYN:
+    # Must fall back to emitting without correlation!
+    evicted_rk = ("10.0.0.2", 8080, "10.0.0.1", 10000)
+    assert evicted_rk not in nt_sniff.corr_disabled  # was evicted from bounded set
+    assert nt_sniff.is_correlation_disabled(evicted_rk, syn_seen=False) is True
+
+    # With verified SYN, correlation is re-enabled:
+    assert nt_sniff.is_correlation_disabled(evicted_rk, syn_seen=True) is False
+    nt_sniff.corr_disabled_clear()
+

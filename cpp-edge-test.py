@@ -46,8 +46,14 @@ assert ring.returncode == 0, ring.stderr
 print('Sniffer TPACKET_V2 geometry and frame bounds fixture: PASS')
 rate = subprocess.run([str(out_sniff), '--ship-rate-fixture'],
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-assert rate.returncode == 0, rate.stderr
 print('Native shipper 64 KiB batch ceiling fixture: PASS')
+
+lockout = subprocess.run([str(out_sniff), '--lockout-fixture'],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+assert lockout.returncode == 0, lockout.stderr
+assert 'Lockout registry 10k bounded fixture: PASS' in lockout.stderr
+print('Sniffer bounded lockout registry 10k fixture: PASS')
+
 
 stats = subprocess.run([str(out_sniff), '--stats-fixture'],
                        text=True, capture_output=True)

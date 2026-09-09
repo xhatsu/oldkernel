@@ -266,6 +266,7 @@ struct Flow {
   bool has_seq;
   bool is_broken;
   bool correlation_disabled;
+  bool syn_seen;
   time_t touched;
   long long first_byte_mono_ms;
   uint32_t generation;
@@ -291,10 +292,11 @@ struct Flow {
   size_t wsse_goal;
 
   Flow() : next_seq(0), has_seq(false), is_broken(false), correlation_disabled(false),
-           touched(time(NULL)), first_byte_mono_ms(0), generation(0),
+           syn_seen(false), touched(time(NULL)), first_byte_mono_ms(0), generation(0),
            state(HTTP_STATE_HEADER), body_remaining(0), chunk_payload_remaining(0),
            chunk_reading_len(true), chunk_reading_crlf(false), chunk_reading_trailer(false),
            awaiting_wsse(false), wsse_goal(0) {}
+
 
   void clear_buffers() {
     flow_bytes_sub(buf.size());
@@ -359,7 +361,11 @@ struct FlowKey {
     if (d_ip != x.d_ip) return d_ip < x.d_ip;
     return dport < x.dport;
   }
+  bool operator==(const FlowKey &x) const {
+    return s_ip == x.s_ip && sport == x.sport && d_ip == x.d_ip && dport == x.dport;
+  }
 };
+
 typedef FlowKey PacketKey;
 
 static uint64_t g_req_id_seq = 0;
@@ -388,11 +394,54 @@ struct PendingQueueRef {
 
 static size_t g_total_pending_count = 0;
 static std::list<PendingQueueRef> g_pending_fifo;
+
 // PacketKey entries (response-direction: server→client) for which response
+
 // correlation is permanently disabled until a verified new SYN arrives.
-// Set when a tombstone expires un-consumed or when a pending entry is
-// force-evicted; cleared only on client SYN.
+// Bounded to MAX_CORR_DISABLED entries to prevent memory growth under many
+// timed-out connections. When capacity is reached, ordering for untracked
+// connections cannot be verified, falling back to emitting without correlation.
+static const size_t MAX_CORR_DISABLED = 2048;
 static std::set<PacketKey> g_corr_disabled;
+static std::list<PacketKey> g_corr_disabled_fifo;
+static bool g_corr_capacity_reached = false;
+
+static void corr_disabled_insert(const PacketKey &key) {
+  if (g_corr_disabled.count(key)) return;
+  while (g_corr_disabled.size() >= MAX_CORR_DISABLED && !g_corr_disabled_fifo.empty()) {
+    g_corr_capacity_reached = true;
+    PacketKey old_key = g_corr_disabled_fifo.front();
+    g_corr_disabled_fifo.pop_front();
+    g_corr_disabled.erase(old_key);
+  }
+  g_corr_disabled.insert(key);
+  g_corr_disabled_fifo.push_back(key);
+}
+
+static void corr_disabled_erase(const PacketKey &key) {
+  if (g_corr_disabled.erase(key)) {
+    for (std::list<PacketKey>::iterator it = g_corr_disabled_fifo.begin();
+         it != g_corr_disabled_fifo.end(); ++it) {
+      if (*it == key) {
+        g_corr_disabled_fifo.erase(it);
+        break;
+      }
+    }
+  }
+}
+
+static void corr_disabled_clear() {
+  g_corr_disabled.clear();
+  g_corr_disabled_fifo.clear();
+  g_corr_capacity_reached = false;
+}
+
+static bool is_correlation_disabled(const PacketKey &key, bool syn_seen) {
+  if (g_corr_disabled.count(key)) return true;
+  if (g_corr_capacity_reached && !syn_seen) return true;
+  return false;
+}
+
 
 static void logmsg(const std::string &s) { fprintf(stderr, "nt-sniff-cpp: %s\n", s.c_str()); fflush(stderr); }
 
@@ -1204,7 +1253,8 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
                           uint32_t d_ip, unsigned dport,
                           std::map<PacketKey, std::vector<Pending> > &pending,
                           long long first_byte_mono_ms = 0,
-                          uint32_t gen = 0) {
+                          uint32_t gen = 0,
+                          bool syn_seen = false) {
   PacketKey rk;
   rk.s_ip = d_ip; rk.sport = (uint16_t)dport;
   rk.d_ip = s_ip; rk.dport = (uint16_t)sport;
@@ -1212,9 +1262,8 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
   long long mono_now = now_monotonic_ms();
   long long started_mono = (first_byte_mono_ms > 0) ? first_byte_mono_ms : mono_now;
 
-  // If ordering was lost for this 4-tuple (tombstone expired, eviction), emit
-  // without queuing so no future response can be attached to this request.
-  if (g_corr_disabled.count(rk)) {
+  bool verified = syn_seen || (gen > 0);
+  if (is_correlation_disabled(rk, verified)) {
     emit_event(e);
     return;
   }
@@ -1235,14 +1284,14 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
             it->second.erase(it->second.begin());
           }
           pending.erase(it);
-          g_corr_disabled.insert(ref.key);
+          corr_disabled_insert(ref.key);
           break;
         }
       }
     }
   }
 
-  if (g_corr_disabled.count(rk)) {
+  if (is_correlation_disabled(rk, verified)) {
     emit_event(e);
     return;
   }
@@ -1258,10 +1307,11 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
       queue.erase(queue.begin());
     }
     pending.erase(rk);
-    g_corr_disabled.insert(rk);
+    corr_disabled_insert(rk);
     emit_event(e);
     return;
   }
+
   uint64_t req_id = ++g_req_id_seq;
   queue.push_back(Pending(req_id, gen, e, now_ms(), started_mono));
   ++g_total_pending_count;
@@ -1302,7 +1352,8 @@ static void flush_incomplete_wsse(std::map<FlowKey, Flow> &flows,
     if (f->second.awaiting_wsse) {
       queue_request(f->second.wsse_event, f->first.s_ip, f->first.sport,
                     f->first.d_ip, f->first.dport, pending, f->second.first_byte_mono_ms,
-                    f->second.generation);
+                    f->second.generation, f->second.syn_seen);
+
       f->second.awaiting_wsse = false;
     }
     f->second.clear_buffers();
@@ -1322,7 +1373,7 @@ static void flush_all_pending(std::map<PacketKey, std::vector<Pending> > &pendin
   pending.clear();
   g_pending_fifo.clear();
   g_total_pending_count = 0;
-  g_corr_disabled.clear();
+  corr_disabled_clear();
 }
 
 
@@ -1366,8 +1417,9 @@ static void sweep(std::map<FlowKey, Flow> &flows,
             }
             p->second.erase(p->second.begin() + i);
           }
-          g_corr_disabled.insert(disabled_key);
+          corr_disabled_insert(disabled_key);
           // Leave i unchanged; inner while exits on next check
+
         } else {
           ++i;
         }
@@ -1458,7 +1510,8 @@ static void evict_oldest_flow_if_needed(std::map<FlowKey, Flow> &flows,
     if (oldest->second.awaiting_wsse) {
       queue_request(oldest->second.wsse_event, oldest->first.s_ip, oldest->first.sport,
                     oldest->first.d_ip, oldest->first.dport, pending, oldest->second.first_byte_mono_ms,
-                    oldest->second.generation);
+                    oldest->second.generation, oldest->second.syn_seen);
+
       oldest->second.awaiting_wsse = false;
     }
     oldest->second.clear_buffers();
@@ -1630,15 +1683,11 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           PacketKey pk;
           pk.s_ip = s_ip; pk.sport = (uint16_t)sport;
           pk.d_ip = d_ip; pk.dport = (uint16_t)dport;
-          // Correlation permanently disabled for this 4-tuple: discard response.
-          if (g_corr_disabled.count(pk)) {
-            // Consume this response header+body so parsing can continue, but
-            // do not attach it to any pending request.
-            // Fall through to body-state transitions below (is_head=false).
-          }
+          bool verified = rfl.syn_seen || (rfl.generation > 0);
           std::map<PacketKey, std::vector<Pending> >::iterator p =
-              g_corr_disabled.count(pk) ? pending.end() : pending.find(pk);
+              is_correlation_disabled(pk, verified) ? pending.end() : pending.find(pk);
           bool is_head = false;
+
           if (p != pending.end() && !p->second.empty()) {
             if (rfl.generation != 0 && p->second[0].generation != 0 && p->second[0].generation != rfl.generation) {
               // Generation mismatch! Stale request from previous connection.
@@ -1842,7 +1891,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     }
     // Re-enable correlation for this 4-tuple: SYN proves a fresh TCP connection
     // with no ambiguous ordering state from the previous stream.
-    g_corr_disabled.erase(rk);
+    corr_disabled_erase(rk);
 
     Flow &fl = flows[fk];
     if (fl.awaiting_wsse) {
@@ -1855,6 +1904,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     fl.clear_buffers();
     fl = Flow();
     fl.generation = next_gen;
+    fl.syn_seen = true;
     fl.has_seq = true;
     fl.next_seq = seq + 1;
     fl.touched = now;
@@ -1868,7 +1918,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
     Flow &resp_fl = flows[rk];
     resp_fl = Flow();
     resp_fl.generation = next_gen;
+    resp_fl.syn_seen = true;
     return true;
+
   }
 
   evict_oldest_flow_if_needed(flows, pending);
@@ -1986,7 +2038,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           fl.wsse_buf.clear();
           fl.wsse_goal = meta.content_length < g_wsse_body_bytes ? meta.content_length : g_wsse_body_bytes;
         } else {
-          queue_request(e, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+          queue_request(e, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
         }
 
         if (meta.has_content_length && meta.content_length > 0) {
@@ -2021,7 +2073,7 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
             if (!username.empty()) {
               ev.wsse_user = username; ev.user = username; ev.scheme = "wsse";
             }
-            queue_request(ev, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+            queue_request(ev, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
             fl.awaiting_wsse = false;
           }
         }
@@ -2030,10 +2082,11 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
         fl.body_remaining -= to_consume;
         if (fl.body_remaining == 0) {
           if (fl.awaiting_wsse) {
-            queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+            queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
             fl.awaiting_wsse = false;
           }
           fl.state = Flow::HTTP_STATE_HEADER;
+
           fl.first_byte_mono_ms = fl.buf.empty() ? 0 : mono_now;
         }
         continue;
@@ -2133,9 +2186,10 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   // FIN / RST Lifecycle: process after payload
   if (tcp_flags & 0x05) {
     if (fl.awaiting_wsse) {
-      queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation);
+      queue_request(fl.wsse_event, s_ip, sport, d_ip, dport, pending, fl.first_byte_mono_ms, fl.generation, fl.syn_seen);
       fl.awaiting_wsse = false;
     }
+
     fl.clear_buffers();
     flows.erase(fk);
   }
@@ -2508,6 +2562,48 @@ static int run_capability_probe(const std::string &iface,
   return 0;
 }
 
+static int run_lockout_fixture() {
+  corr_disabled_clear();
+  // Insert 10,000 distinct connection keys into the registry via corr_disabled_insert
+  for (unsigned i = 0; i < 10000; ++i) {
+    PacketKey k;
+    k.s_ip = 0x0a000002;
+    k.sport = 8080;
+    k.d_ip = 0x0a000001;
+    k.dport = (uint16_t)(10000 + (i % 55000));
+    corr_disabled_insert(k);
+  }
+  // Must be strictly capped at MAX_CORR_DISABLED (2048)
+  if (g_corr_disabled.size() > MAX_CORR_DISABLED) {
+    fprintf(stderr, "Lockout fixture failed: size %lu > %lu\n",
+            (unsigned long)g_corr_disabled.size(), (unsigned long)MAX_CORR_DISABLED);
+    return 1;
+  }
+  if (!g_corr_capacity_reached) {
+    fprintf(stderr, "Lockout fixture failed: g_corr_capacity_reached not set\n");
+    return 1;
+  }
+  // Evicted key without verified SYN must have correlation disabled:
+  PacketKey evicted_key;
+  evicted_key.s_ip = 0x0a000002;
+  evicted_key.sport = 8080;
+  evicted_key.d_ip = 0x0a000001;
+  evicted_key.dport = 10000;
+  if (!is_correlation_disabled(evicted_key, false)) {
+    fprintf(stderr, "Lockout fixture failed: evicted key without SYN must have correlation disabled\n");
+    return 1;
+  }
+  // With verified SYN, correlation must be allowed:
+  if (is_correlation_disabled(evicted_key, true)) {
+    fprintf(stderr, "Lockout fixture failed: key with verified SYN must allow correlation\n");
+    return 1;
+  }
+  corr_disabled_clear();
+  fprintf(stderr, "Lockout registry 10k bounded fixture: PASS (size=%lu, capacity_fallback=verified)\n",
+          (unsigned long)MAX_CORR_DISABLED);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   if (argc > 1 && !strcmp(argv[1], "--wsse-fixture")) return run_wsse_fixture();
@@ -2515,6 +2611,8 @@ int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--ring-fixture")) return run_ring_fixture();
   if (argc > 1 && !strcmp(argv[1], "--ship-rate-fixture")) return run_ship_rate_fixture();
   if (argc > 1 && !strcmp(argv[1], "--stats-fixture")) return run_stats_fixture();
+  if (argc > 1 && !strcmp(argv[1], "--lockout-fixture")) return run_lockout_fixture();
+
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
   std::string endpoint;
   bool capability_probe = false;
