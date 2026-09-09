@@ -15,7 +15,6 @@ Performance:
   * kernel BPF filter (SO_ATTACH_FILTER): IPv4/TCP requests and responses
     for monitored ports are copied up; unrelated traffic stays in kernel
   * HEADER-ONLY by default; opt-in WSSE parsing has strict per-flow/global bounds
-  * PACKET_FANOUT (-j N): N forked workers share the NIC across cores
 Usage:  python nt-sniff.py [-i eth0] [-p 80,8003,...] [-j workers]
                            [--wsse-body-bytes 0..65536]
 Stdout: one JSON event per line -> pipe into nt-ship.py.
@@ -130,6 +129,8 @@ def build_bpf(ports):
             prog.append((JEQ_K, jt, jf, p))
     prog.append((RET_K, 0, 0, 0))                    # reject
     prog.append((RET_K, 0, 0, 0x40000))              # accept
+    if any(jt > 255 or jf > 255 for _, jt, jf, _ in prog):
+        return None
 
     try:
         import ctypes
@@ -186,23 +187,6 @@ def apply_perf_opts(sock, ports):
     return filter_ok
 
 
-# ---------------------------------------------------------------- perf: fanout
-SOL_PACKET = 263
-PACKET_FANOUT = 18
-
-def apply_fanout(sock, group_id):
-    """Kernel load-balances packets across all sockets sharing the group.
-    Hashing is per-flow-directional; request direction alone drives event
-    emission, so directional splits are safe. Returns True on success."""
-    try:
-        sock.setsockopt(SOL_PACKET, PACKET_FANOUT,
-                        struct.pack("I", group_id & 0xFFFF))
-        return True
-    except Exception as e:
-        log("WARN: PACKET_FANOUT failed (%s) — single-process capture" % e)
-        return False
-
-
 def parse_wsse_body_bytes(value):
     """Validate the opt-in body window without allowing unbounded buffers."""
     try:
@@ -239,14 +223,18 @@ def parse_args(argv):
                 raise SystemExit("invalid port list")
             if not ports or any(not valid_port(x) for x in ports):
                 raise SystemExit("ports must be in range 1..65535")
+            if len(ports) > 30:
+                raise SystemExit("at most 30 monitored ports are supported")
         elif a == "-j":
             if i + 1 >= len(argv):
                 raise SystemExit("-j requires a worker count")
             i += 1
             try:
-                workers = max(1, int(argv[i]))
+                workers = int(argv[i])
             except ValueError:
                 raise SystemExit("invalid worker count")
+            if workers != 1:
+                raise SystemExit("only one capture worker is permitted")
         elif a == "-v":
             verbose = True
         elif a == "--wsse-body-bytes":
@@ -795,7 +783,7 @@ def _restart_args(script, iface, ports, verbose, workers, wsse_body_bytes=0):
     if iface:
         args.extend(["-i", iface])
     args.extend(["-p", ",".join([str(p) for p in sorted(ports)])])
-    args.extend(["-j", str(workers)])
+    args.extend(["-j", "1"])
     if wsse_body_bytes:
         args.extend(["--wsse-body-bytes", str(wsse_body_bytes)])
     if verbose:
@@ -837,11 +825,6 @@ def main():
         s.close()
         raise SystemExit("cannot bind AF_PACKET to %s (%s)" %
                          (iface or "<all>", e))
-    fanout_ok = False
-    if workers > 1:
-        fanout_ok = apply_fanout(s, 0xF00D)
-        if fanout_ok:
-            log("fanout group 0xF00D: spawning %d workers" % workers)
     if not drop_capture_capabilities():
         s.close()
         raise SystemExit("cannot drop CAP_NET_RAW after socket setup; refusing unsafe capture")
@@ -868,15 +851,6 @@ def main():
     if wsse_body_bytes:
         log("WSSE UsernameToken inspection enabled (bounded to %d bytes/request)" %
             wsse_body_bytes)
-
-    # fork extra capture workers AFTER fanout attach; WITHOUT a working
-    # fanout group every process would receive EVERY packet (duplicates),
-    # so single-process mode is forced when the kernel lacks support
-    # (PACKET_FANOUT needs kernel >= 3.1; el6 2.6.32 does not have it)
-    if fanout_ok:
-        for _ in range(workers - 1):
-            if os.fork() == 0:
-                break                 # child: fall through into its own loop
 
     # 1s recv timeout: (a) lets the pending/flow sweeps actually fire —
     # without it `except socket.timeout` never runs; (b) empirically REQUIRED

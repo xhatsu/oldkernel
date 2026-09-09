@@ -6,18 +6,19 @@
 # via file capability (cap_net_raw on a private interpreter copy); fails
 # closed rather than running capture as root when this cannot be enforced.
 #
-# FIRST RUN — works standalone on a bare node; missing kit files are
-# fetched automatically from the hub bootstrap server:
+# FIRST RUN — works standalone on a bare node. The saved first-run bundle uses
+# its embedded kit; a plain installer fetches only from explicit --kit-url:
 #
-#   curl -sSf http://HUB:30105/oldkernel/install-oldkernel.sh | sh -s -- \
-#        --endpoint http://HUB:30102
+#   curl -sSf http://KIT_HOST:KIT_PORT/oldkernel/install-firstrun-el68.sh \
+#        -o install-firstrun-el68.sh && \
+#        sudo sh install-firstrun-el68.sh --server http://HUB_HOST:HUB_PORT
 #
 # Local bundle usage:
-#   sh install-oldkernel.sh --endpoint http://hub:30102
+#   sh install-oldkernel.sh --server http://HUB_HOST:HUB_PORT
 #   sh install-oldkernel.sh --check [--endpoint ...]
 #   sh install-oldkernel.sh --uninstall
 #
-# Env overrides: NT_IFACE=eth1 NT_PORTS=80,... NT_HUB=http://HUB:30105/oldkernel
+# Env overrides: NT_IFACE=eth1 NT_PORTS=80,... NT_HUB=http://KIT:PORT/oldkernel
 #                NT_WSSE_BODY_BYTES=0..65536 (Python/C++ modes; default 0)
 #                NT_CPU_CORE=N (default: first CPU allowed for the installer)
 set -u
@@ -29,35 +30,108 @@ MODE=install
 ENDPOINT=""
 IFACE="${NT_IFACE:-}"
 PORTS="${NT_PORTS:-80,8003,8005,8007,8009,8010,8011}"
-WORKERS="${NT_WORKERS:-1}"   # PACKET_FANOUT workers (needs kernel>=3.1)
+WORKERS="${NT_WORKERS:-1}"   # compatibility input; capture is always single-worker
 SHIPPERS="${NT_SHIP_THREADS:-8}"  # concurrent hub POST threads
 KIT_URLS="${NT_HUB:-}"
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
 WSSE_BODY_BYTES="${NT_WSSE_BODY_BYTES:-0}"
 CPU_CORE="${NT_CPU_CORE:-}"
+TOKEN_INPUT_FILE=""
+ALLOW_KIT_FETCH=1
 
 log()  { echo "[nt-legacy] $*"; }
 die()  { echo "[nt-legacy] FAIL: $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+usage() {
+    cat <<'EOF'
+Usage: install-firstrun-el68.sh --server URL [options]
+
+  --server URL              Hub ingest URL, including its actual port
+  --endpoint URL            Alias for --server
+  --kit-url URL             Exact bootstrap-kit URL
+  --iface IFACE             Capture interface, for example eth0
+  --ports LIST              Comma-separated ports, for example 80,8001,8080
+  --mode python|cpp         Capture engine (default: python)
+  --wsse-bytes N            SOAP prefix window, 0..65536 (default: 0)
+  --cpu N                   One allowed logical CPU number
+  --ship-threads N          Python poster threads, 1..32
+  --control-token-file FILE Read the control token from FILE
+  --offline                 Use only local/embedded kit; never fetch fallback
+  --check                   Preflight only; make no installation changes
+  --uninstall               Remove the installed agent
+EOF
+}
+
+need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --endpoint) ENDPOINT="$2"; shift 2 ;;
-        --hub)      KIT_URLS="$2"; shift 2 ;;
-        --mode)     CAPTURE_MODE="$2"; shift 2 ;;
-        --wsse-body-bytes) WSSE_BODY_BYTES="$2"; shift 2 ;;
+        --server)   need_value "$@"; ENDPOINT="$2"; shift 2 ;;
+        --endpoint) need_value "$@"; ENDPOINT="$2"; shift 2 ;;
+        --hub|--kit-url) need_value "$@"; KIT_URLS="$2"; shift 2 ;;
+        --iface)    need_value "$@"; IFACE="$2"; shift 2 ;;
+        --ports)    need_value "$@"; PORTS="$2"; shift 2 ;;
+        --mode)     need_value "$@"; CAPTURE_MODE="$2"; shift 2 ;;
+        --wsse-body-bytes|--wsse-bytes) need_value "$@"; WSSE_BODY_BYTES="$2"; shift 2 ;;
+        --cpu)      need_value "$@"; CPU_CORE="$2"; shift 2 ;;
+        --ship-threads) need_value "$@"; SHIPPERS="$2"; shift 2 ;;
+        --control-token-file) need_value "$@"; TOKEN_INPUT_FILE="$2"; shift 2 ;;
+        --offline)  ALLOW_KIT_FETCH=0; shift ;;
+        --install)  MODE=install; shift ;;
         --check)    MODE=check; shift ;;
         --uninstall) MODE=uninstall; shift ;;
+        -h|--help) usage; exit 0 ;;
         *) die "unknown arg: $1" ;;
     esac
 done
+
+for url_value in "$ENDPOINT" "$KIT_URLS"; do
+    [ -z "$url_value" ] && continue
+    case "$url_value" in http://*|https://*) : ;; *) die "URLs must start with http:// or https://" ;; esac
+    case "$url_value" in
+        *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:/._-]*)
+            die "URL contains unsupported characters" ;;
+    esac
+done
+case "$IFACE" in
+    '' ) : ;;
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-]*) die "invalid interface name" ;;
+esac
+[ ${#IFACE} -le 32 ] || die "interface name is too long"
+case "$PORTS" in ''|,*|*,|*,,*|*[!0-9,]*) die "ports must be comma-separated integers" ;; esac
+old_ifs=$IFS
+IFS=,
+set -- $PORTS
+IFS=$old_ifs
+PORT_COUNT=0
+for port_value do
+    PORT_COUNT=$((PORT_COUNT + 1))
+    [ "$port_value" -ge 1 ] 2>/dev/null && [ "$port_value" -le 65535 ] 2>/dev/null \
+        || die "each port must be in range 1..65535"
+done
+[ "$PORT_COUNT" -le 30 ] || die "at most 30 monitored ports are allowed by the safe cBPF program"
+case "$CAPTURE_MODE" in python|cpp) : ;; *) die "mode must be python or cpp" ;; esac
+case "$SHIPPERS" in ''|*[!0-9]*) die "ship threads must be an integer 1..32" ;; esac
+[ "$SHIPPERS" -ge 1 ] && [ "$SHIPPERS" -le 32 ] || die "ship threads must be in range 1..32"
 
 case "$WSSE_BODY_BYTES" in
     ''|*[!0-9]*) die "WSSE body byte window must be an integer 0..65536" ;;
 esac
 [ "$WSSE_BODY_BYTES" -le 65536 ] \
     || die "WSSE body byte window must be in range 0..65536"
+if [ -n "$TOKEN_INPUT_FILE" ]; then
+    [ -f "$TOKEN_INPUT_FILE" ] && [ -r "$TOKEN_INPUT_FILE" ] \
+        || die "control token file is not readable"
+    TOKEN_SIZE=$(wc -c < "$TOKEN_INPUT_FILE" | tr -d ' ')
+    case "$TOKEN_SIZE" in ''|*[!0-9]*) die "cannot measure control token file" ;; esac
+    [ "$TOKEN_SIZE" -ge 1 ] && [ "$TOKEN_SIZE" -le 4096 ] \
+        || die "control token file must contain 1..4096 bytes"
+    NT_CONTROL_TOKEN=$(sed -n '1p' "$TOKEN_INPUT_FILE")
+    [ -n "$NT_CONTROL_TOKEN" ] || die "control token file is empty"
+    export NT_CONTROL_TOKEN
+fi
 [ "$WORKERS" = 1 ] || {
     log "WARN: NT_WORKERS=$WORKERS overridden to 1 by the host safety boundary"
     WORKERS=1
@@ -78,7 +152,7 @@ fetch() { # fetch <url> <dest>
 #   1. already next to the script (local bundle)
 #   2. embedded base64 payload inside this file (single-file build — no
 #      network needed; preferred because hub mirrors can lag behind fixes)
-#   3. fetched from the hub bootstrap server (--hub / derived from endpoint)
+#   3. fetched from an explicitly configured bootstrap URL (--kit-url)
 # Uninstall never needs the kit.
 need_kit=0
 for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh nt-supervise.sh; do
@@ -92,10 +166,6 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
     # --- source 2: embedded payload -------------------------------------
     SELF="$0"
     [ -f "$SELF" ] || SELF=""
-    if [ -z "$SELF" ] && [ -z "$KIT_URLS" ] && [ -n "$ENDPOINT" ]; then
-        HUBHOST=$(printf %s "$ENDPOINT" | sed -n 's#^\(https\?://[^/:]*\).*$#\1#p')
-        [ -n "$HUBHOST" ] && KIT_URLS="$HUBHOST:30105/oldkernel"
-    fi
     if [ -z "$SELF" ] && [ -n "$KIT_URLS" ]; then
         fetch "$KIT_URLS/install-firstrun-el68.sh" "$WORKDIR/nt-self.sh" 2>/dev/null && SELF="$WORKDIR/nt-self.sh"
     fi
@@ -118,11 +188,9 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
 
     # --- source 3: hub bootstrap server ---------------------------------
     if [ ! -s "$WORKDIR/nt-sniff.py" ] || [ ! -s "$WORKDIR/nt-ship.py" ] || [ ! -s "$WORKDIR/nt-sniff-cpp.cpp" ] || [ ! -s "$WORKDIR/Makefile" ] || [ ! -s "$WORKDIR/nt-resource-guard.sh" ] || [ ! -s "$WORKDIR/nt-supervise.sh" ]; then
-        if [ -z "$KIT_URLS" ] && [ -n "$ENDPOINT" ]; then
-            HUBHOST=$(printf %s "$ENDPOINT" | sed -n 's#^\(https\?://[^/:]*\).*$#\1#p')
-            [ -n "$HUBHOST" ] && KIT_URLS="$HUBHOST:30105/oldkernel"
-        fi
-        [ -n "$KIT_URLS" ] || die "kit files missing, no embedded payload, cannot derive hub URL — pass --hub http://HUB:30105/oldkernel"
+        [ "$ALLOW_KIT_FETCH" = 1 ] \
+            || die "offline mode: local or embedded kit is incomplete"
+        [ -n "$KIT_URLS" ] || die "kit files missing and no embedded payload — pass --kit-url http://KIT_HOST:KIT_PORT/oldkernel"
         log "first run: fetching kit from $KIT_URLS -> $WORKDIR"
         have curl || have wget || die "neither curl nor wget present and no embedded payload"
         for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh nt-supervise.sh el68-smoke.sh README.md DEBUG-NOTES.md; do
@@ -191,6 +259,11 @@ case "$(uname -r)" in
     2.6.*) : ;;
     *) log "WARN: kernel $(uname -r) — kit targets 2.6.32; may still work" ;;
 esac
+case "$(uname -r)" in
+    2.6.32-642.el6*)
+        log "WARN: kernel $(uname -r) predates later vendor AF_PACKET errata; strict TPACKET_V2 avoids V3-only configuration paths but cannot patch kernel defects"
+        ;;
+esac
 
 # C++ native mode uses the shipped binary; do not require Python 2.6.
 if [ "$CAPTURE_MODE" = "cpp" ]; then
@@ -211,6 +284,7 @@ fi
 # allowed cpuset unless explicitly selected, then prove it is bindable before
 # making any host changes. Missing taskset therefore fails closed.
 have taskset || die "taskset required for the one-core runtime safety boundary"
+have chrt || die "chrt required for the lowest-priority SCHED_IDLE boundary"
 if [ -z "$CPU_CORE" ]; then
     CPU_CORE=$(awk '/^Cpus_allowed_list:/ { gsub(/[,-].*/, "", $2); print $2; exit }' /proc/self/status 2>/dev/null)
 fi
@@ -219,6 +293,8 @@ case "$CPU_CORE" in
 esac
 taskset -c "$CPU_CORE" true >/dev/null 2>&1 \
     || die "CPU core $CPU_CORE is outside this host/process cpuset"
+taskset -c "$CPU_CORE" chrt -i 0 nice -n 19 true >/dev/null 2>&1 \
+    || die "cannot enforce SCHED_IDLE, nice 19, and CPU affinity"
 
 if have curl; then
     PROBE=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
@@ -344,7 +420,7 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
         chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         chmod 750 "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         if setcap cap_net_raw+ep "$PREFIX/nt-sniff-cpp" 2>/dev/null \
-           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-sniff-cpp --capability-probe" >/dev/null 2>&1; then
+           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-sniff-cpp --capability-probe -i $IFACE -p $PORTS" >/dev/null 2>&1; then
             SNIFF_AS="$SNIFF_USER"
             log "rootless mode: cap_net_raw on native C++ binary, user=$SNIFF_USER"
         else
@@ -519,7 +595,7 @@ if ! pgrep -f "$PREFIX/nt-sniff.py" >/dev/null && ! pgrep -f "$PREFIX/nt-sniff-c
 fi
 
 log "DONE. Sniffer iface=$IFACE ports=$PORTS -> hub $ENDPOINT (capture-as=$SNIFF_AS)"
-log "Safety: rootless, cpu=$CPU_CORE (one logical core/nice 19), memory=256MiB, fds=1024, output-file=32MiB, crash circuit=5"
+log "Safety: rootless, cpu=$CPU_CORE (one logical core/SCHED_IDLE/nice 19), memory=256MiB, fds=1024, output-file=32MiB, crash circuit=5"
 if [ "$WSSE_BODY_BYTES" -ne 0 ]; then
     log "WSSE UsernameToken inspection: bounded to $WSSE_BODY_BYTES bytes/request"
 else

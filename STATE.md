@@ -1,6 +1,58 @@
-> **Port migration:** The active hub is OTelTrace on `0.0.0.0:30102`. The former NetworkTracing hub on `:31115` is legacy and is not used.
+> **Deployment rule:** Hub and bootstrap ports are explicit configuration;
+> the oldkernel installer must not infer either port.
 
 # STATE.md — Current Project State & Memory
+
+## Strict TPACKET_V2 Hardening (2026-09-09)
+- Native capture now uses only a fixed, overflow-checked 4 MiB TPACKET_V2 RX
+  ring. BPF attachment and interface binding precede ring creation; V3, TX
+  rings, private areas, packet reserve, and virtual network headers remain
+  unused.
+- V2 setup is fail-closed with no automatic `recv()` fallback. Partial setup
+  closes the socket, normal shutdown explicitly unmaps/disables the ring, and
+  packet statistics are logged without payload data.
+- Kernel-owned frame metadata is acquired with a memory barrier and validated
+  against `TPACKET2_HDRLEN`, wire length, snapshot length, network offset, and
+  the 2048-byte frame before parsing. Invalid metadata stops capture and feeds
+  the bounded supervisor crash circuit.
+- The native capability probe now exercises the exact configured BPF, bind,
+  ring mapping/cleanup, and capability drop as `ntsniff`. CentOS 6.8 kernel
+  `2.6.32-642.el6` emits an explicit advisory warning without claiming that
+  userspace can patch kernel defects.
+- Both capture modes cap monitored ports at 30, and native BPF construction
+  independently rejects branch offsets above 255, preventing classic-BPF jump
+  truncation from weakening the mandatory kernel filter.
+- Both capture engines are hard single-worker implementations and contain no
+  `PACKET_FANOUT` setup. `-j` remains a compatibility option but rejects every
+  value other than 1, avoiding the configuration race behind CVE-2017-6346.
+
+## Operator Run Guide (2026-09-09)
+- Simplified the self-contained installer directly instead of adding a
+  wrapper. `--server URL` accepts the exact Hub ingest URL without assuming a
+  port, while friendly
+  `--iface`, `--ports`, `--cpu`, `--ship-threads`, `--wsse-bytes`, and token
+  file options are parsed and validated by the same fail-closed installer.
+- Added `RUNNING.md` as the canonical detailed guide for local and embedded
+  installation, Python/C++ selection, custom interfaces/ports/CPU/WSSE/control
+  settings, service lifecycle, safety verification, live route validation,
+  troubleshooting, uninstall, and developer fixtures.
+- The guide distinguishes installer options from component-only compatibility
+  flags, documents that installation is the default action, and warns that
+  direct component launch bypasses production guards.
+- Current behavior is explicit: `NT_WORKERS` is forced to one, C++ native mode
+  ships directly, and accepted `--spool` parameters do not enable disk spooling
+  in the present bounded in-memory implementations.
+- Verification after the direct CLI and ring hardening: 33 non-PCAP pytest tests,
+  four focused installer CLI tests, native optimized fixtures, ASAN/UBSAN edge
+  tests, the CentOS static runbook, and offline Python/C++ processing of both
+  sample PCAPs passed. The EL6 smoke probe correctly rejected this Linux 6.8,
+  Python 3 sandbox at the target-only kernel, Python 2, setcap, and rootless
+  `AF_PACKET` gates.
+- Added an Ansible fleet design that copies one checksum-controlled embedded
+  bundle from the controller, uses `command.argv`, deploys in rolling batches,
+  and records configuration only after a successful install. New `--offline`
+  mode prevents bootstrap fallback and mixed artifact versions. Managed nodes
+  require the explicitly configured Hub ingest URL but no bootstrap service.
 
 ## Native C++03 WSSE Body Capture (2026-09-08)
 - `nt-sniff-cpp` now accepts `NT_WSSE_BODY_BYTES` and
@@ -27,8 +79,8 @@
   `taskset`/file capabilities are unavailable or the chosen CPU is outside the
   service cpuset. Unsafe root capture fallback was removed; Python and native
   shipping execute under the dedicated non-login `ntsniff` account.
-- The complete descendant process tree is pinned to one logical CPU, runs at
-  nice level 19, and inherits hard limits of 256 MiB virtual memory, 8 MiB
+- The complete descendant process tree is pinned to one logical CPU, runs
+  under SCHED_IDLE at nice level 19, and inherits hard limits of 256 MiB virtual memory, 8 MiB
   stack, 64 KiB locked memory, 1,024 file descriptors, 32 MiB per regular
   output file, and zero-byte core dumps. EL6 `/bin/sh` additionally enforces a
   64-process ceiling.

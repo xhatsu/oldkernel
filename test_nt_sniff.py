@@ -181,7 +181,12 @@ def test_control_config_change_requests_in_place_restart(tmp_path):
     assert status == "restart required"
     args = nt_sniff._restart_args("nt-sniff.py", iface, ports, True, 2)
     assert args[1:] == ["-u", os.path.abspath("nt-sniff.py"), "-i", "eth1",
-                       "-p", "8080", "-j", "2", "-v"]
+                       "-p", "8080", "-j", "1", "-v"]
+
+
+def test_multiple_capture_workers_are_rejected():
+    with pytest.raises(SystemExit, match="only one capture worker"):
+        nt_sniff.parse_args(["-j", "2"])
 
 
 def test_control_stop_requests_process_exit(tmp_path):

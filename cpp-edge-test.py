@@ -29,6 +29,11 @@ bad = subprocess.run([str(out_sniff), '--wsse-body-bytes', '65537'],
 assert bad.returncode == 2
 print('Sniffer bounded WSSE fixture: PASS (4 namespaces, DTD rejection, bounds)')
 
+ring = subprocess.run([str(out_sniff), '--ring-fixture'],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+assert ring.returncode == 0, ring.stderr
+print('Sniffer TPACKET_V2 geometry and frame bounds fixture: PASS')
+
 # 2. Test Shipper under AddressSanitizer & UndefinedBehaviorSanitizer
 src_ship = Path(__file__).with_name('nt-ship-cpp.cpp')
 out_ship = Path('/tmp/nt-ship-cpp-edge-test')

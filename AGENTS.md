@@ -11,6 +11,10 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 - **`install-oldkernel.sh`**: SysV installer script supporting `--check`, `--install`, and `--uninstall`. Manages rootless `ntsniff` user with `cap_net_raw` file capabilities.
 - **`build-firstrun.sh`**: Bundle generator creating `install-firstrun-el68.sh` with embedded base64 payloads of all kit components.
 - **`install-firstrun-el68.sh`**: Self-contained single-file installer suitable for `curl | sh` bootstrap.
+- **`RUNNING.md`**: Detailed operator guide for installation, custom
+  parameters, safety behavior, service lifecycle, verification, and removal.
+- **`ANSIBLE.md`**: Stable mass-deployment pattern using a controller-copied,
+  checksum-controlled embedded bundle and `--offline` installation.
 
 ## Operational Rules & User Directives
 1. **Shell Compatibility**: Standard POSIX `sh` (Bourne shell) strictly. No bashisms (`[[ ]]`, `local`, `declare`, `array[i]`, `&>`, etc.).
@@ -26,12 +30,20 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
    `nt-supervise.sh` and `nt-resource-guard.sh`. The agent must run as the
    dedicated non-login user and startup must fail closed if file capabilities
    or CPU affinity cannot be enforced. The full process tree is pinned to one
-   allowed logical CPU at nice 19 and bounded to 256 MiB address space, 8 MiB
+   allowed logical CPU under SCHED_IDLE at nice 19 and bounded to 256 MiB address space, 8 MiB
    stack, 64 KiB locked memory, 1,024 file descriptors, 32 MiB per output
    file, zero core dumps, and (where `/bin/sh` supports it) 64 processes.
    Five short crashes open the supervisor circuit to prevent restart storms.
    Installation must prove `AF_PACKET` access under `ntsniff`; after socket,
    BPF, and bind setup, capture processes must drop all capabilities.
+8. **Native Packet Ring Safety**: C++ capture uses only `TPACKET_V2` with a
+   fixed, validated 4 MiB RX ring. It must attach cBPF and bind the interface
+   before creating the ring, reject malformed kernel frame metadata, use
+   ownership memory barriers, and fail closed instead of falling back to
+   `recv()`. TPACKET_V3, TX rings, private areas, packet reserve, and virtual
+   network headers are not permitted. Monitored ports are capped at 30 so all
+   classic-BPF 8-bit branch offsets remain representable. `PACKET_FANOUT` is
+   not permitted; both capture engines must reject worker counts other than 1.
 
 ## WSSE Capture State (2026-09-08)
 - Both Python and C++03 capture are header-only by default. `NT_WSSE_BODY_BYTES` or

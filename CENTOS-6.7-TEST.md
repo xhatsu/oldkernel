@@ -148,7 +148,8 @@ NT-SMOKE done: N pass, 0 fail
 Interpretation:
 
 - `python not 2.6/2.7`: stop; this kit is not valid for that node.
-- `setcap refused` or capped AF_PACKET failure: record SELinux/VFS details. The installer may use root capture, but root fallback must be explicit in its output.
+- `setcap refused` or capped AF_PACKET failure: record SELinux/VFS details and
+  stop. The installer fails closed and never uses a root capture fallback.
 - `tcpdump absent`: install it only if permitted by the test image, then rerun. Do not replace the capture test with an unverified assumption.
 
 Also check the exact Python syntax directly:

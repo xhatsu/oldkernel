@@ -26,14 +26,15 @@ def test_guard_applies_hard_limits_and_one_cpu():
         "print(resource.getrlimit(resource.RLIMIT_CORE)); "
         "print(resource.getrlimit(resource.RLIMIT_STACK)); "
         "print(resource.getrlimit(resource.RLIMIT_MEMLOCK)); "
-        "print(__import__('os').nice(0))"
+        "print(__import__('os').nice(0)); "
+        "print(__import__('os').sched_getscheduler(0))"
     )
     cpu = first_allowed_cpu()
     out = subprocess.check_output(["sh", GUARD, cpu, "python3", "-c", probe])
     values = out.decode("ascii").splitlines()
     assert values == [cpu, "(268435456, 268435456)", "(1024, 1024)",
                       "(33554432, 33554432)", "(0, 0)",
-                      "(8388608, 8388608)", "(65536, 65536)", "19"]
+                      "(8388608, 8388608)", "(65536, 65536)", "19", "5"]
 
 
 def test_guard_fails_closed_on_bad_cpu():
@@ -47,12 +48,14 @@ def test_installer_routes_service_through_guard():
     with open(INSTALLER, "r") as src:
         installer = src.read()
     assert 'have taskset || die' in installer
+    assert 'have chrt || die' in installer
     assert 'nt-resource-guard.sh" "\\$CPU_CORE" \\' in installer
     assert "nt-resource-guard.sh" in installer.split("need_kit=0", 1)[1]
     assert "nt-supervise.sh" in installer.split("need_kit=0", 1)[1]
     assert "refusing to run the agent as root" in installer
     assert 'nt-resource-guard.sh" "\\$CPU_CORE" \\' in installer
     assert 'nt-supervise.sh" "\\$PREFIX/nt-resource-guard.sh"' in installer
+    assert 'chrt -i 0 nice -n 19' in installer
 
 
 def test_supervisor_opens_circuit_after_five_fast_crashes(tmp_path):
@@ -93,3 +96,46 @@ def test_installer_passes_wsse_window_to_native_capture():
     assert "nt-sniff-cpp" in native
     assert "--wsse-body-bytes $WSSE_BODY_BYTES" in native
     assert "C++03 remains header-only" not in installer
+
+
+def test_native_probe_exercises_production_interface_ports_and_strict_ring():
+    with open(INSTALLER, "r") as src:
+        installer = src.read()
+    assert "--capability-probe -i $IFACE -p $PORTS" in installer
+    with open(os.path.join(HERE, "nt-sniff-cpp.cpp"), "r") as src:
+        native = src.read()
+    assert "TPACKET_V2 setup failed; refusing non-ring fallback" in native
+    assert "falling back to standard socket recv" not in native
+    assert "valid_ring_geometry" in native
+    assert "valid_ring_frame" in native
+
+
+def test_native_capture_has_only_the_fixed_rx_v2_ring_path():
+    with open(os.path.join(HERE, "nt-sniff-cpp.cpp"), "r") as src:
+        native = src.read()
+    assert "TPACKET_V3" not in native
+    assert "PACKET_TX_RING" not in native
+    assert "PACKET_RESERVE" not in native
+    assert "PACKET_VNET_HDR" not in native
+    assert "PACKET_FANOUT" not in native
+    assert "int ver = TPACKET_V2;" in native
+    assert "block_size(65536), block_nr(64)" in native
+    assert "frame_size(2048), frame_nr(2048)" in native
+    assert "!= 4U * 1024U * 1024U" in native
+
+
+def test_native_setup_order_is_filter_bind_ring_then_capability_drop():
+    with open(os.path.join(HERE, "nt-sniff-cpp.cpp"), "r") as src:
+        native = src.read()
+    setup = native.split("static int open_capture_socket", 1)[1]
+    setup = setup.split("static int run_capability_probe", 1)[0]
+    assert setup.index("attach_bpf(fd, ports)") < setup.index("bind(fd,")
+    assert setup.index("bind(fd,") < setup.index("setup_mmap_ring(fd, ring)")
+    assert setup.index("setup_mmap_ring(fd, ring)") < setup.index("drop_all_capabilities()")
+
+
+def test_python_capture_has_no_packet_fanout_path():
+    with open(os.path.join(HERE, "nt-sniff.py"), "r") as src:
+        python_capture = src.read()
+    assert "PACKET_FANOUT" not in python_capture
+    assert "only one capture worker is permitted" in python_capture

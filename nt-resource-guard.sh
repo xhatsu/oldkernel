@@ -20,6 +20,10 @@ command -v taskset >/dev/null 2>&1 || {
     echo "nt-resource-guard: taskset is required" >&2
     exit 70
 }
+command -v chrt >/dev/null 2>&1 || {
+    echo "nt-resource-guard: chrt is required" >&2
+    exit 70
+}
 
 # 256 MiB address space, 8 MiB stack, 64 KiB locked memory, 1,024 descriptors,
 # 32 MiB per regular output file, and no core dumps. The process limit exists
@@ -34,6 +38,6 @@ if (ulimit -u >/dev/null 2>&1); then
     ulimit -S -u 64 && ulimit -H -u 64 || exit 70
 fi
 
-# Lowest scheduling priority too. taskset provides the hard one-logical-CPU
-# ceiling for the complete descendant process tree.
-exec taskset -c "$CPU_CORE" nice -n 19 "$@"
+# SCHED_IDLE is below every normal SCHED_OTHER task; nice 19 remains an
+# additional inherited safeguard. Affinity confines the full descendant tree.
+exec taskset -c "$CPU_CORE" chrt -i 0 nice -n 19 "$@"

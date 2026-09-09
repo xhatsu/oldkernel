@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <net/if.h>
 #include <signal.h>
 #include <stdint.h>
@@ -46,6 +47,7 @@ static void stop_signal(int) { g_running = 0; }
 static const size_t MAX_FLOWS = 8192;
 static const size_t MAX_PENDING = 8192;
 static const size_t MAX_PENDING_PER_FLOW = 32;
+static const size_t MAX_PORTS = 30;
 static const size_t MAX_HEADER = 262144;
 static const size_t MAX_WSSE_BODY_BYTES = 65536;
 static const size_t MAX_WSSE_BODY_FLOWS = 256;
@@ -825,7 +827,12 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
   unsigned reject = 11 + N * 8;
   unsigned accept = reject + 1;
   struct sock_filter x;
-#define ADD(C,J,T,K) do { x.code=(C); x.jt=(J); x.jf=(T); x.k=(K); f.push_back(x); } while(0)
+#define ADD(C,J,T,K) do { \
+  unsigned _jt = (unsigned)(J), _jf = (unsigned)(T); \
+  if (_jt > UCHAR_MAX || _jf > UCHAR_MAX) return false; \
+  x.code=(C); x.jt=(unsigned char)_jt; x.jf=(unsigned char)_jf; x.k=(K); \
+  f.push_back(x); \
+} while(0)
   /* [0] Load EtherType at offset 12 */
   ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 12);
   /* [1] If standard IPv4 (0x0800), jump over Path B (6 + 4*N instructions) to Path A */
@@ -906,26 +913,43 @@ struct MmapRing {
                frame_size(2048), frame_nr(2048), frames_per_block(32), frame_idx(0) {}
 };
 
+static bool valid_ring_geometry(const MmapRing &mr) {
+  const size_t size_max = (size_t)-1;
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) return false;
+  if (mr.block_size == 0 || mr.block_size % (unsigned long)page_size != 0) return false;
+  if (mr.frame_size < TPACKET2_HDRLEN ||
+      mr.frame_size % TPACKET_ALIGNMENT != 0) return false;
+  if (mr.block_size % mr.frame_size != 0) return false;
+  unsigned frames_per_block = mr.block_size / mr.frame_size;
+  if (frames_per_block == 0 || mr.block_nr == 0) return false;
+  if (frames_per_block > UINT_MAX / mr.block_nr) return false;
+  if (frames_per_block * mr.block_nr != mr.frame_nr) return false;
+  if ((size_t)mr.block_size > size_max / (size_t)mr.block_nr) return false;
+  if ((size_t)mr.block_size * (size_t)mr.block_nr != 4U * 1024U * 1024U) return false;
+  return true;
+}
+
 static bool setup_mmap_ring(int fd, MmapRing &mr) {
+  if (!valid_ring_geometry(mr)) {
+    logmsg("invalid fixed TPACKET_V2 ring geometry");
+    return false;
+  }
   int ver = TPACKET_V2;
   if (setsockopt(fd, SOL_PACKET, PACKET_VERSION, &ver, sizeof(ver)) < 0) {
     return false;
   }
   struct tpacket_req req;
   memset(&req, 0, sizeof(req));
-  req.tp_block_size = 65536;
-  req.tp_block_nr = 64;       /* 4MB shared memory ring buffer */
-  req.tp_frame_size = 2048;   /* 2KB per frame */
-  req.tp_frame_nr = (req.tp_block_size * req.tp_block_nr) / req.tp_frame_size; /* 2048 frames */
+  req.tp_block_size = mr.block_size;
+  req.tp_block_nr = mr.block_nr;
+  req.tp_frame_size = mr.frame_size;
+  req.tp_frame_nr = mr.frame_nr;
 
   if (setsockopt(fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0) {
     return false;
   }
-  mr.ring_size = (size_t)req.tp_block_size * req.tp_block_nr;
-  mr.block_size = req.tp_block_size;
-  mr.block_nr = req.tp_block_nr;
-  mr.frame_size = req.tp_frame_size;
-  mr.frame_nr = req.tp_frame_nr;
+  mr.ring_size = (size_t)req.tp_block_size * (size_t)req.tp_block_nr;
   mr.frames_per_block = req.tp_block_size / req.tp_frame_size;
   mr.frame_idx = 0;
 
@@ -935,6 +959,67 @@ static bool setup_mmap_ring(int fd, MmapRing &mr) {
     return false;
   }
   return true;
+}
+
+static bool release_mmap_ring(int fd, MmapRing &mr) {
+  bool ok = true;
+  if (mr.ring != MAP_FAILED) {
+    if (munmap(mr.ring, mr.ring_size) != 0) ok = false;
+    mr.ring = MAP_FAILED;
+  }
+  struct tpacket_req empty_req;
+  memset(&empty_req, 0, sizeof(empty_req));
+  if (setsockopt(fd, SOL_PACKET, PACKET_RX_RING,
+                 &empty_req, sizeof(empty_req)) != 0) ok = false;
+  mr.ring_size = 0;
+  return ok;
+}
+
+static bool valid_ring_frame(const struct tpacket2_hdr *hdr,
+                             unsigned frame_size,
+                             size_t *packet_offset,
+                             size_t *packet_length) {
+  const unsigned mac = hdr->tp_mac;
+  const unsigned net = hdr->tp_net;
+  const unsigned snaplen = hdr->tp_snaplen;
+  const unsigned wire_len = hdr->tp_len;
+  if (mac < TPACKET2_HDRLEN || mac > frame_size) return false;
+  if (snaplen > wire_len || snaplen > frame_size - mac) return false;
+  if (net < mac || net > mac + snaplen) return false;
+  *packet_offset = mac;
+  *packet_length = snaplen;
+  return true;
+}
+
+static int run_ring_fixture() {
+  MmapRing mr;
+  if (!valid_ring_geometry(mr)) return 20;
+  unsigned char frame[2048];
+  memset(frame, 0, sizeof(frame));
+  struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)frame;
+  size_t off = 0, len = 0;
+  hdr->tp_mac = TPACKET2_HDRLEN;
+  hdr->tp_net = TPACKET2_HDRLEN + 14;
+  hdr->tp_snaplen = 128;
+  hdr->tp_len = 128;
+  if (!valid_ring_frame(hdr, sizeof(frame), &off, &len) ||
+      off != TPACKET2_HDRLEN || len != 128) return 21;
+  hdr->tp_mac = TPACKET2_HDRLEN - 1;
+  if (valid_ring_frame(hdr, sizeof(frame), &off, &len)) return 22;
+  hdr->tp_mac = TPACKET2_HDRLEN;
+  hdr->tp_snaplen = sizeof(frame);
+  hdr->tp_len = sizeof(frame);
+  if (valid_ring_frame(hdr, sizeof(frame), &off, &len)) return 23;
+  hdr->tp_snaplen = 129;
+  hdr->tp_len = 128;
+  if (valid_ring_frame(hdr, sizeof(frame), &off, &len)) return 24;
+  hdr->tp_snaplen = 128;
+  hdr->tp_len = 128;
+  hdr->tp_net = TPACKET2_HDRLEN - 1;
+  if (valid_ring_frame(hdr, sizeof(frame), &off, &len)) return 25;
+  mr.frame_nr++;
+  if (valid_ring_geometry(mr)) return 26;
+  return 0;
 }
 
 static int run_fixture() {
@@ -981,13 +1066,6 @@ static bool parse_wsse_size(const char *value, size_t *result) {
   return true;
 }
 
-static int run_capability_probe() {
-  int fd = socket(AF_PACKET, SOCK_RAW, htons(3));
-  if (fd < 0) { perror("AF_PACKET capability probe"); return 2; }
-  close(fd);
-  return 0;
-}
-
 static bool drop_all_capabilities() {
   struct __user_cap_header_struct header;
   struct __user_cap_data_struct data[2];
@@ -998,12 +1076,71 @@ static bool drop_all_capabilities() {
   return syscall(SYS_capset, &header, data) == 0;
 }
 
+static int open_capture_socket(const std::string &iface,
+                               const std::vector<unsigned> &ports,
+                               MmapRing &ring) {
+  int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+  if (fd < 0) { perror("AF_PACKET"); return -1; }
+  int rb = 8 * 1024 * 1024;
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
+  if (!attach_bpf(fd, ports)) {
+    logmsg("BPF attach failed; refusing unfiltered capture");
+    close(fd);
+    return -1;
+  }
+
+  struct sockaddr_ll sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sll_family = AF_PACKET;
+  sa.sll_protocol = htons(ETH_P_ALL);
+  if (!iface.empty()) {
+    sa.sll_ifindex = (int)if_nametoindex(iface.c_str());
+    if (!sa.sll_ifindex) {
+      logmsg("bad interface");
+      close(fd);
+      return -1;
+    }
+  }
+  if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    perror("bind");
+    close(fd);
+    return -1;
+  }
+  if (!setup_mmap_ring(fd, ring)) {
+    logmsg("TPACKET_V2 setup failed; refusing non-ring fallback");
+    close(fd);
+    return -1;
+  }
+  if (!drop_all_capabilities()) {
+    logmsg("capability drop failed; refusing unsafe capture");
+    release_mmap_ring(fd, ring);
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static int run_capability_probe(const std::string &iface,
+                                const std::vector<unsigned> &ports) {
+  MmapRing ring;
+  int fd = open_capture_socket(iface, ports, ring);
+  if (fd < 0) return 2;
+  bool released = release_mmap_ring(fd, ring);
+  close(fd);
+  if (!released) {
+    logmsg("TPACKET_V2 probe cleanup failed");
+    return 2;
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   if (argc > 1 && !strcmp(argv[1], "--wsse-fixture")) return run_wsse_fixture();
-  if (argc > 1 && !strcmp(argv[1], "--capability-probe")) return run_capability_probe();
+  if (argc > 1 && !strcmp(argv[1], "--ring-fixture")) return run_ring_fixture();
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
   std::string endpoint;
+  bool capability_probe = false;
   const char *wsse_env = getenv("NT_WSSE_BODY_BYTES");
   if (wsse_env && !parse_wsse_size(wsse_env, &g_wsse_body_bytes)) {
     fprintf(stderr, "wsse body bytes must be in range 0..65536\n"); return 2;
@@ -1017,6 +1154,7 @@ int main(int argc, char **argv) {
       }
     }
     else if (!strcmp(argv[i], "--endpoint") && i + 1 < argc) endpoint = argv[++i];
+    else if (!strcmp(argv[i], "--capability-probe")) capability_probe = true;
     else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i; /* ignored: 0 disk write */
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--wsse-body-bytes") && i + 1 < argc) {
@@ -1031,7 +1169,17 @@ int main(int argc, char **argv) {
     else { fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
   }
   if (ports.empty()) { ports.push_back(80); ports.push_back(8003); ports.push_back(8005); ports.push_back(8007); ports.push_back(8009); ports.push_back(8010); ports.push_back(8011); }
+  if (ports.size() > MAX_PORTS) {
+    fprintf(stderr, "at most 30 monitored ports are supported by the safe cBPF program\n");
+    return 2;
+  }
+  if (workers != 1) {
+    fprintf(stderr, "only one capture worker is permitted\n");
+    return 2;
+  }
   (void)workers;
+
+  if (capability_probe) return run_capability_probe(iface, ports);
 
   init_rng();
   memset(g_monitored_ports, 0, sizeof(g_monitored_ports));
@@ -1045,34 +1193,9 @@ int main(int argc, char **argv) {
   g_endpoint = endpoint;
   g_ship_node = node;
 
-  int fd = socket(AF_PACKET, SOCK_RAW, htons(3));
-  if (fd < 0) { perror("AF_PACKET"); return 2; }
-  int rb = 8 * 1024 * 1024;
-  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
-  if (!attach_bpf(fd, ports)) {
-    logmsg("BPF attach failed; refusing unfiltered capture");
-    close(fd);
-    return 2;
-  }
-
   MmapRing ring;
-  bool use_mmap = setup_mmap_ring(fd, ring);
-
-  struct sockaddr_ll sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sll_family = AF_PACKET;
-  sa.sll_protocol = htons(3);
-  if (!iface.empty()) {
-    sa.sll_ifindex = (int)if_nametoindex(iface.c_str());
-    if (!sa.sll_ifindex) { logmsg("bad interface"); close(fd); return 2; }
-  }
-  if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { perror("bind"); close(fd); return 2; }
-  if (!drop_all_capabilities()) {
-    logmsg("capability drop failed; refusing unsafe capture");
-    if (use_mmap && ring.ring != MAP_FAILED) munmap(ring.ring, ring.ring_size);
-    close(fd);
-    return 2;
-  }
+  int fd = open_capture_socket(iface, ports, ring);
+  if (fd < 0) return 2;
 
   signal(SIGTERM, stop_signal);
   signal(SIGINT, stop_signal);
@@ -1080,11 +1203,7 @@ int main(int argc, char **argv) {
   std::map<FlowKey, Flow> flows;
   std::map<PacketKey, std::vector<Pending> > pending;
 
-  if (use_mmap) {
-    logmsg("PACKET_MMAP (TPACKET_V2) zero-copy ring enabled (4MB, 2048 frames)");
-  } else {
-    logmsg("WARN: PACKET_MMAP setup failed, falling back to standard socket recv");
-  }
+  logmsg("PACKET_MMAP (TPACKET_V2) strict RX ring enabled (4MB, 2048 frames)");
   if (g_wsse_body_bytes) {
     logmsg("WSSE UsernameToken inspection enabled (bounded to " + number_string(g_wsse_body_bytes) + " bytes/request)");
   }
@@ -1094,15 +1213,7 @@ int main(int argc, char **argv) {
   logmsg("listening");
 
   time_t last = time(NULL), last_flush = last;
-  unsigned char *fallback_buf = NULL;
-  if (!use_mmap) {
-    fallback_buf = (unsigned char *)malloc(65536);
-    if (!fallback_buf) {
-      close(fd);
-      logmsg("buffer allocation failed");
-      return 2;
-    }
-  }
+  bool ring_integrity_failure = false;
 
   struct pollfd pfd;
   pfd.fd = fd;
@@ -1114,36 +1225,41 @@ int main(int argc, char **argv) {
     if (rc < 0 && errno == EINTR) {
       /* Signal handled, loop condition will check g_running */
     } else if (rc >= 0) {
-      if (use_mmap) {
-        /* Drain all ready frames in the ring without extra syscalls */
-        while (g_running) {
+      /* Drain all ready frames in the ring without extra syscalls. */
+      while (g_running) {
           unsigned b_idx = ring.frame_idx / ring.frames_per_block;
           unsigned f_in_b = ring.frame_idx % ring.frames_per_block;
           uint8_t *frame_ptr = ((uint8_t *)ring.ring) + (b_idx * ring.block_size) + (f_in_b * ring.frame_size);
-          struct tpacket2_hdr *hdr = (struct tpacket2_hdr *)frame_ptr;
+          volatile struct tpacket2_hdr *volatile_hdr =
+              (volatile struct tpacket2_hdr *)frame_ptr;
 
-          if (!(hdr->tp_status & TP_STATUS_USER)) {
+          if (!(volatile_hdr->tp_status & TP_STATUS_USER)) {
             break; /* No more kernel-populated frames in ring right now */
           }
+          __sync_synchronize(); /* acquire kernel-owned frame contents */
 
-          if (hdr->tp_snaplen > 0) {
-            const unsigned char *pkt = ((const unsigned char *)hdr) + hdr->tp_mac;
-            handle_packet(pkt, (size_t)hdr->tp_snaplen, node, ports, flows, pending);
+          const struct tpacket2_hdr *hdr =
+              (const struct tpacket2_hdr *)frame_ptr;
+          size_t packet_offset = 0, packet_length = 0;
+          if (!valid_ring_frame(hdr, ring.frame_size,
+                                &packet_offset, &packet_length)) {
+            __sync_synchronize();
+            volatile_hdr->tp_status = TP_STATUS_KERNEL;
+            ring_integrity_failure = true;
+            g_running = 0;
+            logmsg("invalid TPACKET_V2 frame metadata; stopping capture");
+            break;
+          }
+          if (packet_length > 0) {
+            const unsigned char *pkt = frame_ptr + packet_offset;
+            handle_packet(pkt, packet_length, node, ports, flows, pending);
           }
 
-          hdr->tp_status = TP_STATUS_KERNEL; /* Return frame ownership to kernel */
+          __sync_synchronize(); /* release all reads before returning ownership */
+          volatile_hdr->tp_status = TP_STATUS_KERNEL;
           ring.frame_idx = (ring.frame_idx + 1) % ring.frame_nr;
-        }
-        if (g_endpoint.empty()) std::cout.flush();
-      } else {
-        if (pfd.revents & POLLIN) {
-          ssize_t n = recv(fd, fallback_buf, 65536, 0);
-          if (n > 0) {
-            handle_packet(fallback_buf, (size_t)n, node, ports, flows, pending);
-            if (g_endpoint.empty()) std::cout.flush();
-          }
-        }
       }
+      if (g_endpoint.empty()) std::cout.flush();
     }
 
     time_t now = time(NULL);
@@ -1170,11 +1286,19 @@ int main(int argc, char **argv) {
     send_batches(g_endpoint, g_ship_node, &g_ship_buf, true);
   }
 
-  if (use_mmap && ring.ring != MAP_FAILED) {
-    munmap(ring.ring, ring.ring_size);
+  struct tpacket_stats packet_stats;
+  socklen_t packet_stats_len = sizeof(packet_stats);
+  memset(&packet_stats, 0, sizeof(packet_stats));
+  if (getsockopt(fd, SOL_PACKET, PACKET_STATISTICS,
+                 &packet_stats, &packet_stats_len) == 0) {
+    logmsg("packet stats: received=" + number_string(packet_stats.tp_packets) +
+           " dropped=" + number_string(packet_stats.tp_drops));
   }
-  if (fallback_buf) free(fallback_buf);
+  if (!release_mmap_ring(fd, ring)) {
+    logmsg("TPACKET_V2 cleanup failed");
+    ring_integrity_failure = true;
+  }
   close(fd);
   logmsg("stopped");
-  return 0;
+  return ring_integrity_failure ? 2 : 0;
 }
