@@ -40,9 +40,11 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <set>
 #include <list>
 #include <sstream>
 #include <string>
+
 #include <vector>
 #include <algorithm>
 
@@ -386,6 +388,11 @@ struct PendingQueueRef {
 
 static size_t g_total_pending_count = 0;
 static std::list<PendingQueueRef> g_pending_fifo;
+// PacketKey entries (response-direction: server→client) for which response
+// correlation is permanently disabled until a verified new SYN arrives.
+// Set when a tombstone expires un-consumed or when a pending entry is
+// force-evicted; cleared only on client SYN.
+static std::set<PacketKey> g_corr_disabled;
 
 static void logmsg(const std::string &s) { fprintf(stderr, "nt-sniff-cpp: %s\n", s.c_str()); fflush(stderr); }
 
@@ -1205,6 +1212,13 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
   long long mono_now = now_monotonic_ms();
   long long started_mono = (first_byte_mono_ms > 0) ? first_byte_mono_ms : mono_now;
 
+  // If ordering was lost for this 4-tuple (tombstone expired, eviction), emit
+  // without queuing so no future response can be attached to this request.
+  if (g_corr_disabled.count(rk)) {
+    emit_event(e);
+    return;
+  }
+
   while (g_total_pending_count >= MAX_PENDING_TOTAL && !g_pending_fifo.empty()) {
     PendingQueueRef ref = g_pending_fifo.front();
     g_pending_fifo.pop_front();
@@ -1212,27 +1226,46 @@ static void queue_request(const Event &e, uint32_t s_ip, unsigned sport,
     if (it != pending.end()) {
       for (size_t i = 0; i < it->second.size(); ++i) {
         if (it->second[i].req_id == ref.req_id) {
-          emit_event(it->second[i].ev);
-          it->second.erase(it->second.begin() + i);
-          if (g_total_pending_count > 0) --g_total_pending_count;
-          if (it->second.empty()) pending.erase(it);
+          // Global eviction disrupts ordering for this key: flush all and lock out.
+          while (!it->second.empty()) {
+            if (!it->second.front().is_tombstone) {
+              emit_event(it->second.front().ev);
+              if (g_total_pending_count > 0) --g_total_pending_count;
+            }
+            it->second.erase(it->second.begin());
+          }
+          pending.erase(it);
+          g_corr_disabled.insert(ref.key);
           break;
         }
       }
     }
   }
 
+  if (g_corr_disabled.count(rk)) {
+    emit_event(e);
+    return;
+  }
+
   std::vector<Pending> &queue = pending[rk];
   if (queue.size() >= MAX_PENDING_PER_FLOW) {
-    if (!queue[0].is_tombstone) {
-      emit_event(queue[0].ev);
-      if (g_total_pending_count > 0) --g_total_pending_count;
+    // Per-flow overflow: flush all entries for this 4-tuple, permanently lock out.
+    while (!queue.empty()) {
+      if (!queue.front().is_tombstone) {
+        emit_event(queue.front().ev);
+        if (g_total_pending_count > 0) --g_total_pending_count;
+      }
+      queue.erase(queue.begin());
     }
-    queue.erase(queue.begin());
+    pending.erase(rk);
+    g_corr_disabled.insert(rk);
+    emit_event(e);
+    return;
   }
   uint64_t req_id = ++g_req_id_seq;
   queue.push_back(Pending(req_id, gen, e, now_ms(), started_mono));
   ++g_total_pending_count;
+
 
   PendingQueueRef new_ref;
   new_ref.req_id = req_id;
@@ -1289,7 +1322,9 @@ static void flush_all_pending(std::map<PacketKey, std::vector<Pending> > &pendin
   pending.clear();
   g_pending_fifo.clear();
   g_total_pending_count = 0;
+  g_corr_disabled.clear();
 }
+
 
 
 static void sweep(std::map<FlowKey, Flow> &flows,
@@ -1319,8 +1354,9 @@ static void sweep(std::map<FlowKey, Flow> &flows,
       if (entry.is_tombstone) {
         if (now_mono - entry.tombstone_mono_ms > 10000LL) {
           // Tombstone expired un-consumed: flush all remaining entries in this
-          // queue immediately (ordering is now ambiguous – a very-late response
-          // must not silently attach to the next real request).
+          // queue immediately (ordering is now ambiguous). Then permanently
+          // disable response correlation for this 4-tuple until a new SYN.
+          PacketKey disabled_key = p->first;
           p->second.erase(p->second.begin() + i);
           while (i < p->second.size()) {
             Pending &tail = p->second[i];
@@ -1330,6 +1366,7 @@ static void sweep(std::map<FlowKey, Flow> &flows,
             }
             p->second.erase(p->second.begin() + i);
           }
+          g_corr_disabled.insert(disabled_key);
           // Leave i unchanged; inner while exits on next check
         } else {
           ++i;
@@ -1593,7 +1630,14 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
           PacketKey pk;
           pk.s_ip = s_ip; pk.sport = (uint16_t)sport;
           pk.d_ip = d_ip; pk.dport = (uint16_t)dport;
-          std::map<PacketKey, std::vector<Pending> >::iterator p = pending.find(pk);
+          // Correlation permanently disabled for this 4-tuple: discard response.
+          if (g_corr_disabled.count(pk)) {
+            // Consume this response header+body so parsing can continue, but
+            // do not attach it to any pending request.
+            // Fall through to body-state transitions below (is_head=false).
+          }
+          std::map<PacketKey, std::vector<Pending> >::iterator p =
+              g_corr_disabled.count(pk) ? pending.end() : pending.find(pk);
           bool is_head = false;
           if (p != pending.end() && !p->second.empty()) {
             if (rfl.generation != 0 && p->second[0].generation != 0 && p->second[0].generation != rfl.generation) {
@@ -1796,6 +1840,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
       }
       pending.erase(p);
     }
+    // Re-enable correlation for this 4-tuple: SYN proves a fresh TCP connection
+    // with no ambiguous ordering state from the previous stream.
+    g_corr_disabled.erase(rk);
 
     Flow &fl = flows[fk];
     if (fl.awaiting_wsse) {

@@ -7,7 +7,7 @@
 
 Three additional reproducible blockers fixed in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
 
-1. **Tombstone Expiry Allows Late Re-correlation (Test 23)**: After a tombstone's 10 s secondary TTL expires un-consumed, all remaining pending entries in the same flow queue are now immediately emitted and removed. A very-late response arriving after the tombstone is purged can no longer silently attach to the next real request.
+1. **Persistent Correlation Lockout on Unresolved Tombstone Expiry or Eviction (Test 23)**: When an unresolved tombstone is discarded after its 10-second retention, or when ordering information is lost due to queue/flow eviction, response correlation is permanently disabled for that connection (`g_corr_disabled` in C++, `corr_disabled` in Python). Subsequent requests on that connection emit immediately with null response fields and are never queued; incoming responses are framed but discarded. The lockout persists until a verified new TCP connection (client SYN) resets the state and restores correlation.
 
 2. **Duplicate Emit on Shutdown (Test 24)**: `flush_all_pending()`, per-flow overflow eviction (`queue_request`), and SYN pending cleanup now all guard with `!is_tombstone` before calling `emit_event()`. Tombstone entries are always already emitted by `sweep()`; double-emitting them via flush or SYN reconnect paths is eliminated.
 
@@ -19,9 +19,10 @@ Three additional reproducible blockers fixed in both `nt-sniff-cpp.cpp` and `nt-
 |---|---|
 | `pytest test_nt_sniff.py` | **19/19 PASS** |
 | `python3 test_synthetic_harness.py` | **50/50 PASS** (Tests 1–25, both engines) |
-| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,205 events ✓ |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,204 events ✓ |
 | `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 7 EDGE TESTS PASS** |
 | `make clean && make all && make fixture` | **PASS** (0 warnings) |
+
 
 
 Seven additional reproducible bugs fixed in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:

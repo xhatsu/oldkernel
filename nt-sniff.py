@@ -365,10 +365,13 @@ SWEEP_INTERVAL = 1.0     # honor PENDING_TTL even when the socket goes idle
 # server->client. Value: [event, req_ts]. A list per key handles HTTP
 # keep-alive pipelining (several requests before responses arrive).
 pending = {}
+corr_disabled = set()
 
 
 def pending_del(rk):
     pending.pop(rk, None)
+    corr_disabled.discard(rk)
+
 
 
 def pending_pop(rk, out, pending_tbl=None):
@@ -512,7 +515,7 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                 del rfl.buf[:head_len]
                 continue
 
-            ent = pending_tbl.get(rk)
+            ent = pending_tbl.get(rk) if rk not in corr_disabled else None
             is_head = False
             if ent:
                 item = ent[0]
@@ -885,16 +888,20 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now):
         out.append(ev)
         return
     rk = (dst_ip, dport, src_ip, sport)
+    if rk in corr_disabled:
+        out.append(ev)
+        return
     ent = pending_tbl.get(rk)
     if ent is None:
         if len(pending_tbl) >= PENDING_MAX:
             _flush_oldest_pending(pending_tbl, out)
         ent = pending_tbl[rk] = []
     elif len(ent) >= PENDING_PER_FLOW:
-        pending_pop(rk, out, pending_tbl)
-        ent = pending_tbl.get(rk)
-        if ent is None:
-            ent = pending_tbl[rk] = []
+        while pending_tbl.get(rk):
+            pending_pop(rk, out, pending_tbl)
+        corr_disabled.add(rk)
+        out.append(ev)
+        return
     started = fl.first_byte_ts if fl.first_byte_ts > 0 else (now if now is not None else time.time())
     ent.append([ev, started])
 
@@ -908,18 +915,23 @@ def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_t
         out.append(ev)
         return
     rk = (dst_ip, dport, src_ip, sport)
+    if rk in corr_disabled:
+        out.append(ev)
+        return
     ent = pending_tbl.get(rk)
     if ent is None:
         if len(pending_tbl) >= PENDING_MAX:
             _flush_oldest_pending(pending_tbl, out)
         ent = pending_tbl[rk] = []
     elif len(ent) >= PENDING_PER_FLOW:
-        pending_pop(rk, out, pending_tbl)
-        ent = pending_tbl.get(rk)
-        if ent is None:
-            ent = pending_tbl[rk] = []
+        while pending_tbl.get(rk):
+            pending_pop(rk, out, pending_tbl)
+        corr_disabled.add(rk)
+        out.append(ev)
+        return
     started = first_byte_ts if first_byte_ts > 0 else (now if now is not None else time.time())
     ent.append([ev, started, False, 0.0, generation])
+
 
 
 def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
@@ -943,7 +955,7 @@ def _try_wsse_body(flows, key, fl, payload, meta, out, pending_tbl, now):
 
 def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                    pending_tbl=None, now=None, wsse_body_bytes=0,
-                   seq=None, flags=0, is_truncated=False):
+                   seq=None, flags=0, is_truncated=False, resp_flows=None):
     dst_ip, dport, src_ip, sport = meta
     if not valid_port(dport) or not valid_port(sport):
         return
@@ -957,6 +969,7 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             out.append(fl.wsse_event)
             fl.awaiting_wsse = False
         rk = (dst_ip, dport, src_ip, sport)
+        corr_disabled.discard(rk)
         if pending_tbl is not None:
             ent = pending_tbl.pop(rk, None)
             if ent:
@@ -964,8 +977,12 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                     is_tomb = item[2] if len(item) > 2 else False
                     if not is_tomb:
                         out.append(item[0])
+
+        if resp_flows is not None and rk in resp_flows:
+            resp_flows.pop(rk, None)
         if rev_key is not None and rev_key in flows:
             flows.pop(rev_key, None)
+
         old_gen = fl.generation if fl is not None else 0
         fl = Flow()
         fl.generation = old_gen + 1
@@ -1334,14 +1351,16 @@ def process_packet(pkt, ports, node_host, flows, resp_flows, pending_tbl, out, n
         meta = (dst_ip, dport, src_ip, sport)
         handle_payload(flows, key, None, payload, meta, ports, node_host, out,
                        pending_tbl, now, wsse_body_bytes,
-                       seq=seq, flags=flags, is_truncated=is_truncated)
+                       seq=seq, flags=flags, is_truncated=is_truncated,
+                       resp_flows=resp_flows)
+
         return True
 
     return False
 
 
 def _flush_oldest_pending(pending_tbl, out):
-    """Overflow guard: emit the single oldest pending event as-is."""
+    """Overflow guard: emit all events for the oldest pending key and lock it out."""
     oldest_key, oldest_ts = None, None
     for rk, lst in pending_tbl.items():
         if not lst:
@@ -1350,7 +1369,10 @@ def _flush_oldest_pending(pending_tbl, out):
         if oldest_ts is None or ts < oldest_ts:
             oldest_key, oldest_ts = rk, ts
     if oldest_key is not None:
-        pending_pop(oldest_key, out, pending_tbl)
+        while pending_tbl.get(oldest_key):
+            pending_pop(oldest_key, out, pending_tbl)
+        corr_disabled.add(oldest_key)
+        pending_tbl.pop(oldest_key, None)
 
 
 def sweep_pending(pending_tbl, now, out):
@@ -1367,8 +1389,8 @@ def sweep_pending(pending_tbl, now, out):
             if is_tomb:
                 if now - tomb_ts > 10.0:
                     # Tombstone expired un-consumed: ordering is now ambiguous.
-                    # Flush all remaining entries immediately so no subsequent
-                    # response can silently attach to the next real request.
+                    # Flush all remaining entries immediately and persistently
+                    # disable response correlation for this connection until SYN.
                     lst.pop(i)
                     while i < len(lst):
                         tail = lst[i]
@@ -1376,6 +1398,7 @@ def sweep_pending(pending_tbl, now, out):
                         if not tail_tomb:
                             out.append(tail[0])
                         lst.pop(i)
+                    corr_disabled.add(rk)
                     # Leave i unchanged; the while condition will exit naturally
                 else:
                     i += 1
@@ -1408,6 +1431,8 @@ def drain_pending(pending_tbl, out):
                 is_tomb = item[2] if len(item) > 2 else False
                 if not is_tomb:
                     out.append(item[0])
+    corr_disabled.clear()
+
 
 
 def maintenance_due(now, last_sweep):

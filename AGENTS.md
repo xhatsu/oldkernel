@@ -116,11 +116,12 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 - **Keep-Alive Timing Precision**: `first_byte_ts` / `first_byte_mono_ms` reset strictly at request boundaries.
 - **Shipping Concurrency**: Mutex-guarded `g_producer_finished`, explicit 10s shutdown deadline, `pthread_cond_broadcast` on exit.
 - **Dual-Engine Synthetic Regression Suite (`test_synthetic_harness.py`)**: **50/50 PASS** across both C++ and Python engines covering 25 distinct edge cases (Tests 1–25).
-- **Tombstone Expiry Ordering Safety (Tests 23)**: When a tombstone expires un-consumed (10 s secondary TTL), all subsequent entries in the same flow queue are immediately emitted and discarded. No late response can attach to `/new` after the ordering anchor is gone.
+- **Persistent Correlation Lockout on Unresolved Tombstone Expiry or Eviction (Test 23)**: When a tombstone expires un-consumed or ordering information is lost via queue eviction, response correlation is permanently disabled for that 4-tuple (`g_corr_disabled` in C++, `corr_disabled` in Python). Subsequent requests on that connection emit immediately with null response fields; incoming responses are parsed to maintain HTTP framing but never correlate. Only a verified new connection (client SYN) resets the lockout and re-enables correlation.
 - **No Double-Emit on Drain (Test 24)**: `flush_all_pending()`, per-flow overflow eviction, and SYN cleanup all skip tombstone entries (already emitted by `sweep()`). `drain_pending()` in Python also skips tombstones.
 - **Broken Response Stream Stops Scanning (Test 25)**: `parse_response` / `parse_response_head` failure on conflicting `Content-Length` now sets `rfl.is_broken = true` and clears the buffer rather than `continue`-ing into body bytes. Prevents body data from being re-scanned as a new response and emitting a fabricated status.
-- **PCAP Verification Parity**: PCAP 247 → 109 events, status 200, duration 112ms, both engines. PCAP 249 → 6,204 events (Python) / 6,205 events (C++), zero credential leaks, both engines.
+- **PCAP Verification Parity**: PCAP 247 → 109 events, status 200, duration 112ms, both engines. PCAP 249 → 6,204 events (Python) / 6,204 events (C++), zero credential leaks, both engines.
 - **Unit Tests**: `pytest test_nt_sniff.py` 19/19 PASS.
 - **ASAN/UBSAN**: `cpp-edge-test.py` ALL 7 EDGE TESTS PASS (sniffer, WSSE, dual-auth, TPACKET_V2, shipper ceiling, agent stats, bounded egress).
+
 
 

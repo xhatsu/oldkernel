@@ -72,10 +72,12 @@ def run_cpp_pcap(pcap_file, ports, wsse_bytes=0):
     return events
 
 def run_python_pcap(pcap_file, ports, wsse_bytes=0):
+    nt_sniff.corr_disabled.clear()
     flows = {}
     resp_flows = {}
     pending = {}
     out = []
+
     ports_set = set(ports)
     node_host = "test-py-synthetic"
 
@@ -498,42 +500,66 @@ def run_test_suite_for_engine_ext(run_pcap, engine_name):
     tmp_pcap = "/tmp/nt_synth_ext_%s.pcap" % engine_name.replace("+", "p")
 
     # -----------------------------------------------------------------------
-    # 23. Tombstone Expiry Must Not Allow Late Response to Attach to /new
-    # /old expires -> tombstone -> tombstone expires after 10s -> a very-late
-    # response arrives. It must NOT be attributed to any request.
-    # We verify: exactly 2 events (both uncorrelated), neither has status set.
+    # 23. Tombstone Expiry Must Permanently Lock Out Correlation Until SYN
+    # 1. /old arrives at t=100
+    # 2. t=135 sweep: /old expires (35s > TTL 30s) -> becomes tombstone
+    # 3. t=150 sweep: tombstone expires (15s > 10s) -> tombstone purged, correlation disabled
+    # 4. /new arrives at t=152 on same connection -> emitted immediately with status=null
+    # 5. /old's late response arrives at t=154 -> discarded, /new must NOT get status
+    # 6. verified new SYN arrives at t=160 -> re-enables correlation
+    # 7. /fresh request at t=161 + response at t=162 -> properly correlated with status 200
     # -----------------------------------------------------------------------
-    # Use separate src ports to avoid cross-test state pollution
     req_old23 = b"GET /api/old23 HTTP/1.1\r\nHost: x\r\n\r\n"
     req_new23 = b"GET /api/new23 HTTP/1.1\r\nHost: x\r\n\r\n"
+    req_fresh23 = b"GET /api/fresh23 HTTP/1.1\r\nHost: x\r\n\r\n"
     old_seq23 = 23000
     new_seq23 = old_seq23 + len(req_old23)
-    # t=0   SYN + /old23
+    fresh_seq23 = 50000
+
     pkt_syn23 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
                                   old_seq23 - 1, 0, 0x02, b"")
     pkt_old23 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
                                   old_seq23, 0, 0x18, req_old23)
-    # t=60s /new23 on same connection (well past PENDING_TTL + tombstone TTL)
+    # Dummy sweep packets on unmonitored port 9999
+    pkt_sweep1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 59999, 9999, 1000, 0, 0x10, b"")
+    pkt_sweep2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 59999, 9999, 1001, 0, 0x10, b"")
+    # /new23 on same connection after tombstone expired
     pkt_new23 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
                                   new_seq23, 0, 0x18, req_new23)
-    # t=62s response that would have matched /old23
+    # /old23's late response
     resp23 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-    resp_seq23 = old_seq23 + len(req_old23) + len(req_new23)
     pkt_resp23 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50023,
                                    40000, old_seq23 + len(req_old23), 0x18, resp23)
+    # New verified connection via SYN
+    pkt_syn_fresh = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
+                                      fresh_seq23 - 1, 0, 0x02, b"")
+    pkt_fresh23 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50023, 80,
+                                    fresh_seq23, 0, 0x18, req_fresh23)
+    resp_fresh23 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_resp_fresh = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50023,
+                                       41000, fresh_seq23 + len(req_fresh23), 0x18, resp_fresh23)
+
     write_pcap(tmp_pcap, [
-        (23, 0,         pkt_syn23,  len(pkt_syn23)),
-        (23, 1000,      pkt_old23,  len(pkt_old23)),
-        (23, 60000000,  pkt_new23,  len(pkt_new23)),   # 60 s in usec
-        (23, 62000000,  pkt_resp23, len(pkt_resp23)),
+        (100, 0, pkt_syn23, len(pkt_syn23)),
+        (100, 1000, pkt_old23, len(pkt_old23)),
+        (135, 0, pkt_sweep1, len(pkt_sweep1)),   # 35s later: /old expires to tombstone
+        (150, 0, pkt_sweep2, len(pkt_sweep2)),   # 15s later: tombstone expires, correlation disabled
+        (152, 0, pkt_new23, len(pkt_new23)),     # /new arrives on locked-out connection
+        (154, 0, pkt_resp23, len(pkt_resp23)),   # /old late response arrives -> must NOT correlate
+        (160, 0, pkt_syn_fresh, len(pkt_syn_fresh)), # New verified SYN resets lockout
+        (161, 0, pkt_fresh23, len(pkt_fresh23)),
+        (162, 0, pkt_resp_fresh, len(pkt_resp_fresh)), # Must correlate with 200 OK
     ])
     ev23 = run_pcap(tmp_pcap, [80])
-    # /new23 must NOT carry a status from /old23's response
     new_with_status = [e for e in ev23 if e.get("path") == "/api/new23" and e.get("status") is not None]
+    fresh_with_status = [e for e in ev23 if e.get("path") == "/api/fresh23" and e.get("status") == 200]
     if new_with_status:
-        failures.append("[%s] Test 23 (Tombstone Expiry Re-correlation): /new23 wrongly got status %s" % (engine_name, new_with_status))
+        failures.append("[%s] Test 23 (Tombstone Expiry Lockout): /new23 wrongly got status %s" % (engine_name, new_with_status))
+    elif not fresh_with_status:
+        failures.append("[%s] Test 23 (Tombstone Expiry Lockout): /api/fresh23 failed to correlate after SYN: %s" % (engine_name, ev23))
     else:
-        print("  [%s] Test 23 (Tombstone Expiry Re-correlation): PASS" % engine_name)
+        print("  [%s] Test 23 (Tombstone Expiry Lockout): PASS (persistent lockout prevents late response; SYN restores correlation)" % engine_name)
+
 
     # -----------------------------------------------------------------------
     # 24. Expired Request Must Not Emit Twice (sweep + drain_pending/flush)
