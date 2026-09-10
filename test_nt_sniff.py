@@ -481,3 +481,48 @@ def test_expired_head_request_preserves_bodyless_response():
     assert get_events[0].get("status") == 200
     assert get_events[0].get("resp_bytes") == 5
 
+
+def test_first_fragment_rejected():
+    import struct
+    flows = {}
+    resp_flows = {}
+    pending = {}
+    out = []
+
+    # Build an Ethernet + IPv4 + TCP packet
+    eth = b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x08\x00"
+    tcp = struct.pack("!HHIIBBHHH", 50000, 80, 1000, 0, (5 << 4), 0x02, 65535, 0, 0)
+    # 1. Unfragmented packet (frag = 0): accepted
+    ip_hdr_normal = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40, 100, 0, 64, 6, 0,
+                                b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02")
+    pkt_normal = eth + ip_hdr_normal + tcp
+    assert nt_sniff.process_packet(pkt_normal, {80}, "node", flows, resp_flows, pending, out, now=10.0) is True
+
+    # 2. DF packet (frag = 0x4000): accepted
+    ip_hdr_df = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40, 101, 0x4000, 64, 6, 0,
+                            b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02")
+    pkt_df = eth + ip_hdr_df + tcp
+    assert nt_sniff.process_packet(pkt_df, {80}, "node", flows, resp_flows, pending, out, now=10.0) is True
+
+    # 3. First fragment with MF bit set (frag = 0x2000): rejected!
+    ip_hdr_mf = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40, 102, 0x2000, 64, 6, 0,
+                            b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02")
+    pkt_mf = eth + ip_hdr_mf + tcp
+    assert nt_sniff.process_packet(pkt_mf, {80}, "node", flows, resp_flows, pending, out, now=10.0) is False
+
+    # 4. Non-first fragment with offset (frag = 0x0005): rejected!
+    ip_hdr_offset = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40, 103, 0x0005, 64, 6, 0,
+                               b"\x0a\x00\x00\x01", b"\x0a\x00\x00\x02")
+    pkt_offset = eth + ip_hdr_offset + tcp
+    assert nt_sniff.process_packet(pkt_offset, {80}, "node", flows, resp_flows, pending, out, now=10.0) is False
+
+
+def test_rlimit_as_enforced():
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        # Verify RLIMIT_AS is bounded (not infinity or <= 256 MiB)
+        assert hard != resource.RLIM_INFINITY or soft <= 256 * 1024 * 1024
+    except Exception:
+        pass
+

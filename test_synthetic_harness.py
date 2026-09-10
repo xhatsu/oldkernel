@@ -23,7 +23,7 @@ def ip_checksum(data):
 def make_ipv4_packet(src_ip, dst_ip, sport, dport, seq, ack, flags, payload,
                      src_mac=b"\x00\x11\x22\x33\x44\x55",
                      dst_mac=b"\x66\x77\x88\x99\xaa\xbb",
-                     ip_id=1000, ip_total_len=None):
+                     ip_id=1000, ip_total_len=None, ip_frag=0):
     eth = dst_mac + src_mac + struct.pack("!H", 0x0800)
     tcp_len = 20 + len(payload)
     tcp_hdr = struct.pack("!HHIIBBHHH",
@@ -35,11 +35,11 @@ def make_ipv4_packet(src_ip, dst_ip, sport, dport, seq, ack, flags, payload,
     src_bytes = bytes(map(int, src_ip.split(".")))
     dst_bytes = bytes(map(int, dst_ip.split(".")))
     ip_hdr_no_cksum = struct.pack("!BBHHHBBH4s4s",
-                                  0x45, 0, tot_len, ip_id, 0, 64, 6, 0,
+                                  0x45, 0, tot_len, ip_id, ip_frag, 64, 6, 0,
                                   src_bytes, dst_bytes)
     cksum = ip_checksum(ip_hdr_no_cksum)
     ip_hdr = struct.pack("!BBHHHBBH4s4s",
-                         0x45, 0, tot_len, ip_id, 0, 64, 6, cksum,
+                         0x45, 0, tot_len, ip_id, ip_frag, 64, 6, cksum,
                          src_bytes, dst_bytes)
     return eth + ip_hdr + tcp_hdr + payload
 
@@ -776,6 +776,40 @@ def run_test_suite_for_engine_ext(run_pcap, engine_name):
     else:
         print("  [%s] Test 29 (Expired HEAD Preserves Bodyless Semantics): PASS (HEAD recognized as bodyless, GET correlated with 200 OK)" % engine_name)
 
+    # -----------------------------------------------------------------------
+    # 30. IPv4 Fragment Rejection (MF and non-zero offsets rejected, DF allowed)
+    # Packets with MF (0x2000) or offset must be rejected since no IP reassembly is done.
+    # -----------------------------------------------------------------------
+    pkts30 = []
+    pkt_syn30 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50030, 80, 1000, 0, 0x02, b"", ip_frag=0x4000)
+    pkt_synack30 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50030, 5000, 1001, 0x12, b"", ip_frag=0x4000)
+    pkts30.append((220, 0, pkt_syn30, len(pkt_syn30)))
+    pkts30.append((220, 1000, pkt_synack30, len(pkt_synack30)))
+
+    # First fragment with MF bit set (0x2000): MUST BE REJECTED
+    req_frag = b"POST /api/frag30 HTTP/1.1\r\nHost: x\r\n\r\n"
+    pkt_frag = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50030, 80, 1001, 5001, 0x18, req_frag, ip_frag=0x2000)
+    pkts30.append((220, 2000, pkt_frag, len(pkt_frag)))
+
+    # Subsequent valid unfragmented request with DF bit set (0x4000): MUST BE ACCEPTED
+    req_nofrag = b"GET /api/nofrag30 HTTP/1.1\r\nHost: x\r\n\r\n"
+    pkt_nofrag = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50030, 80, 1001, 5001, 0x18, req_nofrag, ip_frag=0x4000)
+    resp_nofrag = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt_resp_nofrag = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50030, 5001, 1001 + len(req_nofrag), 0x18, resp_nofrag, ip_frag=0x4000)
+    pkts30.append((220, 3000, pkt_nofrag, len(pkt_nofrag)))
+    pkts30.append((220, 4000, pkt_resp_nofrag, len(pkt_resp_nofrag)))
+
+    write_pcap(tmp_pcap, pkts30)
+    ev30 = run_pcap(tmp_pcap, [80])
+    frag_ev = [e for e in ev30 if e.get("path") == "/api/frag30"]
+    nofrag_ev = [e for e in ev30 if e.get("path") == "/api/nofrag30" and e.get("status") == 200]
+    if frag_ev:
+        failures.append("[%s] Test 30 (IPv4 Fragment Rejection): /api/frag30 with MF bit was accepted: %s" % (engine_name, frag_ev))
+    elif not nofrag_ev:
+        failures.append("[%s] Test 30 (IPv4 Fragment Rejection): /api/nofrag30 failed to correlate with 200 OK: %s" % (engine_name, ev30))
+    else:
+        print("  [%s] Test 30 (IPv4 Fragment Rejection): PASS (MF fragment rejected, DF packet accepted & correlated)" % engine_name)
+
     if os.path.exists(tmp_pcap):
         os.remove(tmp_pcap)
     return failures
@@ -797,7 +831,7 @@ def run_regression_suite():
             print("  *", f)
         sys.exit(1)
     else:
-        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (58/58 PASS)!")
+        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (60/60 PASS)!")
 
 if __name__ == "__main__":
     run_regression_suite()

@@ -5,7 +5,7 @@
  * AF_PACKET -> classic BPF -> bounded HTTP header flow table -> response
  * correlation -> JSONL stdout -> nt-ship.py.
  *
- * Build target: CentOS 6 / GCC 4.4, Linux 2.6.32. No third-party deps.
+ * Build target: CentOS 6.8 / GCC 4.4, Linux 2.6.32. No third-party deps.
  * SOAP body inspection is explicitly opt-in and bounded. TLS remains
  * ecapture's concern.
  */
@@ -33,6 +33,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <pwd.h>
+#include <grp.h>
 #include <linux/filter.h>
 #include <linux/capability.h>
 #include <linux/if_packet.h>
@@ -47,6 +49,14 @@
 
 #include <vector>
 #include <algorithm>
+
+#if defined(__SANITIZE_ADDRESS__)
+  #define NT_HAS_ASAN 1
+#elif defined(__has_feature)
+  #if __has_feature(address_sanitizer)
+    #define NT_HAS_ASAN 1
+  #endif
+#endif
 
 static volatile sig_atomic_t g_running = 1;
 static void stop_signal(int) { g_running = 0; }
@@ -1603,9 +1613,9 @@ static bool handle_packet(const unsigned char *buf, size_t n, const std::string 
   unsigned char ihl = (unsigned char)(buf[off] & 15) * 4;
   if ((buf[off] >> 4) != 4 || ihl < 20 || buf[off + 9] != 6) return false;
 
-  // Reject fragmented IP packets (non-first fragment has frag offset > 0)
+  // Reject fragmented IP packets (both MF and non-zero fragment offsets, while allowing DF)
   uint16_t frag = ntohs(read_u16(buf + off + 6));
-  if (frag & 0x1fff) return false;
+  if (frag & 0x3fff) return false;
 
   // IPv4 total length validation and truncation check
   uint16_t ip_total_len = ntohs(read_u16(buf + off + 2));
@@ -2565,13 +2575,41 @@ static bool parse_wsse_size(const char *value, size_t *result) {
 }
 
 static bool drop_all_capabilities() {
+  if (getuid() == 0 || geteuid() == 0) {
+    const char *target_user = getenv("NT_USER");
+    if (!target_user || !*target_user) target_user = "ntsniff";
+    struct passwd *pw = getpwnam(target_user);
+    if (!pw) {
+      pw = getpwnam("nobody");
+    }
+    if (!pw) {
+      logmsg("failed to locate unprivileged account for privilege drop");
+      return false;
+    }
+    if (setgroups(0, NULL) != 0) {
+      perror("setgroups");
+      return false;
+    }
+    if (setgid(pw->pw_gid) != 0) {
+      perror("setgid");
+      return false;
+    }
+    if (setuid(pw->pw_uid) != 0) {
+      perror("setuid");
+      return false;
+    }
+  }
+
   struct __user_cap_header_struct header;
   struct __user_cap_data_struct data[2];
   memset(&header, 0, sizeof(header));
   memset(data, 0, sizeof(data));
   header.version = _LINUX_CAPABILITY_VERSION_3;
   header.pid = 0;
-  return syscall(SYS_capset, &header, data) == 0;
+  if (syscall(SYS_capset, &header, data) != 0) {
+    return false;
+  }
+  return (getuid() != 0 && geteuid() != 0);
 }
 
 static int open_capture_socket(const std::string &iface,
@@ -2789,6 +2827,29 @@ static int run_lockout_fixture() {
 }
 
 int main(int argc, char **argv) {
+#ifndef NT_HAS_ASAN
+  struct rlimit lim;
+  if (getrlimit(RLIMIT_AS, &lim) == 0) {
+    unsigned long target = 256UL * 1024UL * 1024UL;
+    if (lim.rlim_max != RLIM_INFINITY && lim.rlim_max < target) {
+      target = (unsigned long)lim.rlim_max;
+    }
+    lim.rlim_cur = target;
+    lim.rlim_max = target;
+    if (setrlimit(RLIMIT_AS, &lim) != 0) {
+      perror("setrlimit(RLIMIT_AS)");
+      return 2;
+    }
+  } else {
+    lim.rlim_cur = 256UL * 1024UL * 1024UL;
+    lim.rlim_max = 256UL * 1024UL * 1024UL;
+    if (setrlimit(RLIMIT_AS, &lim) != 0) {
+      perror("setrlimit(RLIMIT_AS)");
+      return 2;
+    }
+  }
+#endif
+
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   if (argc > 1 && !strcmp(argv[1], "--wsse-fixture")) return run_wsse_fixture();
   if (argc > 1 && !strcmp(argv[1], "--dual-auth-fixture")) return run_dual_auth_fixture();

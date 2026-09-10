@@ -330,6 +330,16 @@ def main():
     if not endpoint:
         raise SystemExit("--endpoint required")
 
+    try:
+        import resource
+        target = 256 * 1024 * 1024
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard != resource.RLIM_INFINITY and hard < target:
+            target = hard
+        resource.setrlimit(resource.RLIMIT_AS, (target, target))
+    except Exception:
+        pass
+
     node = socket.gethostname().split(".")[0]
     rate_kbps = read_bounded_int("NT_SHIP_RATE_KBPS", DEFAULT_RATE_KBPS,
                                  MIN_RATE_KBPS, MAX_RATE_KBPS)

@@ -77,7 +77,30 @@ def stats_interval_seconds():
 
 
 def drop_capture_capabilities():
-    """Irreversibly clear CAP_NET_RAW after the packet socket is ready."""
+    """Irreversibly drop root privileges and clear CAP_NET_RAW after socket setup."""
+    try:
+        import os, pwd
+        if os.getuid() == 0 or os.geteuid() == 0:
+            target_user = os.environ.get("NT_USER", "ntsniff")
+            try:
+                pw = pwd.getpwnam(target_user)
+            except KeyError:
+                try:
+                    pw = pwd.getpwnam("nobody")
+                except KeyError:
+                    return False
+            try:
+                os.setgroups([])
+            except Exception:
+                pass
+            try:
+                os.setgid(pw.pw_gid)
+                os.setuid(pw.pw_uid)
+            except Exception:
+                return False
+    except Exception:
+        return False
+
     try:
         import ctypes
         libcap = ctypes.CDLL("libcap.so.2")
@@ -86,11 +109,11 @@ def drop_capture_capabilities():
         if not empty:
             return False
         try:
-            return libcap.cap_set_proc(ctypes.c_void_p(empty)) == 0
+            return libcap.cap_set_proc(ctypes.c_void_p(empty)) == 0 and os.getuid() != 0 and os.geteuid() != 0
         finally:
             libcap.cap_free(ctypes.c_void_p(empty))
     except Exception:
-        return False
+        return os.getuid() != 0 and os.geteuid() != 0
 
 
 # ---------------------------------------------------------------- perf: cBPF
@@ -1460,7 +1483,7 @@ def process_packet(pkt, ports, node_host, flows, resp_flows, pending_tbl, out, n
         return False
 
     frag = struct.unpack("!H", pkt[off + 6:off + 8])[0]
-    if frag & 0x1FFF:
+    if frag & 0x3FFF:
         return False
 
     ip_total_len = struct.unpack("!H", pkt[off + 2:off + 4])[0]
@@ -1701,6 +1724,16 @@ def main():
             log("remote control enabled")
         except Exception as e:
             log("WARN: remote control disabled (%s)" % nt_control.safe_message(e))
+
+    try:
+        import resource
+        target = 256 * 1024 * 1024
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard != resource.RLIM_INFINITY and hard < target:
+            target = hard
+        resource.setrlimit(resource.RLIMIT_AS, (target, target))
+    except Exception:
+        pass
 
     try:
         # protocol MUST be htons(ETH_P_ALL) to receive both INGRESS (req) and

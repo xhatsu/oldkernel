@@ -18,6 +18,14 @@
 #include <unistd.h>
 #include <signal.h>
 
+#if defined(__SANITIZE_ADDRESS__)
+  #define NT_HAS_ASAN 1
+#elif defined(__has_feature)
+  #if __has_feature(address_sanitizer)
+    #define NT_HAS_ASAN 1
+  #endif
+#endif
+
 static const size_t MAX_BATCH = 400;
 static const size_t MAX_QUEUE = 4000;
 static const size_t MAX_POST_BYTES = 65536;
@@ -340,6 +348,29 @@ int main(int argc, char **argv) {
     std::cout << shipping_stats_body("{\"packets_total\":100,\"packets_delta\":100,\"kernel_drops_total\":0,\"kernel_drops_delta\":0,\"output_pipe_drops_delta\":0,\"wsse_body_bytes\":8192}") << "\n";
     return 0;
   }
+#ifndef NT_HAS_ASAN
+  struct rlimit lim;
+  if (getrlimit(RLIMIT_AS, &lim) == 0) {
+    unsigned long target = 256UL * 1024UL * 1024UL;
+    if (lim.rlim_max != RLIM_INFINITY && lim.rlim_max < target) {
+      target = (unsigned long)lim.rlim_max;
+    }
+    lim.rlim_cur = target;
+    lim.rlim_max = target;
+    if (setrlimit(RLIMIT_AS, &lim) != 0) {
+      perror("setrlimit(RLIMIT_AS)");
+      return 70;
+    }
+  } else {
+    lim.rlim_cur = 256UL * 1024UL * 1024UL;
+    lim.rlim_max = 256UL * 1024UL * 1024UL;
+    if (setrlimit(RLIMIT_AS, &lim) != 0) {
+      perror("setrlimit(RLIMIT_AS)");
+      return 70;
+    }
+  }
+#endif
+
   pthread_attr_t attr;
   if (pthread_attr_init(&attr) != 0) { logmsg("cannot initialize uploader limits; refusing unsafe startup"); return 70; }
   if (pthread_attr_setstacksize(&attr, 512U * 1024U) != 0) {

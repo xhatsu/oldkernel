@@ -3,6 +3,43 @@
 
 # STATE.md — Current Project State & Memory
 
+## Security Hardening & Correctness Round 6 — Privilege Drop, RLIMIT_AS Enforcement & IPv4 Fragment Rejection (2026-09-10)
+
+Three critical production hardening and correctness issues resolved across both C++ and Python engines:
+
+1. **Complete Privilege Drop from Root (`drop_all_capabilities` / `drop_capture_capabilities`)**:
+   - If the binary is launched as root (UID 0 / EUID 0), it now explicitly drops privileges after socket creation and ring setup:
+     1. Clears auxiliary groups with `setgroups(0, NULL)`.
+     2. Looks up target non-login user (`NT_USER`, default `ntsniff`, fallback `nobody`).
+     3. Drops group ID with `setgid(pw->pw_gid)`.
+     4. Drops user ID with `setuid(pw->pw_uid)`.
+     5. Irreversibly zeroes all capabilities using `capset(all-zero)`.
+     6. Validates `getuid() != 0 && geteuid() != 0`.
+   - Prevents child processes (such as curl in popen shipping mode) from ever executing as root.
+   - For non-root invocations, preserves rootless operation with file capabilities (`CAP_NET_RAW`) and zeroes capabilities immediately after socket initialization.
+
+2. **Real Enforced 256 MiB Virtual Memory Bound (`RLIMIT_AS`)**:
+   - Enforced `setrlimit(RLIMIT_AS, &lim)` (256 MiB ceiling) in `main()` of `nt-sniff-cpp.cpp`, `nt-ship-cpp.cpp`, `nt-sniff.py`, and `nt-ship.py`.
+   - Automatically adapts to existing lower limits (`rlim_max < 256 MiB`) without failing EPERM.
+   - Portable preprocessor check (`#ifndef NT_HAS_ASAN`) avoids conflict with AddressSanitizer's multi-terabyte shadow memory mapping during edge testing.
+   - The advertised `"address_space_bytes": 268435456` in agent telemetry is now backed by a hard kernel limit on the process itself.
+
+3. **Reject First IPv4 Fragment (MF Flag, Test 30)**:
+   - Updated fragment check from `frag & 0x1fff` (which only rejected non-zero offsets) to `frag & 0x3fff` (which rejects both `MF == 1` and non-zero offsets while preserving `DF == 1`).
+   - Because the sniffer does not perform IP defragmentation, accepting the first fragment could lead to truncated or corrupted TCP payload analysis. Rejecting all fragmented packets ensures parser correctness.
+
+### Test Results After Round 6 Fixes
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **60/60 PASS** (Tests 1–30, both engines) |
+| `./nt-sniff-cpp --lockout-fixture` | **PASS** (10k bounded registry + all 4 sequence reproductions) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,204 events ✓ |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 8 EDGE TESTS PASS** |
+| `make clean && make all && make fixture` | **PASS** (0 warnings) |
+| `sh build-firstrun.sh` | **362,119 bytes** bundle rebuilt |
+
 ## Capture & Parser Hardening Round 5 — Unified Flow Reset & Expired HEAD Semantics (2026-09-09)
 
 Two critical edge cases resolved in both `nt-sniff-cpp.cpp` and `nt-sniff.py`:
