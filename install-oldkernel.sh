@@ -429,7 +429,7 @@ fi
 # leaves events stranded in sniff.log (proven on el6). Build one pipeline.
 if [ "$CAPTURE_MODE" = "cpp" ]; then
     CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
-    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD nt-sniff-cpp.cpp -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -o nt-ship-cpp) || die "C++ build failed"
+    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-sniff-cpp.cpp -lrt -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -lrt -o nt-ship-cpp) || die "C++ build failed"
     if [ -f "$PREFIX/nt-sniff-cpp" ] && have setcap && have useradd; then
         chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         chmod 750 "$PREFIX/nt-sniff-cpp" 2>/dev/null || true

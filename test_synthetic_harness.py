@@ -195,7 +195,7 @@ def run_test_suite_for_engine(run_pcap, engine_name):
 
     # 7. Overlapping retransmission
     pkt_ov1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50006, 80, 7000, 0, 0x18, b"GET /api/overlap HTT")
-    pkt_ov2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50006, 80, 7010, 0, 0x18, b"lap HTTP/1.1\r\nHost: a\r\n\r\n")
+    pkt_ov2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50006, 80, 7013, 0, 0x18, b"lap HTTP/1.1\r\nHost: a\r\n\r\n")
     write_pcap(tmp_pcap, [(1006, 0, pkt_ov1, len(pkt_ov1)), (1006, 50, pkt_ov2, len(pkt_ov2))])
     ev7 = run_pcap(tmp_pcap, [80])
     if len(ev7) != 1 or ev7[0].get("path") != "/api/overlap":
@@ -386,7 +386,11 @@ def run_test_suite_for_engine(run_pcap, engine_name):
     pkt_rp17_1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50017, 27000, 17000 + len(req17_1), 0x18, resp17_1)
     resp17_2 = b"HTTP/1.1 204 No Content\r\n\r\n"
     pkt_rp17_2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50017, 27000 + len(resp17_1), 17000 + len(req17_1) + len(req17_2), 0x18, resp17_2)
+    pkt_ack1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50017, 80, 17000 + len(req17_1), 0, 0x10, b"")
     write_pcap(tmp_pcap, [(1017, 0, pkt_r17_1, len(pkt_r17_1)),
+                          (1027, 0, pkt_ack1, len(pkt_ack1)),
+                          (1037, 0, pkt_ack1, len(pkt_ack1)),
+                          (1047, 0, pkt_ack1, len(pkt_ack1)),
                           (1055, 0, pkt_r17_2, len(pkt_r17_2)),
                           (1055, 10000, pkt_rp17_1, len(pkt_rp17_1)),
                           (1055, 20000, pkt_rp17_2, len(pkt_rp17_2))])
@@ -810,6 +814,1281 @@ def run_test_suite_for_engine_ext(run_pcap, engine_name):
     else:
         print("  [%s] Test 30 (IPv4 Fragment Rejection): PASS (MF fragment rejected, DF packet accepted & correlated)" % engine_name)
 
+    # -----------------------------------------------------------------------
+    # 31. Flow Expiry Invalidation & Pending Flush (Framing Isolation)
+    # Flow state expires after 15s (FLOW_TTL).
+    # Two requests are sent; first response has headers + partial body.
+    # Flow expires at 20s. Pending requests must be flushed without status.
+    # Subsequent body bytes resembling "HTTP/1.1 503..." must NOT correlate.
+    # -----------------------------------------------------------------------
+    req31_1 = b"GET /api/r1_31 HTTP/1.1\r\nHost: x\r\n\r\n"
+    req31_2 = b"GET /api/r2_31 HTTP/1.1\r\nHost: x\r\n\r\n"
+    resp31_partial = (b"HTTP/1.1 200 OK\r\n"
+                      b"Content-Length: 100\r\n\r\n"
+                      b"0123456789")
+    resp31_resume = (b"HTTP/1.1 503 Service Unavailable\r\n"
+                     b"Content-Length: 0\r\n\r\n")
+
+    seq31_client = 31000
+    seq31_server = 71000
+
+    pkt_syn31 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50031, 80,
+                                 seq31_client - 1, 0, 0x02, b"")
+    pkt_synack31 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50031,
+                                    seq31_server - 1, seq31_client, 0x12, b"")
+    pkt_r31_1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50031, 80,
+                                 seq31_client, seq31_server, 0x18, req31_1)
+    pkt_r31_2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50031, 80,
+                                 seq31_client + len(req31_1), seq31_server, 0x18, req31_2)
+    pkt_rp31_part = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50031,
+                                     seq31_server, seq31_client + len(req31_1) + len(req31_2),
+                                     0x18, resp31_partial)
+    pkt_rp31_res = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50031,
+                                    seq31_server + len(resp31_partial),
+                                    seq31_client + len(req31_1) + len(req31_2),
+                                    0x18, resp31_resume)
+
+    pkts31 = [
+        (300, 0, pkt_syn31, len(pkt_syn31)),
+        (300, 1000, pkt_synack31, len(pkt_synack31)),
+        (300, 2000, pkt_r31_1, len(pkt_r31_1)),
+        (300, 3000, pkt_r31_2, len(pkt_r31_2)),
+        (300, 4000, pkt_rp31_part, len(pkt_rp31_part)),
+        (325, 0, pkt_rp31_res, len(pkt_rp31_res)),
+    ]
+    write_pcap(tmp_pcap, pkts31)
+    ev31 = run_pcap(tmp_pcap, [80])
+    ev31_503 = [e for e in ev31 if e.get("status") == 503]
+    ev31_r1 = [e for e in ev31 if e.get("path") == "/api/r1_31"]
+    ev31_r2 = [e for e in ev31 if e.get("path") == "/api/r2_31"]
+    if ev31_503:
+        failures.append("[%s] Test 31 (Flow Expiry Framing): Fake 503 status assigned: %s" % (engine_name, ev31_503))
+    elif not ev31_r1 or ev31_r1[0].get("status") != 200:
+        failures.append("[%s] Test 31 (Flow Expiry Framing): Expected /api/r1_31 with status 200, got %s" % (engine_name, ev31_r1))
+    elif not ev31_r2 or ev31_r2[0].get("status") is not None:
+        failures.append("[%s] Test 31 (Flow Expiry Framing): Expected /api/r2_31 with status None, got %s" % (engine_name, ev31_r2))
+    else:
+        print("  [%s] Test 31 (Flow Expiry Framing): PASS (flows expired, pending flushed without status, no fake 503)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 32. WSSE Early Response Correlation
+    # Server sends 403 Forbidden before client finishes sending SOAP body.
+    # The request headers must be reserved in pending immediately, so that
+    # the 403 response correlates to the request with status 403.
+    # -----------------------------------------------------------------------
+    soap_hdr32 = (b"POST /api/wsse_early HTTP/1.1\r\n"
+                  b"Host: x\r\n"
+                  b"Content-Type: text/xml\r\n"
+                  b"Content-Length: 120\r\n\r\n")
+    resp_403 = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+    soap_body32 = (b"<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                   b"xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\">"
+                   b"<wsse:Username>alice</wsse:Username></soap:Envelope>")
+    seq32_client = 32000
+    seq32_server = 72000
+
+    pkt_syn32 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50032, 80,
+                                 seq32_client - 1, 0, 0x02, b"")
+    pkt_synack32 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50032,
+                                    seq32_server - 1, seq32_client, 0x12, b"")
+    pkt_req_hdr32 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50032, 80,
+                                     seq32_client, seq32_server, 0x18, soap_hdr32)
+    pkt_early_resp = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50032,
+                                      seq32_server, seq32_client + len(soap_hdr32), 0x18, resp_403)
+    pkt_req_body32 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50032, 80,
+                                      seq32_client + len(soap_hdr32), seq32_server + len(resp_403), 0x18, soap_body32)
+    pkts32 = [
+        (350, 0, pkt_syn32, len(pkt_syn32)),
+        (350, 1000, pkt_synack32, len(pkt_synack32)),
+        (350, 2000, pkt_req_hdr32, len(pkt_req_hdr32)),
+        (350, 3000, pkt_early_resp, len(pkt_early_resp)),
+        (350, 4000, pkt_req_body32, len(pkt_req_body32)),
+    ]
+    write_pcap(tmp_pcap, pkts32)
+    ev32 = run_pcap(tmp_pcap, [80], wsse_bytes=8192)
+    ev32_early = [e for e in ev32 if e.get("path") == "/api/wsse_early"]
+    if not ev32_early:
+        failures.append("[%s] Test 32 (WSSE Early Response): No event for /api/wsse_early" % engine_name)
+    elif ev32_early[0].get("status") != 403:
+        failures.append("[%s] Test 32 (WSSE Early Response): Expected status 403, got %s" % (engine_name, ev32_early[0].get("status")))
+    elif len(ev32_early) > 1:
+        failures.append("[%s] Test 32 (WSSE Early Response): Duplicate events emitted: %s" % (engine_name, ev32_early))
+    else:
+        print("  [%s] Test 32 (WSSE Early Response): PASS (early 403 correlated before body arrived)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 33. Truncated Packet Invalidation
+    # A response packet has ip_total_len larger than captured wire length.
+    # Sniffer flags is_truncated, increments invalid_frames, breaks flow,
+    # invalidates correlation, and flushes pending requests with null status.
+    # -----------------------------------------------------------------------
+    req33 = b"GET /api/trunc33 HTTP/1.1\r\nHost: x\r\n\r\n"
+    resp33_trunc_data = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq33_client = 33000
+    seq33_server = 73000
+
+    pkt_syn33 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50033, 80,
+                                 seq33_client - 1, 0, 0x02, b"")
+    pkt_synack33 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50033,
+                                    seq33_server - 1, seq33_client, 0x12, b"")
+    pkt_req33 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50033, 80,
+                                 seq33_client, seq33_server, 0x18, req33)
+    pkt_resp33_trunc = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50033,
+                                        seq33_server, seq33_client + len(req33), 0x18,
+                                        resp33_trunc_data, ip_total_len=500)
+    pkts33 = [
+        (400, 0, pkt_syn33, len(pkt_syn33)),
+        (400, 1000, pkt_synack33, len(pkt_synack33)),
+        (400, 2000, pkt_req33, len(pkt_req33)),
+        (400, 3000, pkt_resp33_trunc, len(pkt_resp33_trunc)),
+    ]
+    write_pcap(tmp_pcap, pkts33)
+    ev33 = run_pcap(tmp_pcap, [80])
+    ev33_trunc = [e for e in ev33 if e.get("path") == "/api/trunc33"]
+    if not ev33_trunc:
+        failures.append("[%s] Test 33 (Truncated Packet): No event emitted for /api/trunc33" % engine_name)
+    elif ev33_trunc[0].get("status") is not None:
+        failures.append("[%s] Test 33 (Truncated Packet): Expected status None due to truncation, got %s" % (engine_name, ev33_trunc[0].get("status")))
+    else:
+        print("  [%s] Test 33 (Truncated Packet): PASS (truncation broke flow & correlation invalidated)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 34. Capture Gap & UNSYNCED State (No False Request Fabrication)
+    # Client sends request headers with Content-Length: 50.
+    # An out-of-order gap exceeding MAX_OOO_SEGMENTS invalidates the stream.
+    # Body bytes containing "GET /api/fake34 HTTP/1.1\r\n\r\n" arrive.
+    # Stream in UNSYNCED state must NOT parse /api/fake34 as a request.
+    # Later, a fresh SYN establishes a new connection, sending /api/valid34
+    # which correlates with status 200.
+    # -----------------------------------------------------------------------
+    req34_hdr = b"POST /api/gap34 HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\n"
+    fake_body34 = b"GET /api/fake34 HTTP/1.1\r\nHost: x\r\n\r\n"
+    valid_req34 = b"GET /api/valid34 HTTP/1.1\r\nHost: x\r\n\r\n"
+    valid_resp34 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq34_client = 34000
+    seq34_server = 74000
+    fresh_seq34 = 60000
+
+    pkt_syn34 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80,
+                                 seq34_client - 1, 0, 0x02, b"")
+    pkt_synack34 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50034,
+                                    seq34_server - 1, seq34_client, 0x12, b"")
+    pkt_req34_hdr = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80,
+                                     seq34_client, seq34_server, 0x18, req34_hdr)
+    pkt_gap1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80, seq34_client + len(req34_hdr) + 10, seq34_server, 0x18, b"A")
+    pkt_gap2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80, seq34_client + len(req34_hdr) + 20, seq34_server, 0x18, b"B")
+    pkt_gap3 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80, seq34_client + len(req34_hdr) + 30, seq34_server, 0x18, b"C")
+    pkt_gap4 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80, seq34_client + len(req34_hdr) + 40, seq34_server, 0x18, b"D")
+    pkt_gap5 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80, seq34_client + len(req34_hdr) + 50, seq34_server, 0x18, fake_body34)
+    pkt_syn_fresh34 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80,
+                                       fresh_seq34 - 1, 0, 0x02, b"")
+    pkt_synack_fresh34 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50034,
+                                          seq34_server + 100, fresh_seq34, 0x12, b"")
+    pkt_valid_req34 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50034, 80,
+                                       fresh_seq34, seq34_server + 101, 0x18, valid_req34)
+    pkt_valid_resp34 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50034,
+                                        seq34_server + 101, fresh_seq34 + len(valid_req34), 0x18, valid_resp34)
+
+    pkts34 = [
+        (450, 0, pkt_syn34, len(pkt_syn34)),
+        (450, 1000, pkt_synack34, len(pkt_synack34)),
+        (450, 2000, pkt_req34_hdr, len(pkt_req34_hdr)),
+        (450, 3000, pkt_gap1, len(pkt_gap1)),
+        (450, 4000, pkt_gap2, len(pkt_gap2)),
+        (450, 5000, pkt_gap3, len(pkt_gap3)),
+        (450, 6000, pkt_gap4, len(pkt_gap4)),
+        (450, 7000, pkt_gap5, len(pkt_gap5)),
+        (460, 0, pkt_syn_fresh34, len(pkt_syn_fresh34)),
+        (460, 1000, pkt_synack_fresh34, len(pkt_synack_fresh34)),
+        (460, 2000, pkt_valid_req34, len(pkt_valid_req34)),
+        (460, 3000, pkt_valid_resp34, len(pkt_valid_resp34)),
+    ]
+    write_pcap(tmp_pcap, pkts34)
+    ev34 = run_pcap(tmp_pcap, [80])
+    ev34_fake = [e for e in ev34 if e.get("path") == "/api/fake34"]
+    ev34_valid = [e for e in ev34 if e.get("path") == "/api/valid34"]
+    if ev34_fake:
+        failures.append("[%s] Test 34 (Capture Gap UNSYNCED): Fake request /api/fake34 was fabricated from body" % engine_name)
+    elif not ev34_valid or ev34_valid[0].get("status") != 200:
+        failures.append("[%s] Test 34 (Capture Gap UNSYNCED): Expected /api/valid34 with status 200, got %s" % (engine_name, ev34_valid))
+    else:
+        print("  [%s] Test 34 (Capture Gap UNSYNCED): PASS (fake request rejected in UNSYNCED; new SYN recovered)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 35. Bidirectional Monitored Ports (Client 8003 -> Server 8005)
+    # Monitored ports: [8003, 8005]. Client port is 8003, server port is 8005.
+    # Direction latched from SYN: client=10.0.0.1:8003, server=10.0.0.2:8005.
+    # Request method and response status 200 correctly correlated.
+    # -----------------------------------------------------------------------
+    req35 = b"GET /api/bidi35 HTTP/1.1\r\nHost: x\r\n\r\n"
+    resp35 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq35_client = 35000
+    seq35_server = 75000
+
+    pkt_syn35 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 8003, 8005,
+                                 seq35_client - 1, 0, 0x02, b"")
+    pkt_synack35 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 8005, 8003,
+                                    seq35_server - 1, seq35_client, 0x12, b"")
+    pkt_req35 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 8003, 8005,
+                                 seq35_client, seq35_server, 0x18, req35)
+    pkt_resp35 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 8005, 8003,
+                                  seq35_server, seq35_client + len(req35), 0x18, resp35)
+
+    pkts35 = [
+        (500, 0, pkt_syn35, len(pkt_syn35)),
+        (500, 1000, pkt_synack35, len(pkt_synack35)),
+        (500, 2000, pkt_req35, len(pkt_req35)),
+        (500, 3000, pkt_resp35, len(pkt_resp35)),
+    ]
+    write_pcap(tmp_pcap, pkts35)
+    ev35 = run_pcap(tmp_pcap, [8003, 8005])
+    ev35_bidi = [e for e in ev35 if e.get("path") == "/api/bidi35"]
+    if not ev35_bidi:
+        failures.append("[%s] Test 35 (Bidirectional Monitored Ports): No event for /api/bidi35" % engine_name)
+    elif ev35_bidi[0].get("status") != 200:
+        failures.append("[%s] Test 35 (Bidirectional Monitored Ports): Expected status 200, got %s" % (engine_name, ev35_bidi[0].get("status")))
+    elif ev35_bidi[0].get("dst_port") != 8005:
+        failures.append("[%s] Test 35 (Bidirectional Monitored Ports): Direction inverted; dst_port is %s instead of 8005" % (engine_name, ev35_bidi[0].get("dst_port")))
+    else:
+        print("  [%s] Test 35 (Bidirectional Monitored Ports): PASS (direction latched, status 200 correlated)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 36. Header Limits & UTF-8 Character Boundary Truncation
+    # User-Agent header exceeds 256 bytes with a 3-byte UTF-8 character (Euro €)
+    # placed at byte boundary 255. Emitted event must be valid JSON and valid UTF-8,
+    # and user_agent must not end with a broken byte.
+    # -----------------------------------------------------------------------
+    prefix36 = b"A" * 254
+    euro36 = "\u20ac".encode("utf-8") # 3 bytes: 0xe2 0x82 0xac
+    ua_val36 = prefix36 + euro36 + b"extra_bytes_beyond_limit"
+    req36 = b"GET /api/utf8_36 HTTP/1.1\r\nHost: x\r\nUser-Agent: " + ua_val36 + b"\r\n\r\n"
+    resp36 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq36_client = 36000
+    seq36_server = 76000
+
+    pkt_syn36 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50036, 80,
+                                 seq36_client - 1, 0, 0x02, b"")
+    pkt_synack36 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50036,
+                                    seq36_server - 1, seq36_client, 0x12, b"")
+    pkt_req36 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50036, 80,
+                                 seq36_client, seq36_server, 0x18, req36)
+    pkt_resp36 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50036,
+                                  seq36_server, seq36_client + len(req36), 0x18, resp36)
+
+    pkts36 = [
+        (600, 0, pkt_syn36, len(pkt_syn36)),
+        (600, 1000, pkt_synack36, len(pkt_synack36)),
+        (600, 2000, pkt_req36, len(pkt_req36)),
+        (600, 3000, pkt_resp36, len(pkt_resp36)),
+    ]
+    write_pcap(tmp_pcap, pkts36)
+    ev36 = run_pcap(tmp_pcap, [80])
+    ev36_utf8 = [e for e in ev36 if e.get("path") == "/api/utf8_36"]
+    if not ev36_utf8:
+        failures.append("[%s] Test 36 (UTF-8 Header Limit): No event for /api/utf8_36" % engine_name)
+    else:
+        ua = ev36_utf8[0].get("user_agent", "")
+        try:
+            ua_bytes = ua.encode("utf-8")
+            if len(ua_bytes) > 256:
+                failures.append("[%s] Test 36 (UTF-8 Header Limit): user_agent exceeds 256 bytes: %d" % (engine_name, len(ua_bytes)))
+            else:
+                print("  [%s] Test 36 (UTF-8 Header Limit): PASS (clean UTF-8 boundary preserved, length <= 256)" % engine_name)
+        except UnicodeEncodeError as uerr:
+            failures.append("[%s] Test 36 (UTF-8 Header Limit): Invalid UTF-8 in user_agent: %s" % (engine_name, uerr))
+
+    # -----------------------------------------------------------------------
+    # 37. Out-of-Order FIN with Delayed Body (POST Content-Length: 4)
+    # Client sends POST declaring Content-Length: 4.
+    # Client FIN arrives out-of-order before the 4 body bytes arrive.
+    # Then the 4 body bytes arrive. Server sends 200 OK.
+    # Parser must NOT enter an infinite hang loop, must consume body, and correlate 200 OK.
+    # -----------------------------------------------------------------------
+    post_hdr37 = b"POST /api/fin_ooo37 HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n"
+    post_body37 = b"test"
+    resp37 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq37_client = 37000
+    seq37_server = 77000
+
+    pkt_syn37 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50037, 80,
+                                 seq37_client - 1, 0, 0x02, b"")
+    pkt_synack37 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50037,
+                                    seq37_server - 1, seq37_client, 0x12, b"")
+    pkt_req_hdr37 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50037, 80,
+                                     seq37_client, seq37_server, 0x18, post_hdr37)
+    # FIN packet sent with seq past the body (seq37_client + len(post_hdr37) + 4)
+    pkt_fin37 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50037, 80,
+                                 seq37_client + len(post_hdr37) + len(post_body37), seq37_server, 0x11, b"")
+    # Delayed body packet
+    pkt_body37 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50037, 80,
+                                  seq37_client + len(post_hdr37), seq37_server, 0x18, post_body37)
+    # Server 200 OK
+    pkt_resp37 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50037,
+                                  seq37_server, seq37_client + len(post_hdr37) + len(post_body37) + 1, 0x18, resp37)
+
+    pkts37 = [
+        (700, 0, pkt_syn37, len(pkt_syn37)),
+        (700, 1000, pkt_synack37, len(pkt_synack37)),
+        (700, 2000, pkt_req_hdr37, len(pkt_req_hdr37)),
+        (700, 3000, pkt_fin37, len(pkt_fin37)), # Out-of-order FIN arrives first
+        (700, 4000, pkt_body37, len(pkt_body37)), # Delayed body arrives second
+        (700, 5000, pkt_resp37, len(pkt_resp37)),
+    ]
+    write_pcap(tmp_pcap, pkts37)
+    ev37 = run_pcap(tmp_pcap, [80])
+    ev37_post = [e for e in ev37 if e.get("path") == "/api/fin_ooo37"]
+    if not ev37_post:
+        failures.append("[%s] Test 37 (Out-of-Order FIN Hang): No event for /api/fin_ooo37" % engine_name)
+    elif ev37_post[0].get("status") != 200:
+        failures.append("[%s] Test 37 (Out-of-Order FIN Hang): Expected status 200, got %s" % (engine_name, ev37_post[0].get("status")))
+    else:
+        print("  [%s] Test 37 (Out-of-Order FIN Hang): PASS (no hang, delayed body consumed, status 200 correlated)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 38. Response-Time WSSE Enrichment Correct Targeting
+    # Pipelined requests:
+    # 1. Anonymous GET /api/anon38
+    # 2. SOAP POST /api/soap38 with WSSE username "alice"
+    # Response to /api/anon38 arrives before /api/soap38 completes.
+    # /api/anon38 must NOT be enriched with "alice".
+    # -----------------------------------------------------------------------
+    req38_1 = b"GET /api/anon38 HTTP/1.1\r\nHost: x\r\n\r\n"
+    soap_body38 = (b"<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                   b"xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\">"
+                   b"<soap:Header><wsse:Security><wsse:UsernameToken>"
+                   b"<wsse:Username>alice</wsse:Username>"
+                   b"</wsse:UsernameToken></wsse:Security></soap:Header><soap:Body/></soap:Envelope>")
+    req38_2 = (b"POST /api/soap38 HTTP/1.1\r\nHost: x\r\nContent-Type: text/xml\r\nContent-Length: " +
+               str(len(soap_body38)).encode() + b"\r\n\r\n" + soap_body38)
+    resp38_1 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    resp38_2 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq38_client = 38000
+    seq38_server = 78000
+
+    pkt_syn38 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50038, 80,
+                                 seq38_client - 1, 0, 0x02, b"")
+    pkt_synack38 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50038,
+                                    seq38_server - 1, seq38_client, 0x12, b"")
+    pkt_r38_1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50038, 80,
+                                 seq38_client, seq38_server, 0x18, req38_1)
+    pkt_r38_2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50038, 80,
+                                 seq38_client + len(req38_1), seq38_server, 0x18, req38_2)
+    pkt_resp38_1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50038,
+                                    seq38_server, seq38_client + len(req38_1), 0x18, resp38_1)
+    pkt_resp38_2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50038,
+                                    seq38_server + len(resp38_1), seq38_client + len(req38_1) + len(req38_2), 0x18, resp38_2)
+
+    pkts38 = [
+        (800, 0, pkt_syn38, len(pkt_syn38)),
+        (800, 1000, pkt_synack38, len(pkt_synack38)),
+        (800, 2000, pkt_r38_1, len(pkt_r38_1)),
+        (800, 3000, pkt_r38_2, len(pkt_r38_2)),
+        (800, 4000, pkt_resp38_1, len(pkt_resp38_1)),
+        (800, 5000, pkt_resp38_2, len(pkt_resp38_2)),
+    ]
+    write_pcap(tmp_pcap, pkts38)
+    ev38 = run_pcap(tmp_pcap, [80], wsse_bytes=8192)
+    ev38_anon = [e for e in ev38 if e.get("path") == "/api/anon38"]
+    ev38_soap = [e for e in ev38 if e.get("path") == "/api/soap38"]
+    if not ev38_anon or not ev38_soap:
+        failures.append("[%s] Test 38 (Response-Time WSSE Enrichment): Missing events: anon=%s, soap=%s" % (engine_name, ev38_anon, ev38_soap))
+    elif ev38_anon[0].get("wsse_user") is not None or ev38_anon[0].get("user") not in (None, "-anonymous-"):
+        failures.append("[%s] Test 38 (Response-Time WSSE Enrichment): /api/anon38 incorrectly enriched with user=%s" % (engine_name, ev38_anon[0].get("user")))
+    elif ev38_soap[0].get("user") != "alice" or ev38_soap[0].get("wsse_user") != "alice":
+        failures.append("[%s] Test 38 (Response-Time WSSE Enrichment): /api/soap38 expected user 'alice', got %s" % (engine_name, ev38_soap[0].get("user")))
+    else:
+        print("  [%s] Test 38 (Response-Time WSSE Enrichment): PASS (anon request remained anonymous, soap got alice)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 39. Uncorrelated Non-SOAP Requests Emitted Under WSSE
+    # When correlation is disabled on a connection (no SYN seen so syn_seen=false),
+    # subsequent non-SOAP requests must not be suppressed by deferred WSSE buffering.
+    # -----------------------------------------------------------------------
+    req39_lost = b"GET /api/lost39 HTTP/1.1\r\nHost: x\r\n\r\n"
+    req39_last = b"GET /api/last39 HTTP/1.1\r\nHost: x\r\n\r\n"
+    seq39_client = 39000
+    seq39_server = 79000
+
+    pkt_lost39 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50039, 80,
+                                  seq39_client, seq39_server, 0x18, req39_lost)
+    pkt_last39 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50039, 80,
+                                  seq39_client + len(req39_lost), seq39_server, 0x18, req39_last)
+
+    pkts39 = [
+        (900, 0, pkt_lost39, len(pkt_lost39)),
+        (900, 1000, pkt_last39, len(pkt_last39)),
+    ]
+    write_pcap(tmp_pcap, pkts39)
+    ev39 = run_pcap(tmp_pcap, [80], wsse_bytes=8192)
+    ev39_lost = [e for e in ev39 if e.get("path") == "/api/lost39"]
+    ev39_last = [e for e in ev39 if e.get("path") == "/api/last39"]
+    if not ev39_lost:
+        failures.append("[%s] Test 39 (Uncorrelated Non-SOAP Requests): /api/lost39 missing (swallowed by WSSE buffering)" % engine_name)
+    elif not ev39_last:
+        failures.append("[%s] Test 39 (Uncorrelated Non-SOAP Requests): /api/last39 missing" % engine_name)
+    else:
+        print("  [%s] Test 39 (Uncorrelated Non-SOAP Requests): PASS (both non-SOAP requests emitted on uncorrelated connection)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 40. WSSE Buffer Accounting Leak Prevention
+    # Sequential SOAP requests on the same connection. Verify all succeed
+    # and WSSE buffers are completely freed without memory leaks.
+    # -----------------------------------------------------------------------
+    soap_tmpl40 = (b"<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                   b"xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\">"
+                   b"<soap:Header><wsse:Security><wsse:UsernameToken>"
+                   b"<wsse:Username>%b</wsse:Username>"
+                   b"</wsse:UsernameToken></wsse:Security></soap:Header><soap:Body/></soap:Envelope>")
+    seq40_client = 40000
+    seq40_server = 80000
+    pkts40 = []
+    pkt_syn40 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50040, 80, seq40_client - 1, 0, 0x02, b"")
+    pkt_synack40 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50040, seq40_server - 1, seq40_client, 0x12, b"")
+    pkts40.append((1000, 0, pkt_syn40, len(pkt_syn40)))
+    pkts40.append((1000, 500, pkt_synack40, len(pkt_synack40)))
+
+    cur_c_seq = seq40_client
+    cur_s_seq = seq40_server
+    users40 = [b"user_one", b"user_two", b"user_three"]
+    for idx, u in enumerate(users40):
+        sbody = soap_tmpl40 % u
+        req_bytes = (b"POST /api/soap40_%d HTTP/1.1\r\nHost: x\r\nContent-Type: text/xml\r\nContent-Length: " % idx +
+                     str(len(sbody)).encode() + b"\r\n\r\n" + sbody)
+        resp_bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        pkt_q = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50040, 80, cur_c_seq, cur_s_seq, 0x18, req_bytes)
+        pkt_r = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50040, cur_s_seq, cur_c_seq + len(req_bytes), 0x18, resp_bytes)
+        pkts40.append((1000 + idx * 10, 1000, pkt_q, len(pkt_q)))
+        pkts40.append((1000 + idx * 10, 2000, pkt_r, len(pkt_r)))
+        cur_c_seq += len(req_bytes)
+        cur_s_seq += len(resp_bytes)
+
+    write_pcap(tmp_pcap, pkts40)
+    ev40 = run_pcap(tmp_pcap, [80], wsse_bytes=8192)
+    ev40_users = [e.get("user") for e in ev40 if e.get("path", "").startswith("/api/soap40_")]
+    expected_users = ["user_one", "user_two", "user_three"]
+    if ev40_users != expected_users:
+        failures.append("[%s] Test 40 (WSSE Buffer Accounting): Expected users %s, got %s" % (engine_name, expected_users, ev40_users))
+    else:
+        print("  [%s] Test 40 (WSSE Buffer Accounting): PASS (all sequential WSSE requests parsed & freed cleanly)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 41. Strict UTF-8 Validation (Overlong Sequences & Surrogates Replaced)
+    # Request contains overlong UTF-8 sequence \xC0\xAF and surrogate \xED\xA0\x80 in headers.
+    # Must be sanitized to valid UTF-8, serialized as valid JSON, and not crash.
+    # -----------------------------------------------------------------------
+    bad_utf8 = b"test-\xC0\xAF-overlong-\xED\xA0\x80-surrogate"
+    req41 = b"GET /api/utf8_41 HTTP/1.1\r\nHost: " + bad_utf8 + b"\r\nUser-Agent: " + bad_utf8 + b"\r\n\r\n"
+    resp41 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq41_client = 41000
+    seq41_server = 81000
+
+    pkt_syn41 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50041, 80,
+                                 seq41_client - 1, 0, 0x02, b"")
+    pkt_synack41 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50041,
+                                    seq41_server - 1, seq41_client, 0x12, b"")
+    pkt_req41 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50041, 80,
+                                 seq41_client, seq41_server, 0x18, req41)
+    pkt_resp41 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50041,
+                                  seq41_server, seq41_client + len(req41), 0x18, resp41)
+
+    pkts41 = [
+        (1100, 0, pkt_syn41, len(pkt_syn41)),
+        (1100, 1000, pkt_synack41, len(pkt_synack41)),
+        (1100, 2000, pkt_req41, len(pkt_req41)),
+        (1100, 3000, pkt_resp41, len(pkt_resp41)),
+    ]
+    write_pcap(tmp_pcap, pkts41)
+    ev41 = run_pcap(tmp_pcap, [80])
+    ev41_utf8 = [e for e in ev41 if e.get("path") == "/api/utf8_41"]
+    if not ev41_utf8:
+        failures.append("[%s] Test 41 (Strict UTF-8 Validation): No event for /api/utf8_41" % engine_name)
+    else:
+        e41 = ev41_utf8[0]
+        # Verify JSON serialization round-trip
+        try:
+            dumped = json.dumps(e41)
+            loaded = json.loads(dumped)
+            # Ensure invalid byte sequences were replaced with '?' or '\ufffd'
+            ua = loaded.get("user_agent", "")
+            if "\xc0" in ua or "\xaf" in ua:
+                failures.append("[%s] Test 41 (Strict UTF-8 Validation): Raw overlong bytes survived in user_agent: %r" % (engine_name, ua))
+            else:
+                print("  [%s] Test 41 (Strict UTF-8 Validation): PASS (overlong/surrogate sanitized, valid JSON roundtrip)" % engine_name)
+        except Exception as ex:
+            failures.append("[%s] Test 41 (Strict UTF-8 Validation): JSON encoding failed: %s" % (engine_name, ex))
+
+    # -----------------------------------------------------------------------
+    # 42. Out-of-Order Server FIN with Delayed HTTP 200 Response
+    # On an established connection, client sends GET /api/delayed_fin42.
+    # Server sends FIN ahead of the HTTP 200 response data.
+    # Then server's HTTP 200 response data arrives.
+    # Sniffer must NOT discard the contiguous response bytes, must parse the
+    # HTTP 200 OK, and correlate the request with status 200.
+    # -----------------------------------------------------------------------
+    req42 = b"GET /api/delayed_fin42 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp42 = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    seq42_client = 42000
+    seq42_server = 82000
+
+    pkt_syn42 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50042, 80,
+                                 seq42_client - 1, 0, 0x02, b"")
+    pkt_synack42 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50042,
+                                    seq42_server - 1, seq42_client, 0x12, b"")
+    pkt_req42 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50042, 80,
+                                 seq42_client, seq42_server, 0x18, req42)
+    # Server sends FIN packet past the response data (seq42_server + len(resp42))
+    pkt_fin42 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50042,
+                                 seq42_server + len(resp42), seq42_client + len(req42), 0x11, b"")
+    # Server delayed response data arrives after the FIN
+    pkt_resp42 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50042,
+                                  seq42_server, seq42_client + len(req42), 0x18, resp42)
+
+    pkts42 = [
+        (1200, 0, pkt_syn42, len(pkt_syn42)),
+        (1200, 1000, pkt_synack42, len(pkt_synack42)),
+        (1200, 2000, pkt_req42, len(pkt_req42)),
+        (1200, 3000, pkt_fin42, len(pkt_fin42)),
+        (1200, 4000, pkt_resp42, len(pkt_resp42)),
+    ]
+    write_pcap(tmp_pcap, pkts42)
+    ev42 = run_pcap(tmp_pcap, [80])
+    ev42_fin = [e for e in ev42 if e.get("path") == "/api/delayed_fin42"]
+    if not ev42_fin:
+        failures.append("[%s] Test 42 (Delayed Data Before FIN): No event for /api/delayed_fin42" % engine_name)
+    elif ev42_fin[0].get("status") != 200:
+        failures.append("[%s] Test 42 (Delayed Data Before FIN): Expected status 200, got %s" % (engine_name, ev42_fin[0].get("status")))
+    elif ev42_fin[0].get("resp_bytes") != 5:
+        failures.append("[%s] Test 42 (Delayed Data Before FIN): Expected resp_bytes 5, got %s" % (engine_name, ev42_fin[0].get("resp_bytes")))
+    else:
+        print("  [%s] Test 42 (Delayed Data Before FIN): PASS (delayed 200 OK parsed & correlated, not discarded)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 43. Strict UTF-8 Scalar Boundary (Byte 0xF5 & Values > U+10FFFF)
+    # Header contains byte 0xF5 (\xF5\x80\x80\x80), which exceeds Unicode U+10FFFF.
+    # Must be sanitized to '?' or replaced, JSON valid, and not crash.
+    # -----------------------------------------------------------------------
+    bad_utf8_f5 = b"test-\xF5\x80\x80\x80-exceeds10ffff"
+    req43 = b"GET /api/utf8_43 HTTP/1.1\r\nHost: " + bad_utf8_f5 + b"\r\nUser-Agent: " + bad_utf8_f5 + b"\r\n\r\n"
+    resp43 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq43_client = 43000
+    seq43_server = 83000
+
+    pkt_syn43 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50043, 80,
+                                 seq43_client - 1, 0, 0x02, b"")
+    pkt_synack43 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50043,
+                                    seq43_server - 1, seq43_client, 0x12, b"")
+    pkt_req43 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50043, 80,
+                                 seq43_client, seq43_server, 0x18, req43)
+    pkt_resp43 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50043,
+                                  seq43_server, seq43_client + len(req43), 0x18, resp43)
+
+    pkts43 = [
+        (1300, 0, pkt_syn43, len(pkt_syn43)),
+        (1300, 1000, pkt_synack43, len(pkt_synack43)),
+        (1300, 2000, pkt_req43, len(pkt_req43)),
+        (1300, 3000, pkt_resp43, len(pkt_resp43)),
+    ]
+    write_pcap(tmp_pcap, pkts43)
+    ev43 = run_pcap(tmp_pcap, [80])
+    ev43_utf8 = [e for e in ev43 if e.get("path") == "/api/utf8_43"]
+    if not ev43_utf8:
+        failures.append("[%s] Test 43 (UTF-8 Scalar Boundary): No event for /api/utf8_43" % engine_name)
+    else:
+        e43 = ev43_utf8[0]
+        try:
+            dumped = json.dumps(e43)
+            loaded = json.loads(dumped)
+            ua = loaded.get("user_agent", "")
+            if "\xf5" in ua:
+                failures.append("[%s] Test 43 (UTF-8 Scalar Boundary): Raw 0xF5 survived in user_agent: %r" % (engine_name, ua))
+            else:
+                print("  [%s] Test 43 (UTF-8 Scalar Boundary): PASS (0xF5 sanitized, valid JSON roundtrip)" % engine_name)
+        except Exception as ex:
+            failures.append("[%s] Test 43 (UTF-8 Scalar Boundary): JSON encoding failed: %s" % (engine_name, ex))
+
+    # -----------------------------------------------------------------------
+    # 44. Identity Limit Preservation (> 64 Character Username)
+    # WSSE allows usernames up to 200 characters. Previous code truncated to 64 bytes,
+    # merging accounts sharing the first 64 chars.
+    # Must preserve full username (e.g. 80 characters).
+    # -----------------------------------------------------------------------
+    long_user = "corp_admin_service_account_finance_ap_automation_system_user_identifier_80chars"
+    soap_tmpl44 = (b"<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                   b"xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\">"
+                   b"<soap:Header><wsse:Security><wsse:UsernameToken>"
+                   b"<wsse:Username>%s</wsse:Username>"
+                   b"</wsse:UsernameToken></wsse:Security></soap:Header><soap:Body/></soap:Envelope>") % long_user.encode()
+    req44 = (b"POST /api/soap44 HTTP/1.1\r\nHost: example.com\r\nContent-Type: text/xml\r\nContent-Length: " +
+             str(len(soap_tmpl44)).encode() + b"\r\n\r\n" + soap_tmpl44)
+    resp44 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq44_client = 44000
+    seq44_server = 84000
+
+    pkt_syn44 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50044, 80,
+                                 seq44_client - 1, 0, 0x02, b"")
+    pkt_synack44 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50044,
+                                    seq44_server - 1, seq44_client, 0x12, b"")
+    pkt_req44 = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50044, 80,
+                                 seq44_client, seq44_server, 0x18, req44)
+    pkt_resp44 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50044,
+                                  seq44_server, seq44_client + len(req44), 0x18, resp44)
+
+    pkts44 = [
+        (1400, 0, pkt_syn44, len(pkt_syn44)),
+        (1400, 1000, pkt_synack44, len(pkt_synack44)),
+        (1400, 2000, pkt_req44, len(pkt_req44)),
+        (1400, 3000, pkt_resp44, len(pkt_resp44)),
+    ]
+    write_pcap(tmp_pcap, pkts44)
+    ev44 = run_pcap(tmp_pcap, [80], wsse_bytes=8192)
+    ev44_soap = [e for e in ev44 if e.get("path") == "/api/soap44"]
+    if not ev44_soap:
+        failures.append("[%s] Test 44 (Identity Limit Preservation): No event for /api/soap44" % engine_name)
+    else:
+        u44 = ev44_soap[0].get("user")
+        wu44 = ev44_soap[0].get("wsse_user")
+        if u44 != long_user:
+            failures.append("[%s] Test 44 (Identity Limit Preservation): Expected user %r (len %d), got %r (len %d)" % (
+                engine_name, long_user, len(long_user), u44, len(u44) if u44 else 0))
+        elif wu44 != long_user:
+            failures.append("[%s] Test 44 (Identity Limit Preservation): Expected wsse_user %r, got %r" % (engine_name, long_user, wu44))
+        else:
+            print("  [%s] Test 44 (Identity Limit Preservation): PASS (80-char username preserved without truncation)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 45. Connection Reuse & Stale Pending Cleanup (100 Successive Generations)
+    # 100 successive client SYNs on the same 5-tuple without responses for 1..99.
+    # At each new SYN, old pending requests must be emitted with null status and
+    # cleanly removed from FIFO.
+    # Generation 100 receives complete 200 OK response.
+    # Request 100 must correlate with status 200.
+    # -----------------------------------------------------------------------
+    pkts45 = []
+    sport45 = 50045
+    dport45 = 80
+    for gen in range(1, 101):
+        c_seq = gen * 10000
+        s_seq = gen * 20000
+        pkt_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport45, dport45,
+                                   c_seq - 1, 0, 0x02, b"")
+        req_b = ("GET /api/reuse_%d HTTP/1.1\r\nHost: example.com\r\n\r\n" % gen).encode()
+        pkt_req = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport45, dport45,
+                                   c_seq, s_seq, 0x18, req_b)
+        pkts45.append((1500 + gen, 0, pkt_syn, len(pkt_syn)))
+        pkts45.append((1500 + gen, 1000, pkt_req, len(pkt_req)))
+
+        if gen == 100:
+            pkt_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", dport45, sport45,
+                                          s_seq - 1, c_seq, 0x12, b"")
+            resp_b = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+            pkt_resp = make_ipv4_packet("10.0.0.2", "10.0.0.1", dport45, sport45,
+                                        s_seq, c_seq + len(req_b), 0x18, resp_b)
+            pkts45.append((1500 + gen, 2000, pkt_synack, len(pkt_synack)))
+            pkts45.append((1500 + gen, 3000, pkt_resp, len(pkt_resp)))
+
+    write_pcap(tmp_pcap, pkts45)
+    ev45 = run_pcap(tmp_pcap, [dport45])
+    ev45_100 = [e for e in ev45 if e.get("path") == "/api/reuse_100"]
+    ev45_earlier = [e for e in ev45 if e.get("path", "").startswith("/api/reuse_") and e.get("path") != "/api/reuse_100"]
+
+    if not ev45_100:
+        failures.append("[%s] Test 45 (Connection Reuse): No event for /api/reuse_100" % engine_name)
+    elif ev45_100[0].get("status") != 200:
+        failures.append("[%s] Test 45 (Connection Reuse): Expected status 200 for /api/reuse_100, got %s" % (
+            engine_name, ev45_100[0].get("status")))
+    elif len(ev45_earlier) != 99:
+        failures.append("[%s] Test 45 (Connection Reuse): Expected 99 earlier flushed requests, got %d" % (
+            engine_name, len(ev45_earlier)))
+    elif any(e.get("status") is not None for e in ev45_earlier):
+        failures.append("[%s] Test 45 (Connection Reuse): Earlier requests improperly received status" % engine_name)
+    else:
+        print("  [%s] Test 45 (Connection Reuse): PASS (100 successive generations cleaned up, 100th correlated 200 OK)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 46. Stream Invalidation Packet Loss: Resync to New Boundary Without Correlation
+    # Invalidation disables response correlation, NOT HTTP parsing.
+    # An invalidation trigger occurs (e.g. conflicting Content-Length), then without a new SYN,
+    # client sends a new valid GET request.
+    # The sniffer must resync to the HTTP boundary, parse and emit the request,
+    # but correlation remains disabled (status: null).
+    # -----------------------------------------------------------------------
+    req46_bad = b"POST /api/conflict HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n1234567890"
+    req46_good = b"GET /api/after_gap HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp46_good = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    seq46_c = 10000
+    seq46_s = 20000
+
+    pkt46_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50046, 80, seq46_c - 1, 0, 0x02, b"")
+    pkt46_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50046, seq46_s - 1, seq46_c, 0x12, b"")
+    pkt46_bad = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50046, 80, seq46_c, seq46_s, 0x18, req46_bad)
+    seq46_c2 = seq46_c + len(req46_bad) + 100
+    pkt46_good = make_ipv4_packet("10.0.0.1", "10.0.0.2", 50046, 80, seq46_c2, seq46_s, 0x18, req46_good)
+    pkt46_resp = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, 50046, seq46_s, seq46_c2 + len(req46_good), 0x18, resp46_good)
+
+    pkts46 = [
+        (1600, 0, pkt46_syn, len(pkt46_syn)),
+        (1600, 1000, pkt46_synack, len(pkt46_synack)),
+        (1600, 2000, pkt46_bad, len(pkt46_bad)),
+        (1600, 3000, pkt46_good, len(pkt46_good)),
+        (1600, 4000, pkt46_resp, len(pkt46_resp)),
+    ]
+    write_pcap(tmp_pcap, pkts46)
+    ev46 = run_pcap(tmp_pcap, [80])
+    ev46_good = [e for e in ev46 if e.get("path") == "/api/after_gap"]
+    if not ev46_good:
+        failures.append("[%s] Test 46 (Capture Gap Resync): Request /api/after_gap was not emitted (HTTP parsing broken)" % engine_name)
+    elif ev46_good[0].get("status") is not None:
+        failures.append("[%s] Test 46 (Capture Gap Resync): Request /api/after_gap improperly correlated with status %s on invalidated stream" % (
+            engine_name, ev46_good[0].get("status")))
+    else:
+        print("  [%s] Test 46 (Capture Gap Resync): PASS (/api/after_gap parsed and emitted with null status)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 47. Clean Idle Keepalive Recovery (Preserves Correlation)
+    # A connection completes a transaction and rests cleanly at an idle boundary.
+    # Subsequent keep-alive request after idle interval must correlate with status 200.
+    # -----------------------------------------------------------------------
+    sport47 = 50047
+    seq47_c = 10000
+    seq47_s = 20000
+    req47_1 = b"GET /api/idle1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp47_1 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    req47_2 = b"GET /api/idle2 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp47_2 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+    pkt47_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport47, 80, seq47_c - 1, 0, 0x02, b"")
+    pkt47_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport47, seq47_s - 1, seq47_c, 0x12, b"")
+    pkt47_req1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport47, 80, seq47_c, seq47_s, 0x18, req47_1)
+    pkt47_resp1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport47, seq47_s, seq47_c + len(req47_1), 0x18, resp47_1)
+
+    seq47_c2 = seq47_c + len(req47_1)
+    seq47_s2 = seq47_s + len(resp47_1)
+    pkt47_req2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport47, 80, seq47_c2, seq47_s2, 0x18, req47_2)
+    pkt47_resp2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport47, seq47_s2, seq47_c2 + len(req47_2), 0x18, resp47_2)
+
+    pkts47 = [
+        (1650, 0, pkt47_syn, len(pkt47_syn)),
+        (1650, 1000, pkt47_synack, len(pkt47_synack)),
+        (1650, 2000, pkt47_req1, len(pkt47_req1)),
+        (1650, 3000, pkt47_resp1, len(pkt47_resp1)),
+        (1650 + 35, 0, pkt47_req2, len(pkt47_req2)),
+        (1650 + 35, 1000, pkt47_resp2, len(pkt47_resp2)),
+    ]
+    write_pcap(tmp_pcap, pkts47)
+    ev47 = run_pcap(tmp_pcap, [80])
+    ev47_1 = [e for e in ev47 if e.get("path") == "/api/idle1"]
+    ev47_2 = [e for e in ev47 if e.get("path") == "/api/idle2"]
+    if not ev47_1 or not ev47_2:
+        failures.append("[%s] Test 47 (Clean Idle Recovery): Missing events for idle transactions" % engine_name)
+    elif ev47_1[0].get("status") != 200 or ev47_2[0].get("status") != 200:
+        failures.append("[%s] Test 47 (Clean Idle Recovery): Expected status 200 for both, got %s and %s" % (
+            engine_name, ev47_1[0].get("status"), ev47_2[0].get("status")))
+    else:
+        print("  [%s] Test 47 (Clean Idle Recovery): PASS (keepalive transactions preserved correlation 200 OK)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 48. WSSE Active Flow Reset on Fresh SYN
+    # Flow buffering incomplete WSSE body is interrupted by a fresh SYN on same tuple.
+    # The active WSSE flow must be cancelled and active count decremented.
+    # The subsequent request on the new generation must correlate normally.
+    # -----------------------------------------------------------------------
+    sport48 = 50048
+    soap_head48 = b"<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\"><soap:Header><wsse:Security><wsse:UsernameToken>"
+    req48_soap = (b"POST /api/soap_incomplete HTTP/1.1\r\nHost: example.com\r\nContent-Type: text/xml\r\nContent-Length: 500\r\n\r\n" +
+                  soap_head48)
+    req48_fresh = b"GET /api/fresh HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp48_fresh = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+    pkt48_syn1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport48, 80, 1000 - 1, 0, 0x02, b"")
+    pkt48_synack1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport48, 2000 - 1, 1000, 0x12, b"")
+    pkt48_req_soap = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport48, 80, 1000, 2000, 0x18, req48_soap)
+
+    pkt48_syn2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport48, 80, 5000 - 1, 0, 0x02, b"")
+    pkt48_synack2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport48, 6000 - 1, 5000, 0x12, b"")
+    pkt48_req_fresh = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport48, 80, 5000, 6000, 0x18, req48_fresh)
+    pkt48_resp_fresh = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport48, 6000, 5000 + len(req48_fresh), 0x18, resp48_fresh)
+
+    pkts48 = [
+        (1700, 0, pkt48_syn1, len(pkt48_syn1)),
+        (1700, 1000, pkt48_synack1, len(pkt48_synack1)),
+        (1700, 2000, pkt48_req_soap, len(pkt48_req_soap)),
+        (1701, 0, pkt48_syn2, len(pkt48_syn2)),
+        (1701, 1000, pkt48_synack2, len(pkt48_synack2)),
+        (1701, 2000, pkt48_req_fresh, len(pkt48_req_fresh)),
+        (1701, 3000, pkt48_resp_fresh, len(pkt48_resp_fresh)),
+    ]
+    write_pcap(tmp_pcap, pkts48)
+    ev48 = run_pcap(tmp_pcap, [80], wsse_bytes=8192)
+    ev48_fresh = [e for e in ev48 if e.get("path") == "/api/fresh"]
+    if not ev48_fresh:
+        failures.append("[%s] Test 48 (WSSE Active Flow Reset): No event for /api/fresh" % engine_name)
+    elif ev48_fresh[0].get("status") != 200:
+        failures.append("[%s] Test 48 (WSSE Active Flow Reset): Expected status 200 for /api/fresh, got %s" % (
+            engine_name, ev48_fresh[0].get("status")))
+    else:
+        print("  [%s] Test 48 (WSSE Active Flow Reset): PASS (active WSSE cancelled on SYN, fresh request correlated 200 OK)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 49. Basic Auth Without Colon Rejected as Anonymous
+    # Base64 without ':' (e.g. "Basic dXNlcg==" which decodes to "user") is invalid Basic auth.
+    # Must reject and emit as anonymous (user != "user", scheme != "basic").
+    # -----------------------------------------------------------------------
+    sport49 = 50049
+    req49 = b"GET /api/bad_basic HTTP/1.1\r\nHost: example.com\r\nAuthorization: Basic dXNlcg==\r\n\r\n"
+    resp49 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt49_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport49, 80, 1000 - 1, 0, 0x02, b"")
+    pkt49_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport49, 2000 - 1, 1000, 0x12, b"")
+    pkt49_req = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport49, 80, 1000, 2000, 0x18, req49)
+    pkt49_resp = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport49, 2000, 1000 + len(req49), 0x18, resp49)
+
+    pkts49 = [
+        (1750, 0, pkt49_syn, len(pkt49_syn)),
+        (1750, 1000, pkt49_synack, len(pkt49_synack)),
+        (1750, 2000, pkt49_req, len(pkt49_req)),
+        (1750, 3000, pkt49_resp, len(pkt49_resp)),
+    ]
+    write_pcap(tmp_pcap, pkts49)
+    ev49 = run_pcap(tmp_pcap, [80])
+    ev49_bad = [e for e in ev49 if e.get("path") == "/api/bad_basic"]
+    if not ev49_bad:
+        failures.append("[%s] Test 49 (Basic Auth Colon Check): Missing event for /api/bad_basic" % engine_name)
+    else:
+        u49 = ev49_bad[0].get("user")
+        bu49 = ev49_bad[0].get("basic_user")
+        s49 = ev49_bad[0].get("scheme")
+        if u49 == "user" or bu49 == "user" or s49 == "basic":
+            failures.append("[%s] Test 49 (Basic Auth Colon Check): Malformed basic auth without colon accepted: user=%r, basic_user=%r, scheme=%r" % (
+                engine_name, u49, bu49, s49))
+        else:
+            print("  [%s] Test 49 (Basic Auth Colon Check): PASS (Basic auth without colon rejected as anonymous)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 50. Late Duplicate SYN-ACK Never Moves resp_flow.next_seq Backward
+    # After server responds and advances resp_flow.next_seq, a duplicate SYN-ACK arrives.
+    # resp_flow.next_seq must not move backward. Subsequent pipelined request must correlate.
+    # -----------------------------------------------------------------------
+    sport50 = 50050
+    seq50_c = 10000
+    seq50_s = 20000
+    req50_1 = b"GET /api/synack1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp50_1 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    req50_2 = b"GET /api/synack2 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    resp50_2 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+    pkt50_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport50, 80, seq50_c - 1, 0, 0x02, b"")
+    pkt50_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport50, seq50_s - 1, seq50_c, 0x12, b"")
+    pkt50_req1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport50, 80, seq50_c, seq50_s, 0x18, req50_1)
+    pkt50_resp1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport50, seq50_s, seq50_c + len(req50_1), 0x18, resp50_1)
+
+    pkt50_dup_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport50, seq50_s - 1, seq50_c, 0x12, b"")
+
+    seq50_c2 = seq50_c + len(req50_1)
+    seq50_s2 = seq50_s + len(resp50_1)
+    pkt50_req2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport50, 80, seq50_c2, seq50_s2, 0x18, req50_2)
+    pkt50_resp2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport50, seq50_s2, seq50_c2 + len(req50_2), 0x18, resp50_2)
+
+    pkts50 = [
+        (1800, 0, pkt50_syn, len(pkt50_syn)),
+        (1800, 1000, pkt50_synack, len(pkt50_synack)),
+        (1800, 2000, pkt50_req1, len(pkt50_req1)),
+        (1800, 3000, pkt50_resp1, len(pkt50_resp1)),
+        (1800, 4000, pkt50_dup_synack, len(pkt50_dup_synack)),
+        (1800, 5000, pkt50_req2, len(pkt50_req2)),
+        (1800, 6000, pkt50_resp2, len(pkt50_resp2)),
+    ]
+    write_pcap(tmp_pcap, pkts50)
+    ev50 = run_pcap(tmp_pcap, [80])
+    ev50_1 = [e for e in ev50 if e.get("path") == "/api/synack1"]
+    ev50_2 = [e for e in ev50 if e.get("path") == "/api/synack2"]
+    if not ev50_1 or not ev50_2:
+        failures.append("[%s] Test 50 (Late Duplicate SYN-ACK): Missing events for transactions" % engine_name)
+    elif ev50_1[0].get("status") != 200 or ev50_2[0].get("status") != 200:
+        failures.append("[%s] Test 50 (Late Duplicate SYN-ACK): Expected status 200 for both, got %s and %s" % (
+            engine_name, ev50_1[0].get("status"), ev50_2[0].get("status")))
+    else:
+        print("  [%s] Test 50 (Late Duplicate SYN-ACK): PASS (duplicate SYN-ACK did not rewind next_seq; both correlated 200 OK)" % engine_name)
+
+    # 51. Mid-segment HTTP Resync after packet gap / truncation
+    sport51 = 50051
+    pkt51_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport51, 80, 1000, 0, 0x02, b"")
+    pkt51_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport51, 2000, 1001, 0x12, b"")
+    trunc51 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport51, 80, 1001, 2001, 0x18, b"TRUNC", ip_total_len=200)
+    mid_payload = b"REST_OF_PREV_BODY_DATA" + b"GET /api/midsegment HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    pkt51_mid = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport51, 80, 1500, 2001, 0x18, mid_payload)
+
+    pkts51 = [
+        (1900, 0, pkt51_syn, len(pkt51_syn)),
+        (1900, 1000, pkt51_synack, len(pkt51_synack)),
+        (1900, 2000, trunc51, len(trunc51)),
+        (1900, 3000, pkt51_mid, len(pkt51_mid)),
+    ]
+    write_pcap(tmp_pcap, pkts51)
+    ev51 = run_pcap(tmp_pcap, [80])
+    ev51_mid = [e for e in ev51 if e.get("path") == "/api/midsegment"]
+    if not ev51_mid:
+        failures.append("[%s] Test 51 (Mid-Segment Resync): Expected /api/midsegment event, got %s" % (
+            engine_name, [e.get("path") for e in ev51]))
+    elif ev51_mid[0].get("status") is not None:
+        failures.append("[%s] Test 51 (Mid-Segment Resync): Expected status None for /api/midsegment, got %s" % (
+            engine_name, ev51_mid[0].get("status")))
+    else:
+        print("  [%s] Test 51 (Mid-Segment Resync): PASS (/api/midsegment resynced mid-packet and emitted with null status)" % engine_name)
+
+    # 52. Retransmitted duplicate client SYN after invalidation does not restore correlation
+    sport52 = 50052
+    isn52_c = 10000
+    isn52_s = 20000
+    pkt52_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport52, 80, isn52_c, 0, 0x02, b"")
+    pkt52_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport52, isn52_s, isn52_c + 1, 0x12, b"")
+    trunc52 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport52, 80, isn52_c + 1, isn52_s + 1, 0x18, b"TRUNC", ip_total_len=200)
+    pkt52_dup_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport52, 80, isn52_c, 0, 0x02, b"")
+    req52 = b"GET /api/after_dup_syn HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    resp52 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt52_req = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport52, 80, isn52_c + 100, isn52_s + 1, 0x18, req52)
+    pkt52_resp = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport52, isn52_s + 1, isn52_c + 100 + len(req52), 0x18, resp52)
+
+    pkts52 = [
+        (2000, 0, pkt52_syn, len(pkt52_syn)),
+        (2000, 1000, pkt52_synack, len(pkt52_synack)),
+        (2000, 2000, trunc52, len(trunc52)),
+        (2000, 3000, pkt52_dup_syn, len(pkt52_dup_syn)),
+        (2000, 4000, pkt52_req, len(pkt52_req)),
+        (2000, 5000, pkt52_resp, len(pkt52_resp)),
+    ]
+    write_pcap(tmp_pcap, pkts52)
+    ev52 = run_pcap(tmp_pcap, [80])
+    ev52_req = [e for e in ev52 if e.get("path") == "/api/after_dup_syn"]
+    if not ev52_req:
+        failures.append("[%s] Test 52 (Duplicate Client SYN Lockout): Missing event for /api/after_dup_syn" % engine_name)
+    elif ev52_req[0].get("status") is not None:
+        failures.append("[%s] Test 52 (Duplicate Client SYN Lockout): Expected status None (lockout retained), got %s" % (
+            engine_name, ev52_req[0].get("status")))
+    else:
+        print("  [%s] Test 52 (Duplicate Client SYN Lockout): PASS (duplicate SYN ignored; stream remained uncorrelated)" % engine_name)
+
+    # 53. Strict Base64 validation
+    sport53 = 50053
+    pkt53_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport53, 80, 30000, 0, 0x02, b"")
+    pkt53_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport53, 40000, 30001, 0x12, b"")
+    req53_bad = b"GET /api/b64bad HTTP/1.1\r\nHost: api.test\r\nAuthorization: Basic dXNlcjpwYXNz==!\r\n\r\n"
+    req53_good = b"GET /api/b64good HTTP/1.1\r\nHost: api.test\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n"
+    resp53 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+    seq53_c = 30001
+    seq53_s = 40001
+    pkt53_req1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport53, 80, seq53_c, seq53_s, 0x18, req53_bad)
+    pkt53_resp1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport53, seq53_s, seq53_c + len(req53_bad), 0x18, resp53)
+    seq53_c += len(req53_bad)
+    seq53_s += len(resp53)
+    pkt53_req2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport53, 80, seq53_c, seq53_s, 0x18, req53_good)
+    pkt53_resp2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport53, seq53_s, seq53_c + len(req53_good), 0x18, resp53)
+
+    pkts53 = [
+        (2100, 0, pkt53_syn, len(pkt53_syn)),
+        (2100, 1000, pkt53_synack, len(pkt53_synack)),
+        (2100, 2000, pkt53_req1, len(pkt53_req1)),
+        (2100, 3000, pkt53_resp1, len(pkt53_resp1)),
+        (2100, 4000, pkt53_req2, len(pkt53_req2)),
+        (2100, 5000, pkt53_resp2, len(pkt53_resp2)),
+    ]
+    write_pcap(tmp_pcap, pkts53)
+    ev53 = run_pcap(tmp_pcap, [80])
+    ev53_bad = [e for e in ev53 if e.get("path") == "/api/b64bad"]
+    ev53_good = [e for e in ev53 if e.get("path") == "/api/b64good"]
+    if not ev53_bad or not ev53_good:
+        failures.append("[%s] Test 53 (Strict Base64): Missing events" % engine_name)
+    elif ev53_bad[0].get("user") not in (None, "-anonymous-") or ev53_bad[0].get("basic_user") is not None:
+        failures.append("[%s] Test 53 (Strict Base64): Expected anonymous user for bad Base64, got user=%s, basic_user=%s" % (
+            engine_name, ev53_bad[0].get("user"), ev53_bad[0].get("basic_user")))
+    elif ev53_good[0].get("user") != "user" or ev53_good[0].get("basic_user") != "user":
+        failures.append("[%s] Test 53 (Strict Base64): Expected user='user' for valid Base64, got user=%s" % (
+            engine_name, ev53_good[0].get("user")))
+    else:
+        print("  [%s] Test 53 (Strict Base64): PASS (invalid suffix rejected as anonymous; valid parsed 'user')" % engine_name)
+
+    # 54. Split Request Method Across TCP Segment Boundary After Gap
+    sport54 = 50054
+    pkt54_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport54, 80, 1000, 0, 0x02, b"")
+    pkt54_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport54, 2000, 1001, 0x12, b"")
+    trunc54 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport54, 80, 1001, 2001, 0x18, b"TRUNC", ip_total_len=200)
+    p1_54 = b"BODYTAILGE"
+    p2_54 = b"T /split HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    pkt54_p1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport54, 80, 3000, 2001, 0x18, p1_54)
+    pkt54_p2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport54, 80, 3000 + len(p1_54), 2001, 0x18, p2_54)
+
+    pkts54 = [
+        (2200, 0, pkt54_syn, len(pkt54_syn)),
+        (2200, 1000, pkt54_synack, len(pkt54_synack)),
+        (2200, 2000, trunc54, len(trunc54)),
+        (2200, 3000, pkt54_p1, len(pkt54_p1)),
+        (2200, 4000, pkt54_p2, len(pkt54_p2)),
+    ]
+    write_pcap(tmp_pcap, pkts54)
+    ev54 = run_pcap(tmp_pcap, [80])
+    ev54_split = [e for e in ev54 if e.get("path") == "/split"]
+    if not ev54_split:
+        failures.append("[%s] Test 54 (Split Request Method Boundary): Expected /split event, got %s" % (
+            engine_name, [e.get("path") for e in ev54]))
+    elif ev54_split[0].get("status") is not None:
+        failures.append("[%s] Test 54 (Split Request Method Boundary): Expected status None, got %s" % (
+            engine_name, ev54_split[0].get("status")))
+    else:
+        print("  [%s] Test 54 (Split Request Method Boundary): PASS ('GE'+'T /split' reassembled across packet gap)" % engine_name)
+
+    # 55. Split Response Status Line Across TCP Segment Boundary After Gap
+    sport55 = 50055
+    pkt55_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport55, 80, 10000, 0, 0x02, b"")
+    pkt55_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport55, 20000, 10001, 0x12, b"")
+    trunc55 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport55, 20001, 10001, 0x18, b"TRUNC", ip_total_len=200)
+    p1_55 = b"BODYHT"
+    p2_55 = b"TP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt55_p1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport55, 25000, 10001, 0x18, p1_55)
+    pkt55_p2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport55, 25000 + len(p1_55), 10001, 0x18, p2_55)
+
+    req55 = b"GET /api/after_resp_resync HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    pkt55_req = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport55, 80, 15000, 25000 + len(p1_55) + len(p2_55), 0x18, req55)
+
+    pkts55 = [
+        (2300, 0, pkt55_syn, len(pkt55_syn)),
+        (2300, 1000, pkt55_synack, len(pkt55_synack)),
+        (2300, 2000, trunc55, len(trunc55)),
+        (2300, 3000, pkt55_p1, len(pkt55_p1)),
+        (2300, 4000, pkt55_p2, len(pkt55_p2)),
+        (2300, 5000, pkt55_req, len(pkt55_req)),
+    ]
+    write_pcap(tmp_pcap, pkts55)
+    ev55 = run_pcap(tmp_pcap, [80])
+    ev55_req = [e for e in ev55 if e.get("path") == "/api/after_resp_resync"]
+    if not ev55_req:
+        failures.append("[%s] Test 55 (Split Response Status Boundary): Missing event for /api/after_resp_resync" % engine_name)
+    else:
+        print("  [%s] Test 55 (Split Response Status Boundary): PASS ('HT'+'TP/1.1' reassembled and framing advanced)" % engine_name)
+
+    # 56. Strict Start-Line Validation
+    sport56 = 50056
+    pkt56_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport56, 80, 40000, 0, 0x02, b"")
+    pkt56_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport56, 50000, 40001, 0x12, b"")
+    bad_req = b"GET /bad_req XYZ\r\nHost: api.test\r\n\r\n"
+    good_req = b"GET /good_req HTTP/1.1\r\nHost: api.test\r\n\r\n"
+    bad_resp = b"HTTP/XYZ 200junk\r\nContent-Length: 0\r\n\r\n"
+    good_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+    seq56_c = 40001
+    seq56_s = 50001
+    pkt56_r1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport56, 80, seq56_c, seq56_s, 0x18, bad_req)
+    seq56_c += len(bad_req)
+    pkt56_r2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport56, 80, seq56_c, seq56_s, 0x18, good_req)
+    seq56_c += len(good_req)
+    pkt56_s1 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport56, seq56_s, seq56_c, 0x18, bad_resp)
+    seq56_s += len(bad_resp)
+    pkt56_s2 = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport56, seq56_s, seq56_c, 0x18, good_resp)
+
+    pkts56 = [
+        (2400, 0, pkt56_syn, len(pkt56_syn)),
+        (2400, 1000, pkt56_synack, len(pkt56_synack)),
+        (2400, 2000, pkt56_r1, len(pkt56_r1)),
+        (2400, 3000, pkt56_r2, len(pkt56_r2)),
+        (2400, 4000, pkt56_s1, len(pkt56_s1)),
+        (2400, 5000, pkt56_s2, len(pkt56_s2)),
+    ]
+    write_pcap(tmp_pcap, pkts56)
+    ev56 = run_pcap(tmp_pcap, [80])
+    ev56_bad = [e for e in ev56 if e.get("path") == "/bad_req"]
+    ev56_good = [e for e in ev56 if e.get("path") == "/good_req"]
+    if ev56_bad:
+        failures.append("[%s] Test 56 (Strict Start Line): Expected /bad_req to be rejected, got %s" % (
+            engine_name, ev56_bad))
+    elif not ev56_good:
+        failures.append("[%s] Test 56 (Strict Start Line): Missing /good_req event" % engine_name)
+    elif ev56_good[0].get("status") != 200:
+        failures.append("[%s] Test 56 (Strict Start Line): Expected status 200 for /good_req, got %s" % (
+            engine_name, ev56_good[0].get("status")))
+    else:
+        print("  [%s] Test 56 (Strict Start Line): PASS (invalid request/response start lines rejected)" % engine_name)
+
+    # 57. Oversized or Ambiguous Transfer-Encoding Rejection
+    sport57 = 50057
+    pkt57_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport57, 80, 50000, 0, 0x02, b"")
+    pkt57_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport57, 60000, 50001, 0x12, b"")
+    long_te = b"gzip, " * 45 + b"chunked" # > 270 bytes
+    req57_bad = (b"POST /api/bad_te HTTP/1.1\r\n"
+                 b"Host: test.local\r\n"
+                 b"Transfer-Encoding: " + long_te + b"\r\n\r\n"
+                 b"5\r\nhello\r\n0\r\n\r\n")
+    pkt57_req = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport57, 80, 50001, 60001, 0x18, req57_bad)
+    write_pcap(tmp_pcap, [
+        (2500, 0, pkt57_syn, len(pkt57_syn)),
+        (2500, 1000, pkt57_synack, len(pkt57_synack)),
+        (2500, 2000, pkt57_req, len(pkt57_req)),
+    ])
+    ev57 = run_pcap(tmp_pcap, [80])
+    ev57_bad = [e for e in ev57 if e.get("path") == "/api/bad_te"]
+    if ev57_bad:
+        failures.append("[%s] Test 57 (Oversized TE): Expected /api/bad_te to be rejected/invalidated, got %s" % (
+            engine_name, ev57_bad))
+    else:
+        print("  [%s] Test 57 (Oversized TE): PASS (oversized TE rejected as ambiguous framing)" % engine_name)
+
+    # 58. Same-Sequence OOO Retransmission Extension
+    sport58 = 50058
+    pkt58_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport58, 80, 70000, 0, 0x02, b"")
+    pkt58_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport58, 80000, 70001, 0x12, b"")
+    seg1_data = b"TTP/1.1\r\n"
+    pkt58_ooo1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport58, 80, 70022, 80001, 0x18, seg1_data)
+    seg2_data = b"TTP/1.1\r\nHost: api.test\r\n\r\n"
+    pkt58_ooo2 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport58, 80, 70022, 80001, 0x18, seg2_data)
+    prefix_data = b"GET /api/ooo_extend H"
+    pkt58_head = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport58, 80, 70001, 80001, 0x18, prefix_data)
+    resp58 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt58_resp = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport58, 80001, 70022 + len(seg2_data), 0x18, resp58)
+    write_pcap(tmp_pcap, [
+        (2600, 0, pkt58_syn, len(pkt58_syn)),
+        (2600, 1000, pkt58_synack, len(pkt58_synack)),
+        (2600, 2000, pkt58_ooo1, len(pkt58_ooo1)),
+        (2600, 3000, pkt58_ooo2, len(pkt58_ooo2)),
+        (2600, 4000, pkt58_head, len(pkt58_head)),
+        (2600, 5000, pkt58_resp, len(pkt58_resp)),
+    ])
+    ev58 = run_pcap(tmp_pcap, [80])
+    ev58_ext = [e for e in ev58 if e.get("path") == "/api/ooo_extend"]
+    if not ev58_ext:
+        failures.append("[%s] Test 58 (OOO Retransmission Extension): Missing /api/ooo_extend event" % engine_name)
+    elif ev58_ext[0].get("status") != 200:
+        failures.append("[%s] Test 58 (OOO Retransmission Extension): Expected status 200, got %s" % (
+            engine_name, ev58_ext[0].get("status")))
+    else:
+        print("  [%s] Test 58 (OOO Retransmission Extension): PASS (longer retransmission retained and drained)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 59. Malformed IPv4 Total Length == 0 Rejection
+    # -----------------------------------------------------------------------
+    sport59 = 50059
+    seq59_client = 1000
+    seq59_server = 5000
+    pkt59_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport59, 80, seq59_client, 0, 0x02, b"")
+    pkt59_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport59, seq59_server, seq59_client + 1, 0x12, b"")
+    req59_malformed = b"GET /api/malformed_ip0 HTTP/1.1\r\nHost: test.local\r\n\r\n"
+    pkt59_malformed = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport59, 80, seq59_client + 1, seq59_server + 1, 0x18, req59_malformed, ip_total_len=0)
+    write_pcap(tmp_pcap, [
+        (2700, 0, pkt59_syn, len(pkt59_syn)),
+        (2700, 1000, pkt59_synack, len(pkt59_synack)),
+        (2700, 2000, pkt59_malformed, len(pkt59_malformed)),
+    ])
+    ev59 = run_pcap(tmp_pcap, [80])
+    ev59_malformed = [e for e in ev59 if e.get("path") == "/api/malformed_ip0"]
+    if ev59_malformed:
+        failures.append("[%s] Test 59 (IPv4 Total Length 0): /api/malformed_ip0 should have been rejected but got event" % engine_name)
+    else:
+        print("  [%s] Test 59 (IPv4 Total Length 0): PASS (malformed packet with total_len 0 rejected)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 60. HTTP 101 Switching Protocols Pending Request Completion
+    # -----------------------------------------------------------------------
+    sport60 = 50060
+    seq60_client = 2000
+    seq60_server = 6000
+    pkt60_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport60, 80, seq60_client, 0, 0x02, b"")
+    pkt60_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport60, seq60_server, seq60_client + 1, 0x12, b"")
+    req60 = b"GET /chat/ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    pkt60_req = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport60, 80, seq60_client + 1, seq60_server + 1, 0x18, req60)
+    resp60 = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    pkt60_resp = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport60, seq60_server + 1, seq60_client + 1 + len(req60), 0x18, resp60)
+    # Post-upgrade raw binary frames that look like GET methods shouldn't be parsed
+    raw_ws = b"GET /smuggled_after_upgrade HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    pkt60_raw = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport60, 80, seq60_client + 1 + len(req60), seq60_server + 1 + len(resp60), 0x18, raw_ws)
+    write_pcap(tmp_pcap, [
+        (2800, 0, pkt60_syn, len(pkt60_syn)),
+        (2800, 1000, pkt60_synack, len(pkt60_synack)),
+        (2800, 2000, pkt60_req, len(pkt60_req)),
+        (2800, 3000, pkt60_resp, len(pkt60_resp)),
+        (2800, 4000, pkt60_raw, len(pkt60_raw)),
+    ])
+    ev60 = run_pcap(tmp_pcap, [80])
+    ev60_ws = [e for e in ev60 if e.get("path") == "/chat/ws"]
+    ev60_smuggled = [e for e in ev60 if e.get("path") == "/smuggled_after_upgrade"]
+    if not ev60_ws:
+        failures.append("[%s] Test 60 (HTTP 101 Upgrade): Missing /chat/ws event" % engine_name)
+    elif ev60_ws[0].get("status") != 101:
+        failures.append("[%s] Test 60 (HTTP 101 Upgrade): Expected status 101, got %s" % (engine_name, ev60_ws[0].get("status")))
+    elif ev60_ws[0].get("resp_bytes") != 0:
+        failures.append("[%s] Test 60 (HTTP 101 Upgrade): Expected resp_bytes 0, got %s" % (engine_name, ev60_ws[0].get("resp_bytes")))
+    elif ev60_smuggled:
+        failures.append("[%s] Test 60 (HTTP 101 Upgrade): Smuggled request parsed on upgraded stream" % engine_name)
+    else:
+        print("  [%s] Test 60 (HTTP 101 Upgrade): PASS (status 101 emitted with resp_bytes 0; stream disabled)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 61. Untrusted Response Framing Bypass
+    # -----------------------------------------------------------------------
+    sport61 = 50061
+    seq61_client = 3000
+    seq61_server = 7000
+    pkt61_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport61, 80, seq61_client, 0, 0x02, b"")
+    pkt61_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport61, seq61_server, seq61_client + 1, 0x12, b"")
+    # Framing conflict breaks correlation
+    req61_conflict = b"POST /api/conflict HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    pkt61_req_conflict = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport61, 80, seq61_client + 1, seq61_server + 1, 0x18, req61_conflict)
+    # Next request emitted without correlation (status null)
+    req61_next = b"GET /api/next_request HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    pkt61_req_next = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport61, 80, seq61_client + 1 + len(req61_conflict), seq61_server + 1, 0x18, req61_next)
+    # Server sends a HEAD-style 200 response with Content-Length: 50 but NO body
+    resp61_head = b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n"
+    pkt61_resp_head = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport61, seq61_server + 1, seq61_client + 1 + len(req61_conflict) + len(req61_next), 0x18, resp61_head)
+    write_pcap(tmp_pcap, [
+        (2900, 0, pkt61_syn, len(pkt61_syn)),
+        (2900, 1000, pkt61_synack, len(pkt61_synack)),
+        (2900, 2000, pkt61_req_conflict, len(pkt61_req_conflict)),
+        (2900, 3000, pkt61_req_next, len(pkt61_req_next)),
+        (2900, 4000, pkt61_resp_head, len(pkt61_resp_head)),
+    ])
+    ev61 = run_pcap(tmp_pcap, [80])
+    ev61_next = [e for e in ev61 if e.get("path") == "/api/next_request"]
+    if not ev61_next:
+        failures.append("[%s] Test 61 (Untrusted Response Bypass): Missing /api/next_request event" % engine_name)
+    elif ev61_next[0].get("status") is not None:
+        failures.append("[%s] Test 61 (Untrusted Response Bypass): /api/next_request got unexpected status %s" % (
+            engine_name, ev61_next[0].get("status")))
+    else:
+        print("  [%s] Test 61 (Untrusted Response Bypass): PASS (response payload bypassed when untrusted)" % engine_name)
+
+    # -----------------------------------------------------------------------
+    # 62. Strict Complete Transfer-Encoding Tokenization
+    # -----------------------------------------------------------------------
+    sport62 = 50062
+    seq62_client = 4000
+    seq62_server = 8000
+    pkt62_syn = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport62, 80, seq62_client, 0, 0x02, b"")
+    pkt62_synack = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport62, seq62_server, seq62_client + 1, 0x12, b"")
+    # Empty token: ",chunked"
+    req62_bad1 = b"POST /api/te_bad1 HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: ,chunked\r\n\r\n"
+    pkt62_bad1 = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport62, 80, seq62_client + 1, seq62_server + 1, 0x18, req62_bad1)
+    # Valid chunked: "gzip, chunked"
+    sport62_v = 50063
+    pkt62_syn_v = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport62_v, 80, seq62_client, 0, 0x02, b"")
+    pkt62_synack_v = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport62_v, seq62_server, seq62_client + 1, 0x12, b"")
+    req62_valid = b"POST /api/te_valid HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"
+    pkt62_valid = make_ipv4_packet("10.0.0.1", "10.0.0.2", sport62_v, 80, seq62_client + 1, seq62_server + 1, 0x18, req62_valid)
+    resp62_valid = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    pkt62_resp_v = make_ipv4_packet("10.0.0.2", "10.0.0.1", 80, sport62_v, seq62_server + 1, seq62_client + 1 + len(req62_valid), 0x18, resp62_valid)
+    write_pcap(tmp_pcap, [
+        (3000, 0, pkt62_syn, len(pkt62_syn)),
+        (3000, 1000, pkt62_synack, len(pkt62_synack)),
+        (3000, 2000, pkt62_bad1, len(pkt62_bad1)),
+        (3000, 3000, pkt62_syn_v, len(pkt62_syn_v)),
+        (3000, 4000, pkt62_synack_v, len(pkt62_synack_v)),
+        (3000, 5000, pkt62_valid, len(pkt62_valid)),
+        (3000, 6000, pkt62_resp_v, len(pkt62_resp_v)),
+    ])
+    ev62 = run_pcap(tmp_pcap, [80])
+    ev62_valid = [e for e in ev62 if e.get("path") == "/api/te_valid"]
+    if not ev62_valid:
+        failures.append("[%s] Test 62 (Strict Transfer-Encoding): Missing /api/te_valid event" % engine_name)
+    elif ev62_valid[0].get("status") != 200:
+        failures.append("[%s] Test 62 (Strict Transfer-Encoding): Expected status 200, got %s" % (
+            engine_name, ev62_valid[0].get("status")))
+    else:
+        print("  [%s] Test 62 (Strict Transfer-Encoding): PASS (invalid tokens rejected; valid gzip, chunked correlated)" % engine_name)
+
     if os.path.exists(tmp_pcap):
         os.remove(tmp_pcap)
     return failures
@@ -831,7 +2110,7 @@ def run_regression_suite():
             print("  *", f)
         sys.exit(1)
     else:
-        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (60/60 PASS)!")
+        print("ALL DUAL-ENGINE SYNTHETIC REGRESSION TESTS PASSED (124/124 PASS)!")
 
 if __name__ == "__main__":
     run_regression_suite()

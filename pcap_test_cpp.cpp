@@ -68,8 +68,8 @@ int main(int argc, char **argv) {
                ((linktype << 8) & 0xff0000) | ((linktype << 24) & 0xff000000);
   }
 
-  std::map<FlowKey, Flow> flows;
-  std::map<PacketKey, std::vector<Pending> > pending;
+  std::map<ConnectionKey, Connection> connections;
+  std::list<ConnectionKey> conn_lru;
   std::string node = "cpp-pcap-test";
 
   std::vector<unsigned char> raw_buf;
@@ -104,12 +104,12 @@ int main(int argc, char **argv) {
 
     time_t pcap_now = (time_t)ph.ts_sec;
     long long pcap_mono_now = (long long)ph.ts_sec * 1000LL + (long long)ph.ts_usec / 1000LL;
-    sweep(flows, pending, pcap_now, g_pending_ttl_sec, pcap_mono_now);
-    handle_packet(pkt_ptr, pkt_len, node, ports, flows, pending, pcap_now, pcap_mono_now);
+    sweep(connections, conn_lru, pcap_now, g_pending_ttl_sec, pcap_mono_now);
+    handle_packet(pkt_ptr, pkt_len, node, ports, connections, conn_lru, pcap_now, pcap_mono_now);
   }
 
-  flush_incomplete_wsse(flows, pending);
-  flush_all_pending(pending);
+  flush_incomplete_wsse(connections);
+  flush_all_pending(connections);
   std::cout.flush();
   return 0;
 }

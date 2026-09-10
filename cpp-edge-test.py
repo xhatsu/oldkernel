@@ -54,6 +54,18 @@ assert lockout.returncode == 0, lockout.stderr
 assert 'Lockout registry 10k bounded fixture: PASS' in lockout.stderr
 print('Sniffer bounded lockout registry 10k fixture: PASS')
 
+fifo = subprocess.run([str(out_sniff), '--fifo-fixture'],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+assert fifo.returncode == 0, fifo.stderr
+assert 'FIFO removal fixture: PASS' in fifo.stderr
+print('Sniffer FIFO removal & bounded scaling fixture: PASS')
+
+flow_acc = subprocess.run([str(out_sniff), '--flow-accounting-fixture'],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+assert flow_acc.returncode == 0, flow_acc.stderr
+assert 'Flow accounting fixture: PASS' in flow_acc.stderr
+print('Sniffer flow-accounting bounds & zero leak fixture: PASS')
+
 
 stats = subprocess.run([str(out_sniff), '--stats-fixture'],
                        text=True, capture_output=True)

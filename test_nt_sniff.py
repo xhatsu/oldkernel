@@ -205,10 +205,10 @@ def test_pending_sweep_flushes_all_stale_requests_for_connection():
     key = ("10.0.0.2", 8080, "10.0.0.1", 51000)
     pending = {key: [[{"path": "/one"}, 1.0],
                      [{"path": "/two"}, 2.0],
-                     [{"path": "/fresh"}, 9.0]]}
+                     [{"path": "/fresh"}, 2.0 + nt_sniff.PENDING_TTL]]}
     out = []
 
-    nt_sniff.sweep_pending(pending, 10.0, out)
+    nt_sniff.sweep_pending(pending, 2.0 + nt_sniff.PENDING_TTL + 0.1, out)
 
     assert [event["path"] for event in out] == ["/one", "/two"]
     active = [item for item in pending[key] if not (item[2] if len(item) > 2 else False)]
@@ -413,12 +413,12 @@ def test_client_syn_resets_is_broken():
     bad_req = b"POST /bad HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n12345"
     nt_sniff.handle_payload(flows, key, None, bad_req, meta, {80}, "node", out,
                             pending_tbl=pending, now=10.1, seq=1001, flags=0x18, resp_flows=resp_flows)
-    assert flows[key].is_broken is True
+    assert flows[key].corr_eligible is False
 
     # 2. Client initiates a new connection with fresh SYN
     nt_sniff.handle_payload(flows, key, None, b"", meta, {80}, "node", out,
                             pending_tbl=pending, now=20.0, seq=3000, flags=0x02, resp_flows=resp_flows)
-    assert flows[key].is_broken is False
+    assert flows[key].corr_eligible is True
     assert flows[key].generation == 2
 
     # 3. Valid request and response produce event with status 200
@@ -455,8 +455,9 @@ def test_expired_head_request_preserves_bodyless_response():
     assert len(pending[rk]) == 1
     assert pending[rk][0][0].get("method") == "HEAD"
 
-    # 3. Advance time past pending TTL (e.g. 10s TTL at now=25.0) -> HEAD request expires to tombstone
-    nt_sniff.sweep_pending(pending, 25.0, out, flows=flows, resp_flows=resp_flows)
+    # 3. Advance time past pending TTL -> HEAD request expires to tombstone
+    exp_now = 10.1 + nt_sniff.PENDING_TTL + 1.0
+    nt_sniff.sweep_pending(pending, exp_now, out, flows=flows, resp_flows=resp_flows)
     assert len(out) == 1
     assert out[0].get("path") == "/api/head29"
     assert out[0].get("status") is None
@@ -466,14 +467,14 @@ def test_expired_head_request_preserves_bodyless_response():
     # 4. Client sends GET request on same connection
     get_req = b"GET /api/get29 HTTP/1.1\r\nHost: x\r\n\r\n"
     nt_sniff.handle_payload(flows, key, None, get_req, meta, {80}, "node", out,
-                            pending_tbl=pending, now=25.1, seq=1001 + len(head_req), flags=0x18, resp_flows=resp_flows)
+                            pending_tbl=pending, now=exp_now + 0.1, seq=1001 + len(head_req), flags=0x18, resp_flows=resp_flows)
     assert len(pending[rk]) == 2  # [tombstone, get_req]
 
     # 5. Server sends response to HEAD with Content-Length: 100 (bodyless per RFC)
     # followed by response to GET with 200 OK
     resp_head = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"
     resp_get = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO"
-    nt_sniff.handle_response(resp_flows, rk, resp_head + resp_get, 25.2, out, pending,
+    nt_sniff.handle_response(resp_flows, rk, resp_head + resp_get, exp_now + 0.2, out, pending,
                             seq=5000, flags=0x18, flows=flows)
 
     get_events = [e for e in out if e.get("path") == "/api/get29"]

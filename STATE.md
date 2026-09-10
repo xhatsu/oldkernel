@@ -3,6 +3,406 @@
 
 # STATE.md — Current Project State & Memory
 
+## Production Hardening Round 16 — IPv4 Total Length 0, HTTP 101 Upgrade, Untrusted Response Bypass, Strict TE Tokenization & Strict Port Parsing (Tests 59–62) (2026-09-10)
+
+Implemented 5 production hardening fixes across `nt-sniff-cpp.cpp` and `nt-sniff.py` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **MEDIUM-HIGH — Malformed IPv4 Total Length == 0 Rejection (Test 59)**:
+   - Root Cause: The IPv4 length validation was guarded by `if (ip_total_len > 0)`. When a packet arrived with `ip_total_len == 0`, it bypassed `ip_total_len < ihl + 20` checks entirely, allowing spoofed or malformed L2 frames to be processed as valid TCP HTTP traffic.
+   - Fix: Removed `if (ip_total_len > 0)`. Unconditionally validate `if (ip_total_len < ihl + 20) return false;` in both C++ `handle_packet()` and Python `process_packet()`.
+   - Verification: Test 59 PASS on both C++ and Python engines.
+
+2. **MEDIUM — HTTP 101 Switching Protocols Request Completion (Test 60)**:
+   - Root Cause: When `st == 101` was received, the sniffer transitioned flows to `UNSYNCED` without completing the pending request. The upgrade request remained stranded in `conn.pending` until timeout or reset, where it was emitted with `status: null`.
+   - Fix: Completed the pending upgrade request with `status: 101`, `resp_bytes: 0`, and elapsed duration; decremented global pending count, removed it from FIFO, cleared `conn.pending`, and transitioned flows to `HTTP_STATE_UNSYNCED` with correlation disabled. Subsequent post-upgrade raw frames (e.g. WebSockets) are ignored until a fresh SYN re-establishes an HTTP connection.
+   - Verification: Test 60 PASS on both engines.
+
+3. **MEDIUM — Untrusted Response Correlation Bypass (HEAD Framing Ambiguity Fix, Test 61)**:
+   - Root Cause: When correlation was disabled or untrusted on a connection, `conn.pending` was empty. When a HEAD response arrived (`200 OK` with `Content-Length: N` but bodyless per RFC 2616), the response parser could not know the request was a HEAD request, so it entered `HTTP_STATE_BODY` and waited for N bytes, eating into subsequent responses.
+   - Fix: In both C++ `process_response_payload` and Python `handle_response`, if correlation is untrusted or disabled (`!allowed || rfl.state == HTTP_STATE_UNSYNCED`), response buffers are cleared and payload processing is bypassed entirely. No response payload is buffered or misframed when correlation is disabled, while TCP FIN/RST tracking continues unaffected.
+   - Verification: Test 61 PASS on both engines.
+
+4. **LOW — Strict Complete Transfer-Encoding Tokenization (Test 62)**:
+   - Root Cause: `transfer_encoding_final_chunked` checked only the last token via `rfind(',')`, permitting malformed list syntax such as `,chunked`, `gzip,,chunked`, or duplicate `chunked, chunked`.
+   - Fix: Tokenized all comma-separated values; rejects empty tokens, requires `chunked` exactly once and only as the final token. Symmetrically implemented in C++ and Python.
+   - Verification: Test 62 PASS on both engines.
+
+5. **LOW — Strict `-p` Port Parsing Rejection**:
+   - Root Cause: Specifying an invalid port such as `-p abc` or `-p 80,99999` was silently ignored, falling back to default ports.
+   - Fix: Added `ports_specified` tracking. Invalid port tokens or empty port lists with `-p` immediately print an error and exit with code 2.
+   - Verification: `./nt-sniff-cpp -p abc` exits with code 2.
+
+### Test Results After Round 16 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **124/124 PASS** (Tests 1–62 across both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 10 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, FIFO Removal 20k/Reuse 100/Overflow 4096, Flow Accounting Zero-Leak, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks ✓ |
+| `make clean && make -j2 && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **436,662 bytes** bundle rebuilt & verified (`--check --endpoint http://129.150.59.233:30102` preflight OK) |
+
+## Production Hardening Round 15 — Release-Blocker Flow Accounting, Concurrency TSAN Safety, Strict Transfer-Encoding & OOO Extension (Tests 57–58) (2026-09-10)
+
+Implemented 4 critical production hardening fixes across `nt-sniff-cpp.cpp` and `nt-sniff.py` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **HIGH (Release Blocker) — Zero Flow-Byte Accounting Leak on Response Framing Conflict**:
+   - Root Cause: In `process_response_payload`, when `framing_conflict` occurred, `rfl.buf.clear()` was called immediately before `invalidate_stream(conn, "resp_framing_ambiguous")`. `buf.clear()` erased the buffer without decrementing `g_total_flow_bytes`. When `invalidate_stream()` then called `clear_buffers()`, the buffer was already empty, permanently leaking the un-decremented bytes in global accounting and eventually exhausting the 16 MiB buffer ceiling.
+   - Fix: Removed manual `rfl.buf.clear()`. `invalidate_stream(conn, ...)` invokes `reset_flow_for_resync(conn.resp_flow)`, which calls `rfl.clear_buffers()`, cleanly executing `flow_bytes_sub(buf.size())` and eliminating any accounting leakage. Added built-in regression fixture `--flow-accounting-fixture`.
+   - Verification: Built-in `--flow-accounting-fixture` PASS (`0 bytes leak`), integrated into `cpp-edge-test.py` under ASAN+UBSAN.
+
+2. **MEDIUM — Concurrency TSAN Data Race Elimination in Shipping Statistics**:
+   - Root Cause: `agent_stats_body()` acquired `g_ship_queue_mutex` to compute deltas, unlocked it, and then directly read `g_events_in`, `g_events_pushed`, `g_batches_pushed`, and `g_bytes_pushed` while constructing JSON, followed by a redundant second lock to update `g_prev_*`. ThreadSanitizer confirmed data races with concurrent shipping worker updates.
+   - Fix: Completely snapshotted all shipping totals (`events_in_total`, `events_pushed_total`, `events_dropped_total`, `drop_queue_total`, `drop_hub_total`, `drop_oversized_total`, `batches_pushed_total`, `batches_failed_total`, `bytes_pushed_total`, `stats_drop_total`) under a single mutex critical section. Committed `g_prev_*` from that exact same snapshot, constructed JSON strictly from local snapshots, and removed the second lock. Eliminates all TSAN races and prevents delta discrepancies.
+
+3. **MEDIUM — Bounded & Non-Truncating `Transfer-Encoding` Header Validation (Test 57)**:
+   - Root Cause: `bounded_assign()` truncated `Transfer-Encoding` headers longer than 256 bytes. When a long header (e.g. 269 bytes) ended in `chunked`, truncation sliced off `chunked`, causing the tracer to treat the request as bodyless while the backend server treated it as chunked, corrupting subsequent request framing boundaries.
+   - Fix: Added `has_transfer_encoding` and `invalid_transfer_encoding` flags to `RequestMeta`. Oversized (> 256 bytes) or comma-separated TE lines exceeding 256 bytes are flagged invalid rather than silently truncated. Added `transfer_encoding_final_chunked()` to inspect the last comma-delimited token. Any ambiguous, non-chunked, or conflicting TE immediately triggers `invalidate_stream("request_framing_ambiguous")`. Symmetrically implemented for responses and in Python engine.
+   - Verification: Test 57 PASS on both C++ and Python engines.
+
+4. **MEDIUM/LOW — Same-Sequence OOO Retransmission Extension (`ooo_insert`, Test 58)**:
+   - Root Cause: Out-of-order segment handling deduplicated segments strictly by sequence number. A retransmission carrying an extended range for the same sequence (e.g. seq 200 len 10 followed by retransmission seq 200 len 30) was discarded, causing artificial packet gaps upon reassembly.
+   - Fix: Replaced deduplication loops with `ooo_insert()` across request and response paths in C++ and `_ooo_insert()` in Python. If a segment with the same sequence arrives: verifies common bytes match (invalidating if conflicting/ambiguous); if the new segment is longer, updates the data, adjusts `g_total_flow_bytes` accurately (`flow_bytes_sub(old_len); flow_bytes_add(len)`), and retains the longer segment.
+   - Verification: Test 58 PASS on both engines.
+
+### Test Results After Round 15 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **116/116 PASS** (Tests 1–58 across both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 10 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, FIFO Removal 20k/Reuse 100/Overflow 4096, Flow Accounting Zero-Leak, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks ✓ |
+| `make clean && make -j2 && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **429,457 bytes** bundle rebuilt & verified (`--check --iface lo` preflight OK) |
+
+## Production Hardening Round 14 — Five Production Hardening Fixes & Extended Suite (Tests 54–56) (2026-09-10)
+
+Implemented 5 production hardening fixes and 3 new regression fixtures across `nt-sniff-cpp.cpp`, `nt-ship-cpp.cpp`, `nt-sniff.py`, `Makefile`, and `install-oldkernel.sh` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **HIGH — Resync Across TCP Segment Boundaries (`find_request_resync`, `find_response_resync`, Tests 54 & 55)**:
+   - Root Cause: Resync search only identified complete signatures (`GET `, `POST `, `HTTP/`) within a single payload. If a method or status line was split across packet boundaries (e.g. `BODYTAILGE` in packet 1 and `T /split HTTP/1.1...` in packet 2, or `BODYHT` + `TP/1.1 200 OK`), resync failed and discarded the stream.
+   - Fix: Enhanced `find_request_resync` and `find_response_resync` in C++ and `find_request_resync_py` / `find_response_resync_py` in Python. They search for complete signatures first, then check whether the segment ends with a partial prefix (`prefix = 1..mlen-1`) at offset `plen - n`. When a trailing prefix is detected, sequence tracking latches to that offset, enabling contiguous TCP reassembly and resync with the arriving continuation segment.
+   - Verification: Test 54 (`'GE'+'T /split'`) and Test 55 (`'HT'+'TP/1.1'`) PASS on both C++ and Python engines.
+
+2. **MEDIUM-HIGH — Graceful Shutdown Queue Flushing**:
+   - Root Cause: Retry loops in `ship_worker_thread()` (`nt-sniff-cpp.cpp`) and `nt-ship-cpp.cpp` checked `g_producer_finished` or `g_input_done` and aborted immediately during retries, dropping queued batches during normal supervisor shutdown.
+   - Fix: Removed premature termination on producer finish. Implemented monotonic `shutdown_deadline` checks with dynamic timeout clamping (`unsigned timeout = remaining < post_timeout ? (unsigned)remaining : post_timeout; if (!timeout) timeout = 1;`). Egress queues flush cleanly within the shutdown grace period.
+
+3. **MEDIUM — Strict Start-Line Validation & Framing Conflict Separation (Tests 25 & 56)**:
+   - Root Cause: Loose start-line parsing accepted malformed versions (e.g. `XYZ`, `HTT.1`), and C++ `parse_response()` treated invalid start lines identically to framing conflicts, either invalidating valid connections on non-HTTP body false-positives or allowing smuggled responses to correlate.
+   - Fix:
+     - `parse_request()`: strictly verifies delimiter and requires version to be exactly `HTTP/1.0` or `HTTP/1.1` (8 bytes).
+     - `parse_response()`: strictly requires `HTTP/1.0 ` or `HTTP/1.1 ` followed by exactly 3 ASCII digits (100–599).
+     - Added `bool *framing_conflict` parameter to `parse_response()`: invalid start lines skip past `\r\n\r\n` and continue searching without invalidating connection correlation; conflicting `Content-Length` or `Transfer-Encoding: chunked` clears buffers and triggers `invalidate_stream("resp_framing_ambiguous")`. Symmetrically aligned with Python `parse_response_head`.
+   - Verification: Test 25 (framing conflict invalidation, 0 fake 503) and Test 56 (strict start line rejection) PASS on both engines.
+
+4. **LOW — POLLHUP Ring Safety**:
+   - Added `POLLHUP` to poll event bitmask (`pfd.revents & (POLLERR | POLLHUP | POLLNVAL)`) in `nt-sniff-cpp.cpp`, preventing busy spins if the network interface unbinds or closes unexpectedly.
+
+5. **CentOS 6 Build Detail — Link With `-lrt`**:
+   - Added `-pthread -lrt` in `LDLIBS` placed after source files in `Makefile` (`cpp`, `cpp-ship`, `cpp-debug`, `pcap_test_cpp`) and `install-oldkernel.sh` for legacy glibc 2.12 runtime library compatibility.
+
+### Test Results After Round 14 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **112/112 PASS** (Tests 1–56 across both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 9 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, FIFO Removal 20k/Reuse 100/Overflow 4096, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks ✓ |
+| `make clean && make -j2 && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **423,706 bytes** bundle rebuilt & verified (`--check --iface lo` preflight OK) |
+
+## Production Hardening Round 13 — Five Production Fixes & Extended Suite (Tests 51–53) (2026-09-10)
+
+Implemented 5 production hardening fixes and 3 new regression fixtures across `nt-sniff-cpp.cpp`, `nt-ship-cpp.cpp`, and `nt-sniff.py` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **HIGH — Mid-Segment HTTP Resync (`find_request_resync`, `find_response_resync`, Test 51)**:
+   - Root Cause: Following packet loss or stream invalidation, parsers only resynchronized if an HTTP method or `HTTP/` was at offset 0 of the TCP packet. If the packet began with residual body bytes from a dropped request followed mid-segment by a new request, resync was missed.
+   - Fix: Added `find_request_resync(payload, plen)` (methods `GET `, `POST `, `PUT `, `DELETE `, `PATCH `, `HEAD `, `OPTIONS `) and `find_response_resync(payload, plen)` (`HTTP/`) scanning up to 16 KiB. When found mid-segment (`start != -1`), sequence and payload pointers advance (`fl.next_seq = seq + start; payload += start; plen -= start; seq += start;`), state is reset to `HTTP_STATE_HEADER`, and the request is immediately parsed and emitted with `status: null`. Preserved `fl.ooo` out-of-order queue so out-of-order segments are not dropped during resync. Symmetrically added `find_request_resync_py` and `find_response_resync_py` in `nt-sniff.py`.
+   - Verification: Test 51 PASS on both C++ and Python engines.
+
+2. **MEDIUM-HIGH — Retain Client ISN Across Invalidations (Test 52)**:
+   - Root Cause: `reset_flow_for_resync()` cleared `conn.req_flow.has_seq` and `next_seq`. Retransmitted original SYNs (`seq == client_isn`) were treated as new connection SYNs because `has_seq` was false, which bumped generation and prematurely restored correlation on broken streams.
+   - Fix: Added `bool have_client_isn; uint32_t client_isn;` to `struct Connection` in `nt-sniff-cpp.cpp` and `client_isn` attribute to Python `Flow`. These persist across invalidations. Retransmitted duplicate client SYNs are recognized and ignored without resetting generation or restoring correlation.
+   - Verification: Test 52 PASS on both engines.
+
+3. **MEDIUM — Monotonic & Rollback-Safe Touched Timestamp**:
+   - Root Cause: `conn.touched` relied solely on wall-clock `time(NULL)`. NTP backward clock steps caused unsigned time delta underflow or premature connection expiration.
+   - Fix: Added `long long touched_mono_ms;` to `struct Connection`. Updated with monotonic time (`now_monotonic_ms()`) in `handle_packet()`, on new SYN, and in `touch_connection()`. `sweep()` calculates `idle_ms = now_mono - conn.touched_mono_ms`, completely immune to wall-clock rollbacks.
+
+4. **MEDIUM-LOW — Strict Base64 Full-Token Validation (Test 53)**:
+   - Root Cause: `b64decode_user()` broke on `:` without scanning the rest of the Base64 token, ignoring illegal characters, invalid padding, or trailing data after padding. Python `base64.b64decode()` silently ignored non-base64 characters.
+   - Fix: Updated `b64decode_user()` in C++ and `basic_user()` in Python to scan through the complete Base64 token. Validates that all characters are legal Base64 digits or padding, enforces `(data_chars + pad_count) % 4 == 0`, maximum 2 `=` pads, zero data characters after padding, and rejects usernames >= 256 bytes.
+   - Verification: Test 53 PASS on both engines (malformed trailing suffix rejected as anonymous; valid credentials parsed).
+
+5. **LOW-MEDIUM — Shipping Retry Shutdown Awareness & Timeout Tuning**:
+   - Root Cause: Ingest shipping retry loops did not inspect shutdown flags during 500ms backoff intervals.
+   - Fix: In `ship_worker_thread()` (`nt-sniff-cpp.cpp`) and `nt-ship-cpp.cpp`, added `if (!g_running || g_producer_finished) break;` before and after retry backoff (`usleep(500000)`). Reduced ingest post timeout in `ship_worker_thread()` from 10s to 3s.
+
+### Test Results After Round 13 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **106/106 PASS** (Tests 1–53, both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 9 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, FIFO Removal 20k/Reuse 100/Overflow 4096, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks ✓ |
+| `make clean && make -j2 && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **419,698 bytes** bundle rebuilt & verified (`--check --server http://127.0.0.1:18081` preflight OK) |
+
+## Production Hardening Round 12 — Eight Production Fixes & Extended Suite (Tests 46–50) (2026-09-10)
+
+Implemented 8 production hardening fixes and 5 new regression fixtures across `nt-sniff-cpp.cpp`, `nt-ship-cpp.cpp`, and `nt-sniff.py` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **Stream Invalidation Resync Model (`reset_flow_for_resync`, Test 46)**:
+   - Root Cause: When stream errors or packet loss occurred, `invalidate_stream()` set `fl.state = HTTP_STATE_UNSYNCED` and `is_broken = true`, permanently bricking the directional HTTP parser on that connection until a new client SYN arrived.
+   - Fix: Added `reset_flow_for_resync(Flow &fl)`. Invalidation resets sequence state (`has_seq = false`, `next_seq = 0`, `is_broken = false`, `state = HTTP_STATE_HEADER`), flushes buffers, and keeps correlation disabled (`corr_eligible = false`). Directional parsers seamlessly resynchronize on the next HTTP method/status line boundary, parsing and emitting requests without response correlation (`status: null`), preserving the central safety invariant.
+   - Verification: Test 46 PASS on both C++ and Python engines.
+
+2. **Flow TTL & Clean Idle vs Stale Connection Sweep (Test 47)**:
+   - Root Cause: Fixed 15s `FLOW_TTL` evicted active keep-alive connections prematurely and called `invalidate_stream()`, poisoning future correlation on that 5-tuple.
+   - Fix: Changed TTL to `FLOW_IDLE_TTL = 300` and `FLOW_STALE_TTL = 600`. Added `flow_at_clean_boundary()` and `connection_clean_idle()`. Moved expiration check after pending/tombstone loop in `sweep()`. Cleanly idle connections at clean boundary are quietly erased without disabling correlation. Only connections hung mid-stream or with unresolved pending requests past `stale_ttl` trigger `invalidate_stream("stale_flow_expired")`.
+   - Verification: Test 47 PASS on both C++ and Python engines (keepalive requests across 35s idle interval correlate with status 200).
+
+3. **Centralized WSSE Flow Slot Management (`Flow::wsse_cancel()`, Test 48)**:
+   - Root Cause: Dispersed manual decrements of `g_wsse_body_flows_active` across six disparate branches created potential slot leakage if any cancellation path missed a decrement.
+   - Fix: Moved `g_wsse_body_flows_active` above `struct Flow`, defined `Flow::wsse_cancel()` which atomically guards `awaiting_wsse`, decrements `g_wsse_body_flows_active`, and calls `wsse_clear()`. Replaced all manual decrements with `fl.wsse_cancel()`, and invoked it automatically inside `Flow::clear_buffers()`.
+   - Verification: Test 48 PASS on both engines (fresh SYN cancels active WSSE body buffering, decrements counter, and fresh request correlates with status 200).
+
+4. **Capture Snap Length Elevation**:
+   - Elevated classic-BPF packet capture length to `ACCEPT = 12288` to accommodate jumbo Ethernet frames and LRO/GRO offloaded packets up to 12 KiB without truncation.
+
+5. **Basic Auth Colon Requirement & Padding Validation (Test 49)**:
+   - Root Cause: `b64decode_user()` extracted base64 strings without requiring `:`, and ignored non-padding data following padding `=`.
+   - Fix: Added `saw_colon` requirement: returns empty string if no colon is present in decoded data. Added strict padding check rejecting non-whitespace data following `=`.
+   - Verification: Test 49 PASS on both engines (malformed `Basic dXNlcg==` without colon rejected, emitted as anonymous).
+
+6. **Parse-Time Header Length Bounding (`bounded_assign`)**:
+   - Added `bounded_assign()` helper. Enforces strict parse-time length caps: `Host` (256), `User-Agent` (256), `X-Forwarded-For` (512), `Content-Type` (256), `Transfer-Encoding` (256), preventing oversized headers from allocating unbounded heap memory.
+
+7. **Shipping Queue Deque & Bounded 3x Transient Retry**:
+   - In `nt-sniff-cpp.cpp`: Replaced `std::vector<std::string> g_ship_buf` with `std::deque<std::string>` and `pop_front()`, eliminating $O(N)$ copies on queue operations.
+   - In both `nt-sniff-cpp.cpp` and `nt-ship-cpp.cpp`: Implemented bounded 3x retry with 500ms delay on transient failures (5xx or connection errors; 4xx client errors dropped immediately).
+
+8. **Protocol Polish: Traceparent Hex Flags & Duplicate SYN-ACK Guard (Test 50)**:
+   - In `trace_id_from_parent`: Validates hex characters for W3C flags `x[53]` and `x[54]`.
+   - In SYN-ACK handling: Only sets `resp_flow.has_seq = true; resp_flow.next_seq = seq + 1;` if `!resp_flow.has_seq`, preventing duplicate or late SYN-ACKs from moving `resp_flow.next_seq` backward.
+   - Verification: Test 50 PASS on both engines.
+
+### Test Results After Round 12 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **100/100 PASS** (Tests 1–50, both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 9 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, FIFO Removal 20k/Reuse 100/Overflow 4096, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks ✓ |
+| `make clean && make -j2 && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **413,380 bytes** bundle rebuilt & verified (`--check --endpoint http://129.150.59.233:30102` preflight OK) |
+
+## Production Hardening Round 10 — Six Production Fixes & Extended Suite (Tests 42–45) (2026-09-10)
+
+Implemented fixes for 6 production issues across `nt-sniff-cpp.cpp` and `nt-sniff.py` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **[P1] Completed Requests Leave Growing FIFO Behind (Lines 1753 & 1813)**:
+   - Root Cause: Every queued request added a `g_pending_fifo` entry, but successful responses did not remove it. Retention waited for 2x TTL (60s), causing memory to scale with traffic volume during retention independently of `MAX_PENDING_TOTAL`.
+   - Fix: Added `std::list<PendingQueueRef>::iterator fifo_it;` and `bool in_fifo;` to `struct Pending`.
+   - In `queue_request`: initializes `p.fifo_it = fit; p.in_fifo = true;`.
+   - In `process_response_payload`: calls `remove_pending_from_fifo(front);` upon response correlation completion.
+   - In `invalidate_stream`: calls `remove_pending_from_fifo(conn.pending[i]);` when flushing requests.
+   - In `sweep`: calls `remove_pending_from_fifo(entry);` when requests expire to tombstone or prune.
+   - Verification: Added `--fifo-fixture` simulating 20,000 requests and responses, invalidation, and sweep under AddressSanitizer. Verified `g_pending_fifo.empty() == true` and 0 leaks.
+
+2. **[P1] Global Pending Overflow Double-Erasure & Heap-Use-After-Free (Lines 1744–1749 & 515)**:
+   - Root Cause: `queue_request()` removed the oldest FIFO node with `g_pending_fifo.pop_front()`, then called `invalidate_stream(it->second, "global_pending_overflow")`. The associated `Pending` object in `conn.pending` still held `in_fifo = true` and `fifo_it` pointing to the freed node. When `invalidate_stream()` ran, `remove_pending_from_fifo()` erased that same iterator again, causing heap-use-after-free and double-erasure crashes under memory pressure.
+   - Fix: Single-owner FIFO removal. For live references, `invalidate_stream()` owns the removal via `remove_pending_from_fifo()`. Directly call `g_pending_fifo.pop_front()` only for unowned/orphaned references where no live pending object exists.
+   - Connection State Recheck: After eviction, explicitly recheck whether the connection receiving the new request was itself invalidated (`conn.corr_disabled || !conn.corr_eligible || conn.req_flow.is_broken || conn.resp_flow.is_broken || g_corr_disabled.count(rk) > 0`) before enqueueing.
+   - Verification: Added 4,096-slot global pending overflow test across 128 connections in `--fifo-fixture` under AddressSanitizer. Verified zero heap-use-after-free and clean eviction without double-frees.
+
+3. **[P2] New-SYN Cleanup Leaves Stale FIFO Entries (Lines 2681–2687, Test 45)**:
+   - Root Cause: On arriving client SYN for a new connection generation, existing pending requests were emitted and cleared from `conn.pending` via `conn.pending.clear()`, but `remove_pending_from_fifo()` was omitted. Each successive generation left stale dangling FIFO nodes.
+   - Fix: Loop over all pending entries (including tombstones) and call `remove_pending_from_fifo(conn.pending[pi]);` before clearing the vector.
+   - Verification: Added Test 45 in `test_synthetic_harness.py` simulating 100 successive connection generations on one 5-tuple without responses for 1..99, with generation 100 receiving 200 OK. Verified 99 earlier requests cleanly flushed without status, 100th request correlated with status 200, and exactly 1 FIFO entry remained in `--fifo-fixture`.
+
+4. **[P2] Out-of-Order FIN Discards Valid Delayed Data (Lines 1913 & 2237, Test 42)**:
+   - Root Cause: After reassembly reached the FIN sequence (`fdiff >= 0`), code immediately switched `fl.state = HTTP_STATE_CLOSE_BODY` before running the while loop to parse the newly assembled bytes in `fl.buf`. The next branch discarded those bytes, dropping delayed HTTP 200 responses arriving after an out-of-order server FIN.
+   - Fix: Removed premature transition to `CLOSE_BODY` prior to buffer parsing. The HTTP parser while loops in `process_request_payload` and `process_response_payload` parse contiguous data first. Only after `buf` and `ooo` are completely drained does the flow transition to `CLOSE_BODY`.
+   - Verification: Added Test 42 to `test_synthetic_harness.py`. Server sends FIN before delayed HTTP 200 OK; response parsed and correlated with status 200 and resp_bytes 5.
+
+5. **[P2] UTF-8 Validation Accepts Values Above U+10FFFF (Lines 797 & 1434, Test 43)**:
+   - Root Cause: Leading bytes 0xF5–0xF7 were accepted in 4-byte check (`c >= 0xF0 && c <= 0xF7`). RFC 3629 restricts UTF-8 code points to U+10FFFF (max leading byte 0xF4 with second byte <= 0x8F).
+   - Fix: In `valid_utf8_username` and `sanitize_utf8_truncate`, changed 4-byte check to `c >= 0xF0 && c <= 0xF4`. Explicitly reject `c > 0xF4` and `cp > 0x10FFFFUL`, replacing invalid bytes with `'?'`.
+   - Verification: Added Test 43 to `test_synthetic_harness.py`. Byte sequence `\xF5\x80\x80\x80` sanitized to `'?'`, valid JSON roundtrip, 0 crashes.
+
+6. **[P2] Export Truncation Merges Distinct Identities (Lines 1475–1478, Test 44)**:
+   - Root Cause: `MAX_WSSE_USERNAME = 200`, but `emit_event` truncated `user` and `wsse_user` to 64 bytes (`sanitize_utf8_truncate(e.user, 64)`), truncating and merging accounts sharing that prefix.
+   - Fix: Changed `emit_event` truncation ceiling to `MAX_WSSE_USERNAME * 4` (800 bytes) for `user` and `wsse_user`, and 256 bytes for `basic_user`.
+   - Verification: Added Test 44 to `test_synthetic_harness.py` with an 80-character WSSE username; verified full username emitted without truncation. Verified real PCAP 249 long user `ENC(dBZp1w/CLci3X4HAhy3g2s60kpt4nYoIeIsFNy3sgrGQCCpXapHCJ9T3hPdeG` preserved.
+
+### Test Results After Round 10 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **90/90 PASS** (Tests 1–45, both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 9 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, FIFO Removal 20k/Reuse 100/Overflow 4096, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,041 events (0.52s), zero secret leaks ✓ |
+| `make clean && make all && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **402,150 bytes** bundle rebuilt & verified (`--check --endpoint http://129.150.59.233:30102` preflight OK) |
+
+## Production Hardening Round 9 — Six Production Fixes & Extended Synthetic Suite (Tests 37–41) (2026-09-10)
+
+Implemented fixes for 6 production issues across `nt-sniff-cpp.cpp` and `nt-sniff.py` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **Memory-Pressure Eviction Iterator Protection**:
+   - In `nt-sniff-cpp.cpp`, `Connection` tracks `bool in_lru` (initialized to `false`).
+   - In `touch_connection`: checks `if (conn.in_lru) conn_lru.erase(conn.lru_it); conn.in_lru = false;` and sets `conn.in_lru = true;`.
+   - `evict_connection_if_needed`: takes `const ConnectionKey *protected_key`. Moves the arriving packet's active connection to the back of the LRU queue so it is never pruned mid-packet. Clears `it->second.in_lru = false;` on erasure.
+   - In `handle_packet`: passes `&ckey` as `protected_key`. Rechecks existence via `cit = connections.find(ckey)` after eviction. If newly inserted, fully initializes `conn.key`, `conn_lru.push_back`, `conn.lru_it`, and `conn.in_lru = true;`.
+
+2. **Out-of-Order FIN Hang Prevention (Test 37)**:
+   - Added `fin_seen` and `fin_seq` to `Flow` (both C++ and Python).
+   - In `handle_connection_flags` / `feed_flow`: records `fl.fin_seen = true; fl.fin_seq = seq + plen;`. Only transitions to `HTTP_STATE_CLOSE_BODY` if sequence is drained (`!fl.has_seq || fdiff <= 0`).
+   - In `process_request_payload` / `feed_flow`: added `if (fl.state == HTTP_STATE_CLOSE_BODY) { del fl.buf[:]; break; }` guaranteeing bytes are consumed and the parser loop never hangs.
+   - Symmetrically handled response flows (`rfl.fin_seen`, `rfl.fin_seq`).
+
+3. **Response-Time WSSE Enrichment Correct Targeting (Test 38)**:
+   - In C++, replaced `conn.pending[0].ev.wsse_user = username;` with a targeted loop over `conn.pending`: matches `conn.pending[pi].req_id == conn.req_flow.wsse_req_id && conn.pending[pi].generation == conn.req_flow.generation`. Anonymous pipelined requests in `pending[0]` are never contaminated with subsequent request's WSSE credentials.
+   - Symmetrically brought `nt-sniff.py` into parity in `handle_response`.
+
+4. **Uncorrelated Non-SOAP Requests Emitted Under WSSE (Test 39)**:
+   - In `queue_request()` (C++): only defers to `conn.deferred_wsse_event` if `wsse_eligible == true`. If `conn.has_deferred_wsse` already exists, flushes the previous deferred event before storing the new one. Ineligible requests (like `GET /lost`) emit immediately via `emit_event(e); return 0;`.
+   - In `nt-sniff.py`: `_emit_request_to_pending` emits immediately when correlation is not allowed; deferred WSSE is only active for SOAP-eligible requests.
+
+5. **WSSE Buffer Accounting Leak Prevention (Test 40)**:
+   - Added `Flow::wsse_clear()` in C++ that performs `flow_bytes_sub(wsse_buf.size()); wsse_buf.clear(); wsse_last_parsed_len = 0;`.
+   - Replaced all direct `fl.wsse_buf.clear()` calls with `fl.wsse_clear()`.
+   - Invoked `fl.wsse_clear()` across all extraction exit points (successful parse, goal reached, body exhausted, response enrichment).
+
+6. **Complete Unicode/UTF-8 Validation (Test 41)**:
+   - Rewrote `sanitize_utf8_truncate` with full Unicode decoding validation: rejects 2-byte overlongs (`need == 1 && c < 0xc2`), 3-byte overlongs (`c == 0xe0 && s[i+1] < 0xa0`), UTF-16 surrogates (`c == 0xed && s[i+1] >= 0xa0`), 4-byte overlongs (`c == 0xf0 && s[i+1] < 0x90`), and codepoints > U+10FFFF (`c == 0xf4 && s[i+1] >= 0x90`). Replaces all invalid bytes with `'?'`.
+   - In `emit_event`: passes all exported strings through `sanitize_utf8_truncate` (`host`, `service`, `method`, `path`, `user`, `scheme`, `basic_user`, `wsse_user`, `host_hdr`, `user_agent`, `xff`, `caller`, `dst_ip`, `traceparent`, `trace_id`).
+
+### Test Results After Round 9 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **82/82 PASS** (Tests 1–41, both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 8 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,041 events (0.52s), zero secret leaks ✓ |
+| `make clean && make all && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **391,172 bytes** bundle rebuilt & verified (`--check --endpoint http://129.150.59.233:30102` preflight OK) |
+
+## Production Hardening & Architectural Refinement Round 8 — 15-Point Implementation Checklist (2026-09-10)
+
+Implemented the complete 15-point production hardening checklist across `nt-sniff-cpp.cpp`, `nt-ship-cpp.cpp`, `pcap_test_cpp.cpp`, and `nt-sniff.py` under strict **C++03/GCC 4.4 compatibility**, bounded host memory (256 MiB address space, 4 MiB RX ring), and maintaining all existing JSON fields:
+
+1. **Capture Gaps & Broken Streams (`invalidate_stream`, Test 34)**:
+   - Centralized stream integrity invalidation in `invalidate_stream(conn, reason)`.
+   - Disables correlation in both directions, flushes pending non-tombstone requests once with null response fields, clears reassembly, out-of-order, and WSSE buffers, records invalidation counter, and enters explicit `HTTP_STATE_UNSYNCED`.
+   - Body bytes cannot be misinterpreted as HTTP request methods while unsynced. Only a verified new client SYN re-establishes synchronized HTTP parsing.
+
+2. **Ring Geometry & Frame Bounds**:
+   - Configured `MmapRing` geometry to 16 KiB frames (`frame_size = 16384`, `frame_nr = 256`, `frames_per_block = 4`, `block_size = 65536`, `block_nr = 64`, strict 4 MiB total).
+   - Prevents frame truncation on standard and jumbo frames up to 16 KiB while fitting all kernel ring metadata. Frame truncation immediately routes to `invalidate_stream(conn, "truncated_frame")`.
+
+3. **Bidirectional Monitored Ports (Test 35)**:
+   - Canonicalized `ConnectionKey(ep1, ep2)` with latched endpoint roles (`conn.client` and `conn.server`).
+   - Direction established decisively on first packet (client SYN, server SYN-ACK, or HTTP method prefix) and never re-evaluated per packet, preventing directional inversion when proxy/service ports (e.g. 8003 -> 8005) are both in the monitored list.
+
+4. **Header Limits & Atomic PIPE_BUF Writes (Test 36)**:
+   - Sanitizes and truncates headers to bounded lengths (Host 256B, UA 256B, XFF 512B) using `sanitize_utf8_truncate`, strictly preserving multibyte UTF-8 character boundaries without splitting trailing code points.
+   - Validates W3C `traceparent` format (version, 32-hex trace-id, 16-hex parent-id, 2-hex flags) before extraction.
+   - Formats JSON lines and progressively trims optional fields (`user_agent`, `xff`, `path`) to guarantee each line + `\n` is <= `PIPE_BUF` (4096B) for atomic single `write()` execution on stdout pipes.
+
+5. **Shipping Retries, Pacing & Timeouts**:
+   - `nt-ship-cpp.cpp` generates a stable UUIDv4 batch ID (`X-Batch-Id`) reused across retries.
+   - Implemented 1x transient retry after 500ms delay for 5xx/network errors; 4xx errors drop immediately.
+   - Rate-based timeout calculation: `max(DEFAULT_POST_TIMEOUT_SEC, (int)(batch_bytes * 8 / ship_rate_bps) + 5)`.
+   - Replaced shell `popen()` with direct `pipe()`/`fork()`/`execvp()` execution of `curl`, reading exit code and verifying exact HTTP status lines without shell overhead.
+
+6. **Memory Ceiling & RLIMIT_AS Enforcement**:
+   - Verified that `curl` processes launched by the native shipper operate within the 256 MiB address space limit enforced by `nt-resource-guard.sh` and internal `setrlimit(RLIMIT_AS)`.
+
+7. **Shutdown Busy-Spin Elimination**:
+   - In `nt-ship-cpp.cpp`, replaced `usleep(100000)` polling loop with `pthread_cond_timedwait` on producer condition variable with monotonic 10-second deadline. Discarded records on timeout are accounted in `drop_queue`.
+
+8. **Generation Mismatch & Tombstone Safety**:
+   - In `invalidate_stream` and queue sweeps: `if (!entry.is_tombstone) emit_event(entry.ev);`. Tombstones are never double-emitted.
+   - Differentiates SYN retransmissions (`seq == conn.req_flow.next_seq - 1`) from new connections, preventing spurious generation increments.
+
+9. **WSSE UTF-8 Validation & Text Accumulation**:
+   - `valid_utf8_username` validates UTF-8 multi-byte sequences, checking continuation bytes `(byte & 0xC0) == 0x80` and rejecting overlong encodings, surrogates, and code points > U+10FFFF.
+   - XML parsing accumulates text across comments and CDATA sections (`xml_unescape_append`).
+
+10. **WSSE Parsing Cost & Active Body Counters**:
+    - Limits XML parsing checkpoints to `wsse_goal`, body end, or buffer growth >= 512 bytes.
+    - Accurately increments/decrements `g_wsse_body_flows_active` across all flow termination, expiry, and reset paths.
+    - Early server responses attempt one final parse on accumulated buffer before immediate emission.
+
+11. **Coherent LRU Connection Eviction**:
+    - Connections tracked on `conn_lru` list. Differentiates connection table capacity (`connections.size() >= MAX_FLOWS = 4096`) from aggregate payload byte ceiling (`g_total_flow_bytes >= MAX_TOTAL_FLOW_BYTES = 16 MiB`).
+
+12. **Decoupled Payload & Connection Flags**:
+    - Decoupled payload processing (`process_request_payload`, `process_response_payload`) from connection flag handling (`handle_connection_flags`).
+    - Payload is processed before FIN/RST. FIN operates as directional half-close; RST immediately invalidates and purges the connection.
+
+13. **Empty WSSE on FIN Avoidance**:
+    - Removed obsolete re-queueing of incomplete WSSE events on FIN packets, preventing duplicate or phantom empty WSSE emissions.
+
+14. **Deferred WSSE Identity When Correlation Disabled**:
+    - When correlation is disabled for a connection, valid WSSE authentication events are retained in `conn.deferred_wsse_event` and emitted once with null status/duration rather than discarded.
+
+15. **Defensive Socket & Protocol Cleanup**:
+    - Directly attaches BPF to AF_PACKET socket via `SO_ATTACH_FILTER`.
+    - Creates socket with protocol 0 and binds before attaching filter.
+    - Fixed signed negation overflow in sequence math via `(uint32_t)(-(int64_t)diff)`.
+    - Limited chunk size line parsing to 64 bytes.
+    - Mapped HTTP 101 (Switching Protocols) to `HTTP_STATE_UNSYNCED`.
+
+### Test Results After Round 8 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **72/72 PASS** (Tests 1–36, both C++ and Python engines) |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 8 EDGE TESTS PASS** (Sniffer, WSSE, Dual-Auth, TPACKET_V2, Ceiling, Lockout 10k, Stats, Shipper) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,031 events (0.38s), zero secret leaks ✓ |
+| `make clean && make all && make pcap_test_cpp` | **PASS** (0 warnings under `-Wall -Wextra -std=gnu++03`) |
+| `sh build-firstrun.sh` | **379,577 bytes** bundle rebuilt |
+
+## Capture & Parser Hardening Round 7 — Flow Expiry Invalidation, WSSE Early Response, Ring Geometry & Truncation (2026-09-10)
+
+Three critical production hardening and framing isolation issues resolved across both C++ and Python engines:
+
+1. **Flow Expiry Framing Isolation & Correlation Invalidation (Test 31)**:
+   - When flow state expires after 15 seconds (`FLOW_TTL = 15`), previously pending requests (default `PENDING_TTL = 30`) retained pending state while HTTP parser and TCP sequence state were reset. Resuming response body data could be misinterpreted as a new HTTP response header (e.g. `HTTP/1.1 503...`) and falsely correlated to queued requests.
+   - Fixed by calling `invalidate_connection_correlation` for the canonical response key `rk` in `sweep()` (C++) and `sweep_idle()` (Python) before erasing flow state. All queued pending requests on that connection are immediately flushed without status (`status = None`), and subsequent requests on that flow cannot correlate until a fresh client SYN initializes a new connection.
+
+2. **Immediate Pending Queue Reservation for WSSE Flows (Test 32)**:
+   - Previously, when `--wsse-body-bytes` was enabled, requests were only enqueued to pending after SOAP body collection finished or reached `MAX_WSSE_BODY_BYTES`. An early server response (such as `403 Forbidden` or `500 Internal Server Error`) arriving before the body arrived could not find a pending entry and was discarded.
+   - Fixed by immediately reserving the pending request slot upon header parsing completion (`queue_request` in C++, `_emit_request_to_pending` in Python), tracking `fl.wsse_req_id` and `fl.wsse_rk`. When the SOAP body arrives later, the pending entry is enriched in-place with extracted `wsse_user`. If an early response arrives before the body, it immediately matches the reserved pending request and emits with the correct status.
+
+3. **Packet Ring Sizing & Truncated Frame Invalidation (Test 33)**:
+   - Updated C++ packet capture ring geometry in `MmapRing` to `frame_size = 8192`, `frame_nr = 512`, `frames_per_block = 8`, `block_size = 65536`, `block_nr = 64`, maintaining the strict 4 MiB ring bound while supporting 8 KiB frame captures (`ACCEPT = 8192`).
+   - Added explicit packet truncation detection (`n - off < ip_total_len`). When a truncated packet arrives, `is_truncated = true` increments `g_invalid_frames`, marks the flow broken (`is_broken = true`), invalidates correlation (`invalidate_connection_correlation`), and flushes pending requests with null status rather than attempting partial corrupt reassembly.
+
+### Test Results After Round 7 Fixes
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **26/26 PASS** |
+| `python3 test_synthetic_harness.py` | **66/66 PASS** (Tests 1–33, both engines) |
+| `./nt-sniff-cpp --lockout-fixture` | **PASS** (10k bounded registry + all 4 sequence reproductions) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,204/6,204 events ✓ |
+| `python3 cpp-edge-test.py` (ASAN/UBSAN) | **ALL 8 EDGE TESTS PASS** |
+| `make clean && make all && make fixture` | **PASS** (0 warnings) |
+| `sh build-firstrun.sh` | **367,205 bytes** bundle rebuilt |
+
 ## Security Hardening & Correctness Round 6 — Privilege Drop, RLIMIT_AS Enforcement & IPv4 Fragment Rejection (2026-09-10)
 
 Three critical production hardening and correctness issues resolved across both C++ and Python engines:
@@ -484,3 +884,33 @@ Seven additional reproducible bugs fixed in both `nt-sniff-cpp.cpp` and `nt-snif
       - Average CPU: **14.89%** of 1 core (peak: 14.89%).
       - Resident Memory (RSS): **24.47 MB** peak.
   - Benchmarking tools: `measure_usage.py`, `run_100tps_benchmark.py`.
+
+## Python Engine Performance & Hot-Path Parser Optimization (2026-09-10) — Round 11
+- **Elimination of $O(N)$ Active Flow Scans**:
+  - Replaced per-request linear scans over `flows.values()` with $O(1)$ tracked `g_wsse_active_flows` via `@awaiting_wsse.setter` and `@body_goal.setter` in `Flow`, eliminating >200ms of CPU overhead.
+  - Automatically handles lifecycle cleanups, flow resets, and garbage collection via `__del__`.
+- **Fast-Path XML Early Termination & Checkpoint Parsing**:
+  - Fast substring check `b"UsernameToken" not in body` bypasses Expat XML parser initialization for non-WSSE payloads.
+  - Guarded DTD/entity inspection with `if b"<!" in body:`, preventing full body bytearray copying and lowercasing.
+  - Checkpointed XML parsing in `handle_payload` (evaluating only at goal, body end, or 512B growth).
+  - Immediate parser termination via `_UsernameFound` exception upon closing `<wsse:Username>` tag, avoiding parsing thousands of trailing SOAP body elements.
+  - ASCII fast path in `normalize_wsse_username` bypasses `unicodedata.normalize` and category checks for printable ASCII (32..126).
+- **Zero-Copy Packet Unpacking & Port Filtering**:
+  - Replaced slice-based `struct.unpack` with pre-compiled `struct.Struct.unpack_from` (`_STRUCT_B`, `_STRUCT_H`, `_STRUCT_HH`, `_STRUCT_I`).
+  - Evaluated `sport in ports` and `dport in ports` before IP total length, data offset, sequence number, and IP string conversions.
+  - Cached IP string conversions via `_fast_inet_ntoa` (bounded 4,096-entry cache), eliminating >298,000 `inet_ntoa` conversions on PCAP 249.
+  - Reused `sport_mon` and `dport_mon` booleans in `process_packet` to eliminate redundant hash lookups.
+  - Inlined `1 <= port <= 65535` range check in `handle_payload`, eliminating 161,470 `valid_port()` function calls and try/except blocks.
+- **Header Parsing Streamlining**:
+  - Avoided intermediate `replace(b"\r\n", b"\n")` string copies, splitting directly on `\r\n`.
+  - Filtered header lines by initial character before lowercasing, extracting only the 8 required headers (`content-length`, `transfer-encoding`, `content-type`, `authorization`, `traceparent`, `host`, `user-agent`, `x-forwarded-for`).
+  - Pre-checked HTTP method prefix at index 0 against `METHODS_BYTES` set to avoid calling `find_http_start` on standard requests.
+- **Syscall & Periodic Task Batching**:
+  - Gated `emit_capture_stats()` and remote control polling to run every 256 packets or on `socket.timeout`, removing redundant `time.time()` syscalls from the hot packet ingestion loop.
+  - Replaced `waiting_wsse` loop in `emit_capture_stats()` with direct `g_wsse_active_flows` lookup.
+- **Performance Results**:
+  - PCAP 249 Python offline runtime improved from **1.89s to 1.36s** (throughput increased from **78,978 pkts/s to 109,751 pkts/s**, a **>39% speedup**). Under cProfile, overall CPU time was reduced by >57% (7.52s -> 3.18s).
+  - All **6,077 events**, 21 users, statuses, traceparents, and secret scrubbing preserved with 100% fidelity.
+  - Dual-engine test suite: **90/90 PASS** (`test_synthetic_harness.py`).
+  - Unit tests: **26/26 PASS** (`pytest test_nt_sniff.py`).
+  - Rebuilt self-contained installer bundle: `install-firstrun-el68.sh` (410,235 bytes, preflight check OK).

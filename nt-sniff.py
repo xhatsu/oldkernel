@@ -46,6 +46,33 @@ def b2i(c):
     return ord(c) if PY2 else c
 
 METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
+METHODS_BYTES = set((b"GET", b"POST", b"PUT", b"DELETE", b"PATCH", b"HEAD", b"OPTIONS"))
+
+_STRUCT_B = struct.Struct("!B")
+_STRUCT_H = struct.Struct("!H")
+_STRUCT_HH = struct.Struct("!HH")
+_STRUCT_I = struct.Struct("!I")
+
+_IP_CACHE = {}
+
+
+def _fast_inet_ntoa(raw4):
+    ip = _IP_CACHE.get(raw4)
+    if ip is None:
+        if len(_IP_CACHE) > 4096:
+            _IP_CACHE.clear()
+        ip = socket.inet_ntoa(raw4)
+        _IP_CACHE[raw4] = ip
+    return ip
+
+
+g_wsse_active_flows = 0
+
+
+def reset_wsse_active_flows():
+    global g_wsse_active_flows
+    g_wsse_active_flows = 0
+
 
 MAX_FLOWS = 8192            # concurrent tracked half-flows (per direction)
 MAX_HDRS = 262144           # max bytes buffered waiting for \r\n\r\n
@@ -289,6 +316,7 @@ HTTP_STATE_HEADER = 0
 HTTP_STATE_BODY = 1
 HTTP_STATE_CHUNK = 2
 HTTP_STATE_CLOSE_BODY = 3
+HTTP_STATE_UNSYNCED = 4
 
 MAX_OOO_SEGMENTS = 4
 MAX_OOO_BYTES = 16384
@@ -305,36 +333,76 @@ def seq_diff(a, b):
 def is_method_or_prefix(payload):
     if not payload:
         return False
-    p = bytes(payload[:8])
+    p = payload[:8]
     for m in (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"PATCH ", b"HEAD ", b"OPTIONS "):
-        check_len = min(len(p), len(m))
-        if p[:check_len] == m[:check_len]:
+        if p.startswith(m[:len(p)]):
             return True
     return False
 
 
 def find_http_start(buf):
-    b = bytes(buf)
     best = -1
     for m in (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"PATCH ", b"HEAD ", b"OPTIONS "):
-        pos = b.find(m)
+        pos = buf.find(m)
         if pos != -1 and (best == -1 or pos < best):
             best = pos
     return best
+
+
+_RESYNC_METHODS = (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"PATCH ", b"HEAD ", b"OPTIONS ")
+
+
+def find_request_resync_py(payload):
+    scan_limit = min(len(payload), 16384)
+    sub = bytes(payload[:scan_limit])
+    best = None
+    # First prefer a complete method.
+    for m in _RESYNC_METHODS:
+        pos = sub.find(m)
+        if pos != -1 and (best is None or pos < best):
+            best = pos
+    if best is not None:
+        return best
+    # Then allow a method beginning near the end and continuing into next segment
+    for m in _RESYNC_METHODS:
+        mlen = len(m)
+        for prefix_len in range(1, mlen):
+            if prefix_len > scan_limit:
+                continue
+            off = scan_limit - prefix_len
+            if sub[off:] == m[:prefix_len]:
+                return off
+    return None
+
+
+def find_response_resync_py(payload):
+    scan_limit = min(len(payload), 16384)
+    sub = bytes(payload[:scan_limit])
+    pos = sub.find(b"HTTP/")
+    if pos != -1:
+        return pos
+    for n in range(4, 0, -1):
+        if n <= scan_limit:
+            off = scan_limit - n
+            if sub[off:] == b"HTTP/"[:n]:
+                return off
+    return None
 
 
 class Flow(object):
     __slots__ = ("next_seq", "has_seq", "is_broken", "touched", "first_byte_ts",
                  "buf", "ooo", "state", "body_remaining", "chunk_remaining",
                  "chunk_payload_remaining", "chunk_reading_len", "chunk_reading_crlf",
-                 "chunk_reading_trailer", "awaiting_wsse", "wsse_event", "wsse_buf",
-                 "wsse_goal", "event", "hdrs", "head_bytes", "body_goal", "generation",
-                 "syn_seen", "corr_eligible")
+                 "chunk_reading_trailer", "_awaiting_wsse", "wsse_event", "wsse_buf",
+                 "wsse_goal", "wsse_req_id", "wsse_rk", "event", "hdrs", "head_bytes",
+                 "_body_goal", "generation", "syn_seen", "corr_eligible",
+                 "fin_seen", "fin_seq", "wsse_last_parsed_len", "client_isn")
 
     def __init__(self):
         self.next_seq = 0
         self.has_seq = False
         self.is_broken = False
+        self.client_isn = None
         self.touched = time.time()
         self.first_byte_ts = 0.0
         self.buf = bytearray()
@@ -346,17 +414,64 @@ class Flow(object):
         self.chunk_reading_len = True
         self.chunk_reading_crlf = False
         self.chunk_reading_trailer = False
-        self.awaiting_wsse = False
+        self._awaiting_wsse = False
         self.wsse_event = None
         self.wsse_buf = bytearray()
         self.wsse_goal = 0
+        self.wsse_req_id = 0
+        self.wsse_rk = None
         self.event = None
         self.hdrs = None
         self.head_bytes = 0
-        self.body_goal = 0
+        self._body_goal = 0
         self.generation = 0
         self.syn_seen = False
         self.corr_eligible = True
+        self.fin_seen = False
+        self.fin_seq = 0
+        self.wsse_last_parsed_len = 0
+
+    @property
+    def awaiting_wsse(self):
+        return self._awaiting_wsse
+
+    @awaiting_wsse.setter
+    def awaiting_wsse(self, val):
+        global g_wsse_active_flows
+        v = bool(val)
+        if self._awaiting_wsse != v:
+            old_active = self._awaiting_wsse or (self._body_goal > 0)
+            self._awaiting_wsse = v
+            new_active = self._awaiting_wsse or (self._body_goal > 0)
+            if old_active != new_active:
+                if new_active:
+                    g_wsse_active_flows += 1
+                elif g_wsse_active_flows > 0:
+                    g_wsse_active_flows -= 1
+
+    @property
+    def body_goal(self):
+        return self._body_goal
+
+    @body_goal.setter
+    def body_goal(self, val):
+        global g_wsse_active_flows
+        v = int(val) if val else 0
+        if self._body_goal != v:
+            old_active = self._awaiting_wsse or (self._body_goal > 0)
+            self._body_goal = v
+            new_active = self._awaiting_wsse or (self._body_goal > 0)
+            if old_active != new_active:
+                if new_active:
+                    g_wsse_active_flows += 1
+                elif g_wsse_active_flows > 0:
+                    g_wsse_active_flows -= 1
+
+    def __del__(self):
+        global g_wsse_active_flows
+        if getattr(self, "_awaiting_wsse", False) or getattr(self, "_body_goal", 0) > 0:
+            if g_wsse_active_flows > 0:
+                g_wsse_active_flows -= 1
 
     def reset_for_new_connection(self, next_gen, now=None, syn_seen=True, corr_eligible=True):
         self.next_seq = 0
@@ -377,6 +492,8 @@ class Flow(object):
         self.wsse_event = None
         self.wsse_buf = bytearray()
         self.wsse_goal = 0
+        self.wsse_req_id = 0
+        self.wsse_rk = None
         self.event = None
         self.hdrs = None
         self.head_bytes = 0
@@ -384,6 +501,30 @@ class Flow(object):
         self.generation = next_gen
         self.syn_seen = syn_seen
         self.corr_eligible = corr_eligible
+        self.fin_seen = False
+        self.fin_seq = 0
+        self.wsse_last_parsed_len = 0
+
+
+def _ooo_insert(fl, seq, payload, is_truncated=False):
+    if is_truncated:
+        return True
+    b_pay = bytes(payload)
+    plen = len(b_pay)
+    for i, (s, d) in enumerate(fl.ooo):
+        if s == seq:
+            old_len = len(d)
+            common = min(old_len, plen)
+            if common and d[:common] != b_pay[:common]:
+                return False
+            if old_len >= plen:
+                return True
+            fl.ooo[i] = (seq, b_pay)
+            return True
+    if len(fl.ooo) >= MAX_OOO_SEGMENTS:
+        return False
+    fl.ooo.append((seq, b_pay))
+    return True
 
 
 def _drain_ooo(fl):
@@ -412,8 +553,11 @@ def seq_in_window(seq, base, window):
     return 0 <= seq_diff(seq, base) < window
 
 
-# ------------------------------------------------- response correlation ----
-PENDING_TTL = 5.0        # flush unmatched requests after this many seconds
+DEFAULT_PENDING_TTL = 30.0
+try:
+    PENDING_TTL = float(os.getenv("NT_PENDING_TTL_SEC", "30.0"))
+except (ValueError, TypeError):
+    PENDING_TTL = DEFAULT_PENDING_TTL
 PENDING_MAX = 8192       # hard cap; overflow flushes oldest first
 PENDING_PER_FLOW = 32    # bound a single pipelined/hostile keep-alive flow
 SWEEP_INTERVAL = 1.0     # honor PENDING_TTL even when the socket goes idle
@@ -467,11 +611,21 @@ def invalidate_connection_correlation(flows, resp_flows, rk):
         rfl = resp_flows.get(rk)
         if rfl is not None:
             rfl.corr_eligible = False
+            rfl.is_broken = False
+            rfl.has_seq = False
+            del rfl.buf[:]
+            del rfl.ooo[:]
+            rfl.state = HTTP_STATE_HEADER
     if flows is not None:
         cfk = (rk[2], rk[3], rk[0], rk[1])
         cfl = flows.get(cfk)
         if cfl is not None:
             cfl.corr_eligible = False
+            cfl.is_broken = False
+            cfl.has_seq = False
+            del cfl.buf[:]
+            del cfl.ooo[:]
+            cfl.state = HTTP_STATE_HEADER
 
 
 def is_correlation_allowed(rk, flows=None, resp_flows=None, gen=0, syn_seen=False, corr_eligible=True):
@@ -521,6 +675,22 @@ def pending_pop(rk, out, pending_tbl=None):
     return None
 
 
+def transfer_encoding_final_chunked(raw):
+    if not raw:
+        return False
+    if isinstance(raw, bytes):
+        raw = raw.decode("latin1", "replace")
+    s = raw.strip().lower()
+    if not s:
+        return False
+    tokens = [p.strip() for p in s.split(",")]
+    if any(not tok for tok in tokens) or tokens[-1] != "chunked":
+        return False
+    if any(tok == "chunked" for tok in tokens[:-1]):
+        return False
+    return True
+
+
 def parse_response_head(payload):
     """First line 'HTTP/1.x NNN ...' -> (status_int|None, content_len|None, head_end_idx|None, is_chunked, is_close)."""
     try:
@@ -529,9 +699,11 @@ def parse_response_head(payload):
         if idx < 0:
             return None, None, None, False, False
         head = raw[:idx]
-        lines = head.replace(b"\r\n", b"\n").split(b"\n")
+        lines = head.split(b"\r\n") if b"\r\n" in head else head.split(b"\n")
         first = lines[0].split()
-        if len(first) < 2 or not first[0].startswith(b"HTTP/"):
+        if len(first) < 2 or first[0] not in (b"HTTP/1.0", b"HTTP/1.1"):
+            return None, None, idx + 4, False, False
+        if len(first[1]) != 3 or not first[1].isdigit():
             return None, None, idx + 4, False, False
         st = int(first[1])
         if st < 100 or st > 599:
@@ -546,7 +718,15 @@ def parse_response_head(payload):
     is_http_10 = first[0].startswith(b"HTTP/1.0")
     conn_close = False
     conn_keep_alive = False
+    has_te = False
+    invalid_te = False
+    resp_te = b""
     for ln in lines[1:]:
+        if not ln:
+            continue
+        c0 = ln[:1]
+        if c0 not in (b"c", b"C", b"t", b"T"):
+            continue
         low = ln.lower()
         if low.startswith(b"content-length:"):
             try:
@@ -560,14 +740,27 @@ def parse_response_head(payload):
             except ValueError:
                 has_conflict_cl = True
         elif low.startswith(b"transfer-encoding:"):
-            if b"chunked" in low:
-                is_chunked = True
+            has_te = True
+            v = ln.split(b":", 1)[1].strip()
+            if len(v) > 256:
+                invalid_te = True
+            else:
+                if resp_te:
+                    resp_te += b","
+                if len(resp_te) + len(v) > 256:
+                    invalid_te = True
+                else:
+                    resp_te += v
         elif low.startswith(b"connection:"):
             if b"close" in low:
                 conn_close = True
             elif b"keep-alive" in low:
                 conn_keep_alive = True
-    if has_conflict_cl or (has_clen and is_chunked):
+    if has_te:
+        if invalid_te or not transfer_encoding_final_chunked(resp_te):
+            return None, None, None, False, False
+        is_chunked = True
+    if has_conflict_cl or (has_clen and (has_te or is_chunked)):
         return None, None, None, False, False
     if is_http_10 and not conn_keep_alive:
         is_close = True
@@ -580,6 +773,8 @@ def parse_response_head(payload):
 def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, flags=0, is_truncated=False, flows=None):
     if flags & 0x02 and seq is not None:
         rfl = resp_flows.get(rk)
+        if rfl is not None and getattr(rfl, "has_seq", False):
+            return
         gen = rfl.generation if rfl is not None else 0
         syn = rfl.syn_seen if rfl is not None else False
         eligible = rfl.corr_eligible if rfl is not None else True
@@ -605,29 +800,64 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
     rfl.touched = now
 
     plen = len(payload) if payload else 0
+
+    allowed = is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                     gen=rfl.generation, syn_seen=rfl.syn_seen,
+                                     corr_eligible=getattr(rfl, "corr_eligible", True))
+    if not allowed or getattr(rfl, "state", None) == HTTP_STATE_UNSYNCED:
+        del rfl.buf[:]
+        del rfl.ooo[:]
+        if flags & 0x04:
+            resp_flows.pop(rk, None)
+            pending_pop(rk, out, pending_tbl)
+        elif flags & 0x01:
+            if seq is not None:
+                rfl.fin_seen = True
+                rfl.fin_seq = (seq + plen) & 0xFFFFFFFF
+            if not rfl.has_seq or seq_diff(rfl.fin_seq, rfl.next_seq) <= 0:
+                if getattr(rfl, "state", None) in (HTTP_STATE_HEADER, HTTP_STATE_CLOSE_BODY, HTTP_STATE_UNSYNCED) and not rfl.buf and not rfl.ooo:
+                    resp_flows.pop(rk, None)
+                    pending_pop(rk, out, pending_tbl)
+        return
     if plen > 0:
+        if is_truncated:
+            rfl.is_broken = True
+            invalidate_connection_correlation(flows, resp_flows, rk)
+            if pending_tbl and rk in pending_tbl:
+                if out is not None:
+                    for item in pending_tbl[rk]:
+                        if not item[2]:
+                            out.append(item[0])
+                del pending_tbl[rk]
+            return
+
         if seq is None:
             rfl.buf.extend(payload)
         else:
             if not rfl.has_seq:
-                if (plen >= 5 and payload[:5] == b"HTTP/") or (plen < 5 and b"HTTP/".startswith(payload)):
+                start = find_response_resync_py(payload)
+                if start is not None:
+                    rfl.has_seq = True
+                    rfl.next_seq = (seq + start) & 0xFFFFFFFF
+                    rfl.is_broken = False
+                    rfl.state = HTTP_STATE_HEADER
+                    payload = payload[start:]
+                    plen -= start
+                    seq = (seq + start) & 0xFFFFFFFF
+                elif (plen >= 5 and payload[:5] == b"HTTP/") or (plen < 5 and b"HTTP/".startswith(payload)):
                     rfl.has_seq = True
                     rfl.next_seq = seq
                     rfl.is_broken = False
                 else:
-                    if len(rfl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
-                        if not any(s == seq for s, _ in rfl.ooo):
-                            rfl.ooo.append((seq, bytes(payload)))
+                    if not _ooo_insert(rfl, seq, payload, is_truncated):
+                        rfl.is_broken = True
                     return
 
             diff = seq_diff(seq, rfl.next_seq)
             if diff == 0:
-                if is_truncated:
-                    rfl.is_broken = True
-                else:
-                    rfl.buf.extend(payload)
-                    rfl.next_seq = (rfl.next_seq + plen) & 0xFFFFFFFF
-                    _drain_ooo(rfl)
+                rfl.buf.extend(payload)
+                rfl.next_seq = (rfl.next_seq + plen) & 0xFFFFFFFF
+                _drain_ooo(rfl)
             elif diff < 0:
                 overlap = -diff
                 if overlap < plen and not is_truncated:
@@ -635,13 +865,16 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                     rfl.next_seq = (rfl.next_seq + plen - overlap) & 0xFFFFFFFF
                     _drain_ooo(rfl)
             else:
-                if len(rfl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
-                    if not any(s == seq for s, _ in rfl.ooo):
-                        rfl.ooo.append((seq, bytes(payload)))
-                else:
+                if not _ooo_insert(rfl, seq, payload, is_truncated):
                     rfl.is_broken = True
 
     # Parse complete responses from reassembled buffer using HTTP framing
+    if rfl.fin_seen and rfl.has_seq:
+        fdiff = seq_diff(rfl.fin_seq, rfl.next_seq)
+        if fdiff <= 0:
+            if rfl.state == HTTP_STATE_HEADER and not rfl.buf and not rfl.ooo:
+                rfl.state = HTTP_STATE_CLOSE_BODY
+
     while rfl.buf and not rfl.is_broken:
         if rfl.state == HTTP_STATE_HEADER:
             st, clen, head_len, is_chunked, is_close = parse_response_head(rfl.buf)
@@ -662,6 +895,53 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                                              gen=rfl.generation, syn_seen=rfl.syn_seen,
                                              corr_eligible=rfl.corr_eligible)
             ent = pending_tbl.get(rk) if allowed else None
+
+            if st == 101:
+                del rfl.buf[:head_len]
+                if ent:
+                    item = ent[0]
+                    is_tombstone = item[2] if len(item) > 2 else False
+                    if not is_tombstone:
+                        ev = item[0]
+                        started = item[1]
+                        ev["status"] = 101
+                        ev["duration_ms"] = max(0, int((now - started) * 1000))
+                        ev["resp_bytes"] = 0
+                        out.append(ev)
+                    ent.pop(0)
+                    while ent:
+                        rem_item = ent.pop(0)
+                        if not (rem_item[2] if len(rem_item) > 2 else False):
+                            out.append(rem_item[0])
+                    pending_tbl.pop(rk, None)
+                corr_disabled_insert(rk)
+                rfl.corr_eligible = False
+                rfl.state = HTTP_STATE_UNSYNCED
+                rfl.is_broken = True
+                if flows is not None:
+                    cfk = (rk[2], rk[3], rk[0], rk[1])
+                    cfl = flows.get(cfk)
+                    if cfl is not None:
+                        cfl.corr_eligible = False
+                        cfl.state = HTTP_STATE_UNSYNCED
+                        cfl.is_broken = True
+                break
+
+            if flows is not None:
+                cfk = (rk[2], rk[3], rk[0], rk[1])
+                cfl = flows.get(cfk)
+                if cfl is not None and cfl.awaiting_wsse and cfl.wsse_buf:
+                    username = extract_wsse_username(cfl.wsse_buf)
+                    if username and ent:
+                        for pitem in ent:
+                            if len(pitem) > 5 and pitem[5] == cfl.wsse_req_id:
+                                pitem[0]["wsse_user"] = username
+                                pitem[0]["user"] = username
+                                pitem[0]["scheme"] = "wsse"
+                                break
+                    cfl.awaiting_wsse = False
+                    cfl.wsse_buf = bytearray()
+
             is_head = False
 
             if ent:
@@ -793,9 +1073,23 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             del rfl.buf[:]
             break
 
-    if flags & 0x05:
+    if rfl.fin_seen and rfl.has_seq:
+        fdiff = seq_diff(rfl.fin_seq, rfl.next_seq)
+        if fdiff <= 0:
+            if rfl.state == HTTP_STATE_HEADER and not rfl.buf and not rfl.ooo:
+                rfl.state = HTTP_STATE_CLOSE_BODY
+
+    if flags & 0x04:
         resp_flows.pop(rk, None)
         pending_pop(rk, out, pending_tbl)
+    elif flags & 0x01:
+        if seq is not None:
+            rfl.fin_seen = True
+            rfl.fin_seq = (seq + plen) & 0xFFFFFFFF
+        if not rfl.has_seq or seq_diff(rfl.fin_seq, rfl.next_seq) <= 0:
+            if rfl.state in (HTTP_STATE_HEADER, HTTP_STATE_CLOSE_BODY) and not rfl.buf and not rfl.ooo:
+                resp_flows.pop(rk, None)
+                pending_pop(rk, out, pending_tbl)
 
 
 def correlate_response(pending_tbl, rk, payload, now, out, resp_flows=None, seq=None, flags=0, is_truncated=False):
@@ -846,16 +1140,32 @@ def basic_user(value):
     scheme = parts[0].lower()
     if scheme == "basic":
         try:
-            pad = parts[1].strip()
-            if len(pad) > 1024:
+            token = parts[1].strip()
+            if not token or len(token) > 1024 or len(token) % 4 != 0:
                 return None, None
-            pad += "=" * (-len(pad) % 4)
-            raw = base64.b64decode(pad)
+            saw_pad = False
+            pad_count = 0
+            for ch in token:
+                if saw_pad:
+                    if ch == '=':
+                        pad_count += 1
+                        if pad_count > 2:
+                            return None, None
+                    else:
+                        return None, None
+                elif ch == '=':
+                    saw_pad = True
+                    pad_count = 1
+                elif not (('A' <= ch <= 'Z') or ('a' <= ch <= 'z') or ('0' <= ch <= '9') or ch in ('+', '/')):
+                    return None, None
+            raw = base64.b64decode(token)
             if len(raw) > 512:
                 return None, None
             if b":" in raw:
-                user = raw.split(b":", 1)[0]
-                user = user.decode("utf-8", "replace")[:64]
+                user_raw = raw.split(b":", 1)[0]
+                if len(user_raw) >= 256:
+                    return None, None
+                user = user_raw.decode("utf-8", "replace")[:64]
                 if user:
                     return user, "basic"
         except Exception:
@@ -875,10 +1185,27 @@ def normalize_wsse_username(value):
         return None
     if not username or len(username) > MAX_WSSE_USERNAME:
         return None
+    # Fast path for common ASCII printable usernames (ord 32..126)
+    try:
+        is_ascii = True
+        for ch in username:
+            o = ord(ch)
+            if o < 32 or o > 126:
+                is_ascii = False
+                break
+        if is_ascii:
+            return username
+    except Exception:
+        pass
+
     for char in username:
         if unicodedata.category(char).startswith("C"):
             return None
     return username
+
+
+class _UsernameFound(Exception):
+    pass
 
 
 def extract_wsse_username(body):
@@ -890,9 +1217,12 @@ def extract_wsse_username(body):
     """
     if not body or len(body) > MAX_WSSE_BODY_BYTES or b"\x00" in body:
         return None
-    lowered = bytes(body).lower()
-    if b"<!doctype" in lowered or b"<!entity" in lowered:
+    if b"UsernameToken" not in body:
         return None
+    if b"<!" in body:
+        lowered = bytes(body).lower()
+        if b"<!doctype" in lowered or b"<!entity" in lowered:
+            return None
 
     state = {"stack": [], "token_depth": 0, "username_depth": 0,
              "chars": [], "too_long": False, "result": None}
@@ -931,6 +1261,8 @@ def extract_wsse_username(body):
             if not state["too_long"] and state["result"] is None:
                 state["result"] = normalize_wsse_username(
                     u"".join(state["chars"]))
+                if state["result"] is not None:
+                    raise _UsernameFound()
             state["username_depth"] = 0
             state["chars"] = []
         if state["token_depth"] == depth:
@@ -949,6 +1281,8 @@ def extract_wsse_username(body):
                 hasattr(expat, "XML_PARAM_ENTITY_PARSING_NEVER")):
             parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
         parser.Parse(bytes(body), False)
+    except _UsernameFound:
+        pass
     except (expat.ExpatError, ValueError, TypeError):
         # A bounded prefix is commonly incomplete. A username fully closed
         # before the truncation point is still safe to use.
@@ -957,7 +1291,7 @@ def extract_wsse_username(body):
 
 
 def is_soap_content_type(value):
-    if not value:
+    if not value or "xml" not in value:
         return False
     media_type = value.split(";", 1)[0].strip().lower()
     return (media_type in ("text/xml", "application/xml",
@@ -978,8 +1312,12 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     trace_id = None
     if tp:
         parts = tp.split("-")
-        if len(parts) == 4 and len(parts[1]) == 32:
-            trace_id = parts[1].lower()
+        if len(parts) == 4 and len(parts[1]) == 32 and len(parts[2]) == 16 and len(parts[3]) == 2:
+            try:
+                int(parts[3], 16)
+                trace_id = parts[1].lower()
+            except ValueError:
+                pass
     if not trace_id:
         try:
             rnd = binascii.hexlify(os.urandom(16))
@@ -1057,22 +1395,25 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now, resp_flows=None):
     ent.append([ev, started, False, 0.0, fl.generation])
 
 
+_req_id_seq = [0]
+
+
 def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_tbl, now,
                              generation=0, syn_seen=False, corr_eligible=True,
                              flows=None, resp_flows=None):
     dst_ip, dport, src_ip, sport = meta
     if not ev:
-        return
+        return 0
     ev["req_bytes"] = head_bytes
     if pending_tbl is None:
         out.append(ev)
-        return
+        return 0
     rk = (dst_ip, dport, src_ip, sport)
     if not is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
                                   gen=generation, syn_seen=syn_seen,
                                   corr_eligible=corr_eligible):
         out.append(ev)
-        return
+        return 0
     ent = pending_tbl.get(rk)
     if ent is None:
         if len(pending_tbl) >= PENDING_MAX:
@@ -1083,9 +1424,12 @@ def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_t
             pending_pop(rk, out, pending_tbl)
         invalidate_connection_correlation(flows, resp_flows, rk)
         out.append(ev)
-        return
+        return 0
     started = first_byte_ts if first_byte_ts > 0 else (now if now is not None else time.time())
-    ent.append([ev, started, False, 0.0, generation])
+    _req_id_seq[0] += 1
+    req_id = _req_id_seq[0]
+    ent.append([ev, started, False, 0.0, generation, req_id])
+    return req_id
 
 
 
@@ -1115,46 +1459,44 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                    pending_tbl=None, now=None, wsse_body_bytes=0,
                    seq=None, flags=0, is_truncated=False, resp_flows=None):
     dst_ip, dport, src_ip, sport = meta
-    if not valid_port(dport) or not valid_port(sport):
+    if not (1 <= dport <= 65535 and 1 <= sport <= 65535):
         return
+    if not flows:
+        reset_wsse_active_flows()
     if now is None:
         now = time.time()
 
     # SYN handling: reset flow and start sequence tracking
     if flags & 0x02 and seq is not None:
         fl = flows.get(key)
-        if fl is not None and fl.awaiting_wsse and fl.wsse_event:
-            out.append(fl.wsse_event)
+        if fl is not None and getattr(fl, "syn_seen", False) and getattr(fl, "client_isn", None) == seq:
+            return
+        if fl is not None:
             fl.awaiting_wsse = False
         rk = (dst_ip, dport, src_ip, sport)
         corr_disabled_erase(rk)
 
         if pending_tbl is not None:
-            ent = pending_tbl.pop(rk, None)
+            ent = pending_tbl.get(rk)
             if ent:
-                for item in ent:
+                for item in list(ent):
                     is_tomb = item[2] if len(item) > 2 else False
-                    if not is_tomb:
+                    if not is_tomb and out is not None:
                         out.append(item[0])
+                pending_tbl.pop(rk, None)
 
-        if rev_key is not None and rev_key in flows:
-            flows.pop(rev_key, None)
-
-        old_gen = fl.generation if fl is not None else 0
-        next_gen = old_gen + 1
-        if fl is None:
-            fl = Flow()
-            flows[key] = fl
-        fl.reset_for_new_connection(next_gen, now=now, syn_seen=True, corr_eligible=True)
+        next_gen = (fl.generation + 1) if fl else 1
+        fl = Flow()
+        fl.reset_for_new_connection(next_gen, now, syn_seen=True, corr_eligible=True)
         fl.has_seq = True
         fl.next_seq = (seq + 1) & 0xFFFFFFFF
+        fl.client_isn = seq
+        flows[key] = fl
 
+        rfl = Flow()
+        rfl.reset_for_new_connection(next_gen, now, syn_seen=True, corr_eligible=True)
         if resp_flows is not None:
-            rfl = resp_flows.get(rk)
-            if rfl is None:
-                rfl = Flow()
-                resp_flows[rk] = rfl
-            rfl.reset_for_new_connection(next_gen, now=now, syn_seen=True, corr_eligible=True)
+            resp_flows[rk] = rfl
         return
 
     fl = flows.get(key)
@@ -1162,41 +1504,72 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
         fl = Flow()
         flows[key] = fl
         if len(flows) > MAX_FLOWS:
-            enforce_limit(flows, now)
+            enforce_limit(flows, now, out=out, pending_tbl=pending_tbl, resp_flows=resp_flows)
     fl.touched = now
 
     # Check keep-alive request transition while waiting for body in direct test feed mode
     if seq is None and fl.awaiting_wsse and payload and is_method_or_prefix(payload):
-        _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts,
-                                 meta, out, pending_tbl, now)
+        if pending_tbl is None and fl.wsse_event is not None:
+            out.append(fl.wsse_event)
         fl.awaiting_wsse = False
         fl.state = HTTP_STATE_HEADER
         fl.buf = bytearray()
 
     plen = len(payload) if payload else 0
+
+    if getattr(fl, "state", None) == HTTP_STATE_UNSYNCED:
+        if flags & 0x04:
+            if fl.awaiting_wsse:
+                fl.awaiting_wsse = False
+            flows.pop(key, None)
+        elif flags & 0x01:
+            if seq is not None:
+                fl.fin_seen = True
+                fl.fin_seq = (seq + plen) & 0xFFFFFFFF
+            if not fl.has_seq or seq_diff(fl.fin_seq, fl.next_seq) <= 0:
+                if getattr(fl, "state", None) in (HTTP_STATE_HEADER, HTTP_STATE_CLOSE_BODY, HTTP_STATE_UNSYNCED) and not fl.buf and not fl.ooo and not fl.awaiting_wsse:
+                    flows.pop(key, None)
+        return
     if plen > 0:
+        if is_truncated:
+            fl.is_broken = True
+            rk = (dst_ip, dport, src_ip, sport)
+            invalidate_connection_correlation(flows, resp_flows, rk)
+            if pending_tbl and rk in pending_tbl:
+                if out is not None:
+                    for item in pending_tbl[rk]:
+                        if not item[2]:
+                            out.append(item[0])
+                del pending_tbl[rk]
+            return
+
         if seq is None:
             fl.buf.extend(payload)
         else:
             if not fl.has_seq:
-                if is_method_or_prefix(payload):
+                start = find_request_resync_py(payload)
+                if start is not None:
+                    fl.has_seq = True
+                    fl.next_seq = (seq + start) & 0xFFFFFFFF
+                    fl.is_broken = False
+                    fl.state = HTTP_STATE_HEADER
+                    payload = payload[start:]
+                    plen -= start
+                    seq = (seq + start) & 0xFFFFFFFF
+                elif is_method_or_prefix(payload):
                     fl.has_seq = True
                     fl.next_seq = seq
                     fl.is_broken = False
                 else:
-                    if len(fl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
-                        if not any(s == seq for s, _ in fl.ooo):
-                            fl.ooo.append((seq, bytes(payload)))
+                    if not _ooo_insert(fl, seq, payload, is_truncated):
+                        fl.is_broken = True
                     return
 
             diff = seq_diff(seq, fl.next_seq)
             if diff == 0:
-                if is_truncated:
-                    fl.is_broken = True
-                else:
-                    fl.buf.extend(payload)
-                    fl.next_seq = (fl.next_seq + plen) & 0xFFFFFFFF
-                    _drain_ooo(fl)
+                fl.buf.extend(payload)
+                fl.next_seq = (fl.next_seq + plen) & 0xFFFFFFFF
+                _drain_ooo(fl)
             elif diff < 0:
                 overlap = -diff
                 if overlap < plen and not is_truncated:
@@ -1204,14 +1577,21 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                     fl.next_seq = (fl.next_seq + plen - overlap) & 0xFFFFFFFF
                     _drain_ooo(fl)
             else:
-                if len(fl.ooo) < MAX_OOO_SEGMENTS and not is_truncated:
-                    if not any(s == seq for s, _ in fl.ooo):
-                        fl.ooo.append((seq, bytes(payload)))
-                else:
+                if not _ooo_insert(fl, seq, payload, is_truncated):
                     fl.is_broken = True
 
     # HTTP framing state machine
+    if fl.fin_seen and fl.has_seq:
+        fdiff = seq_diff(fl.fin_seq, fl.next_seq)
+        if fdiff <= 0:
+            if fl.state == HTTP_STATE_HEADER and not fl.buf and not fl.ooo:
+                fl.state = HTTP_STATE_CLOSE_BODY
+
     while len(fl.buf) > 0 and not fl.is_broken:
+        if fl.state == HTTP_STATE_CLOSE_BODY:
+            del fl.buf[:]
+            break
+
         if fl.state == HTTP_STATE_HEADER:
             if not fl.first_byte_ts:
                 fl.first_byte_ts = now
@@ -1222,7 +1602,14 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                     fl.buf = bytearray()
                     fl.is_broken = True
                 break
-            start = find_http_start(fl.buf)
+            p0 = fl.buf[:8]
+            if (p0.startswith(b"GET ") or p0.startswith(b"POST ") or
+                p0.startswith(b"PUT ") or p0.startswith(b"DELETE ") or
+                p0.startswith(b"HEAD ") or p0.startswith(b"OPTIONS ") or
+                p0.startswith(b"PATCH ")):
+                start = 0
+            else:
+                start = find_http_start(fl.buf)
             if start < 0 or start > idx:
                 del fl.buf[:idx + 4]
                 continue
@@ -1231,9 +1618,9 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                 idx -= start
 
             head = bytes(fl.buf[:idx])
-            lines = head.replace(b"\r\n", b"\n").split(b"\n")
+            lines = head.split(b"\r\n") if b"\r\n" in head else head.split(b"\n")
             first = lines[0].strip().split()
-            if len(first) < 2 or first[0].decode("ascii", "replace") not in METHODS:
+            if len(first) < 3 or first[0] not in METHODS_BYTES or first[2] not in (b"HTTP/1.0", b"HTTP/1.1"):
                 del fl.buf[:idx + 4]
                 continue
             hdrs = {}
@@ -1241,15 +1628,23 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             hdrs["_path"] = first[1].decode("ascii", "replace")
             has_conflict_cl = False
             first_cl = None
+            has_transfer_encoding = False
+            invalid_transfer_encoding = False
+            te_raw = b""
             for ln in lines[1:]:
+                if not ln:
+                    continue
+                c0 = ln[:1]
+                if c0 not in (b"a", b"A", b"c", b"C", b"h", b"H", b"t", b"T", b"u", b"U", b"x", b"X"):
+                    continue
                 if b":" not in ln:
                     continue
                 kn, kv = ln.split(b":", 1)
-                k_norm = kn.strip().lower().decode("ascii", "replace")
-                v_norm = kv.strip().decode("utf-8", "replace")[:180]
-                if k_norm == "content-length":
+                kn_low = kn.strip().lower()
+                if kn_low == b"content-length":
+                    v_raw = kv.strip()
                     try:
-                        parsed_cl = int(v_norm)
+                        parsed_cl = int(v_raw)
                         if parsed_cl < 0:
                             has_conflict_cl = True
                         elif first_cl is None:
@@ -1258,7 +1653,32 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                             has_conflict_cl = True
                     except ValueError:
                         has_conflict_cl = True
-                hdrs[k_norm] = v_norm
+                    hdrs["content-length"] = v_raw.decode("ascii", "replace")[:180]
+                elif kn_low == b"transfer-encoding":
+                    has_transfer_encoding = True
+                    v_te = kv.strip()
+                    if len(v_te) > 256:
+                        invalid_transfer_encoding = True
+                    else:
+                        if te_raw:
+                            te_raw += b","
+                        if len(te_raw) + len(v_te) > 256:
+                            invalid_transfer_encoding = True
+                        else:
+                            te_raw += v_te
+                    hdrs["transfer-encoding"] = te_raw.decode("ascii", "replace")[:180]
+                elif kn_low == b"content-type":
+                    hdrs["content-type"] = kv.strip().decode("ascii", "replace")[:180]
+                elif kn_low == b"authorization":
+                    hdrs["authorization"] = kv.strip().decode("ascii", "replace")[:180]
+                elif kn_low == b"traceparent":
+                    hdrs["traceparent"] = kv.strip().decode("ascii", "replace")[:180]
+                elif kn_low == b"host":
+                    hdrs["host"] = kv.strip().decode("utf-8", "replace")[:180]
+                elif kn_low == b"user-agent":
+                    hdrs["user-agent"] = kv.strip().decode("utf-8", "replace")[:180]
+                elif kn_low == b"x-forwarded-for":
+                    hdrs["x-forwarded-for"] = kv.strip().decode("utf-8", "replace")[:180]
             fl.hdrs = hdrs
             fl.event = finish_event(fl, key, dst_ip, dport, src_ip, sport, ports, node_host)
             fl.head_bytes = idx + 4
@@ -1271,27 +1691,54 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                 content_length = int(hdrs.get("content-length", "0"))
             except (ValueError, TypeError):
                 content_length = 0
-            te = hdrs.get("transfer-encoding", "").lower()
-            is_chunked = "chunked" in te
+            has_te = has_transfer_encoding
+            is_chunked = False
+            if has_te:
+                if not invalid_transfer_encoding and transfer_encoding_final_chunked(te_raw):
+                    is_chunked = True
 
-            if has_conflict_cl or (content_length > 0 and is_chunked) or ("content-length" in hdrs and is_chunked):
-                fl.buf = bytearray()
-                fl.is_broken = True
+            if (has_conflict_cl or invalid_transfer_encoding or
+                (has_te and not is_chunked) or
+                (has_te and "content-length" in hdrs)):
+                del fl.buf[:]
+                del fl.ooo[:]
+                fl.has_seq = False
+                fl.is_broken = False
+                fl.state = HTTP_STATE_HEADER
+                rk = (dst_ip, dport, src_ip, sport)
+                invalidate_connection_correlation(flows, resp_flows, rk)
                 break
 
-            active_body_flows = sum(1 for cand in flows.values() if cand.awaiting_wsse or (cand.event is not None and getattr(cand, "body_goal", 0) > 0))
             wsse_eligible = (wsse_body_bytes > 0 and
                              is_soap_content_type(hdrs.get("content-type")) and
                              content_length > 0 and
                              not is_chunked and
-                             active_body_flows < MAX_WSSE_BODY_FLOWS)
+                             g_wsse_active_flows < MAX_WSSE_BODY_FLOWS)
 
             if wsse_eligible:
                 fl.awaiting_wsse = True
                 fl.wsse_event = fl.event
                 fl.wsse_buf = bytearray()
                 fl.wsse_goal = min(content_length, wsse_body_bytes, MAX_WSSE_BODY_BYTES)
+                fl.wsse_last_parsed_len = 0
+                if pending_tbl is not None:
+                    rk = (dst_ip, dport, src_ip, sport)
+                    if is_correlation_allowed(rk, flows=flows, resp_flows=resp_flows,
+                                              gen=fl.generation, syn_seen=fl.syn_seen,
+                                              corr_eligible=fl.corr_eligible):
+                        req_id = _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
+                                                         generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
+                                                         flows=flows, resp_flows=resp_flows)
+                        fl.wsse_req_id = req_id
+                        fl.wsse_rk = rk
+                    else:
+                        fl.wsse_req_id = 0
+                        fl.wsse_rk = None
+                else:
+                    fl.wsse_req_id = 0
+                    fl.wsse_rk = None
             else:
+                fl.awaiting_wsse = False
                 _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
                                          generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
                                          flows=flows, resp_flows=resp_flows)
@@ -1320,25 +1767,38 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                 if wsse_need > 0:
                     copy_len = min(to_consume, wsse_need)
                     fl.wsse_buf.extend(fl.buf[:copy_len])
-                username = extract_wsse_username(fl.wsse_buf)
-                if username or len(fl.wsse_buf) >= fl.wsse_goal:
-                    ev = fl.wsse_event
-                    if username:
-                        ev["wsse_user"] = username
-                        ev["user"] = username
-                        ev["scheme"] = "wsse"
-                    _emit_request_to_pending(ev, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
-                                             generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
-                                             flows=flows, resp_flows=resp_flows)
-                    fl.awaiting_wsse = False
+                buf_len = len(fl.wsse_buf)
+                should_parse = (buf_len >= fl.wsse_goal or
+                                fl.body_remaining <= to_consume or
+                                buf_len >= fl.wsse_last_parsed_len + 512)
+                if should_parse:
+                    fl.wsse_last_parsed_len = buf_len
+                    username = extract_wsse_username(fl.wsse_buf)
+                    if username or buf_len >= fl.wsse_goal:
+                        if username and fl.wsse_event is not None:
+                            fl.wsse_event["wsse_user"] = username
+                            fl.wsse_event["user"] = username
+                            fl.wsse_event["scheme"] = "wsse"
+                        if pending_tbl is not None:
+                            if fl.wsse_rk in pending_tbl:
+                                for item in pending_tbl[fl.wsse_rk]:
+                                    if len(item) > 5 and item[5] == fl.wsse_req_id:
+                                        if username:
+                                            item[0]["wsse_user"] = username
+                                            item[0]["user"] = username
+                                            item[0]["scheme"] = "wsse"
+                                        break
+                        else:
+                            if fl.wsse_event is not None:
+                                out.append(fl.wsse_event)
+                        fl.awaiting_wsse = False
 
             del fl.buf[:to_consume]
             fl.body_remaining -= to_consume
             if fl.body_remaining == 0:
                 if fl.awaiting_wsse:
-                    _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
-                                             generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
-                                             flows=flows, resp_flows=resp_flows)
+                    if pending_tbl is None and fl.wsse_event is not None:
+                        out.append(fl.wsse_event)
                     fl.awaiting_wsse = False
                 fl.state = HTTP_STATE_HEADER
                 fl.first_byte_ts = now if fl.buf else 0.0
@@ -1416,13 +1876,23 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                     fl.chunk_reading_crlf = True
             continue
 
-    if flags & 0x05:
-        if fl.awaiting_wsse and fl.wsse_event:
-            _emit_request_to_pending(fl.wsse_event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
-                                     generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
-                                     flows=flows, resp_flows=resp_flows)
+    if fl.fin_seen and fl.has_seq:
+        fdiff = seq_diff(fl.fin_seq, fl.next_seq)
+        if fdiff <= 0:
+            if fl.state == HTTP_STATE_HEADER and not fl.buf and not fl.ooo:
+                fl.state = HTTP_STATE_CLOSE_BODY
+
+    if flags & 0x04:
+        if fl.awaiting_wsse:
             fl.awaiting_wsse = False
         flows.pop(key, None)
+    elif flags & 0x01:
+        if seq is not None:
+            fl.fin_seen = True
+            fl.fin_seq = (seq + plen) & 0xFFFFFFFF
+        if not fl.has_seq or seq_diff(fl.fin_seq, fl.next_seq) <= 0:
+            if fl.state in (HTTP_STATE_HEADER, HTTP_STATE_CLOSE_BODY) and not fl.buf and not fl.ooo and not fl.awaiting_wsse:
+                flows.pop(key, None)
     elif seq is None and fl.state == HTTP_STATE_HEADER and not fl.buf and not fl.ooo and not fl.awaiting_wsse:
         flows.pop(key, None)
 
@@ -1434,28 +1904,38 @@ def sweep_idle(flows, now, out=None, pending_tbl=None, resp_flows=None):
             stale.append(k)
     for k in stale:
         fl = flows.get(k)
-        if fl is not None and fl.awaiting_wsse and fl.wsse_event is not None:
-            if out is not None:
-                out.append(fl.wsse_event)
+        if fl is not None:
             fl.awaiting_wsse = False
+            rk = (k[2], k[3], k[0], k[1])
+            invalidate_connection_correlation(flows, resp_flows, rk)
+            if pending_tbl is not None and rk in pending_tbl:
+                if out is not None:
+                    for item in pending_tbl[rk]:
+                        if not item[2]:
+                            out.append(item[0])
+                del pending_tbl[rk]
         flows.pop(k, None)
     if resp_flows is not None:
         rstale = [k for k, rfl in resp_flows.items() if now - rfl.touched > FLOW_TTL]
         for k in rstale:
+            rk = k
+            invalidate_connection_correlation(flows, resp_flows, rk)
+            if pending_tbl is not None and rk in pending_tbl:
+                if out is not None:
+                    for item in pending_tbl[rk]:
+                        if not item[2]:
+                            out.append(item[0])
+                del pending_tbl[rk]
             resp_flows.pop(k, None)
 
 
 def drain_incomplete_wsse(flows, out, pending_tbl, now=None):
-    """Fall back to emitting the request event if WSSE inspection was incomplete."""
-    if now is None:
-        now = time.time()
+    """Fall back to clearing awaiting_wsse without re-emitting (already in pending)."""
     for key in list(flows.keys()):
         fl = flows.get(key)
         if fl is None:
             continue
-        if fl.awaiting_wsse and fl.wsse_event is not None:
-            out.append(fl.wsse_event)
-            fl.awaiting_wsse = False
+        fl.awaiting_wsse = False
         flows.pop(key, None)
 
 
@@ -1466,59 +1946,94 @@ def process_packet(pkt, ports, node_host, flows, resp_flows, pending_tbl, out, n
     if now is None:
         now = time.time()
     off = 14
-    etype = struct.unpack("!H", pkt[12:14])[0]
+    etype = _STRUCT_H.unpack_from(pkt, 12)[0]
     if etype == ETH_P_VLAN:
         if n < 38:
             return False
-        etype = struct.unpack("!H", pkt[16:18])[0]
+        etype = _STRUCT_H.unpack_from(pkt, 16)[0]
         off = 18
     elif etype != ETH_P_IP:
         return False
 
-    ip0 = b2i(pkt[off])
-    if (ip0 >> 4) != 4 or b2i(pkt[off + 9]) != 6:
+    ip0 = _STRUCT_B.unpack_from(pkt, off)[0]
+    if (ip0 >> 4) != 4 or _STRUCT_B.unpack_from(pkt, off + 9)[0] != 6:
         return False
     ihl = (ip0 & 0x0F) * 4
     if ihl < 20 or n < off + ihl + 20:
         return False
 
-    frag = struct.unpack("!H", pkt[off + 6:off + 8])[0]
+    frag = _STRUCT_H.unpack_from(pkt, off + 6)[0]
     if frag & 0x3FFF:
         return False
 
-    ip_total_len = struct.unpack("!H", pkt[off + 2:off + 4])[0]
-    is_truncated = False
-    if ip_total_len > 0:
-        if ip_total_len < ihl + 20:
-            return False
-        if n - off < ip_total_len:
-            is_truncated = True
-        elif n - off > ip_total_len:
-            n = off + ip_total_len
-
-    src_ip = socket.inet_ntoa(pkt[off + 12:off + 16])
-    dst_ip = socket.inet_ntoa(pkt[off + 16:off + 20])
     tcp_off = off + ihl
-    sport, dport = struct.unpack("!HH", pkt[tcp_off:tcp_off + 4])
-    seq = struct.unpack("!I", pkt[tcp_off + 4:tcp_off + 8])[0]
-    doff_byte = b2i(pkt[tcp_off + 12])
+    sport, dport = _STRUCT_HH.unpack_from(pkt, tcp_off)
+    sport_mon = sport in ports
+    dport_mon = dport in ports
+    if not (sport_mon or dport_mon):
+        return False
+
+    ip_total_len = _STRUCT_H.unpack_from(pkt, off + 2)[0]
+    if ip_total_len < ihl + 20:
+        return False
+    is_truncated = False
+    if n - off < ip_total_len:
+        is_truncated = True
+    elif n - off > ip_total_len:
+        n = off + ip_total_len
+
+    doff_byte = _STRUCT_B.unpack_from(pkt, tcp_off + 12)[0]
     doff = (doff_byte >> 4) * 4
     if doff < 20 or n < tcp_off + doff:
         return False
 
-    flags = b2i(pkt[tcp_off + 13])
+    src_ip = _fast_inet_ntoa(pkt[off + 12:off + 16])
+    dst_ip = _fast_inet_ntoa(pkt[off + 16:off + 20])
+    seq = _STRUCT_I.unpack_from(pkt, tcp_off + 4)[0]
+    flags = _STRUCT_B.unpack_from(pkt, tcp_off + 13)[0]
     pay_start = tcp_off + doff
     payload = pkt[pay_start:n] if n > pay_start else b""
 
     # Response direction: Server -> Client
-    if sport in ports and dport not in ports:
+    if sport_mon and not dport_mon:
         rk = (src_ip, sport, dst_ip, dport)
         handle_response(resp_flows, rk, payload, now, out, pending_tbl,
                         seq=seq, flags=flags, is_truncated=is_truncated, flows=flows)
         return True
 
+    # Both ports monitored: latch roles via handshake, existing flow, or HTTP prefix
+    elif sport_mon and dport_mon:
+        rk = (src_ip, sport, dst_ip, dport)
+        req_k = (src_ip, sport, dst_ip, dport)
+        is_resp = False
+        if resp_flows is not None and rk in resp_flows:
+            is_resp = True
+        elif flows is not None and (dst_ip, dport, src_ip, sport) in flows:
+            is_resp = True
+        elif flows is not None and req_k in flows:
+            is_resp = False
+        elif (flags & 0x12) == 0x12:
+            is_resp = True
+        elif flags & 0x02:
+            is_resp = False
+        elif payload and payload.startswith(b"HTTP/"):
+            is_resp = True
+        else:
+            is_resp = False
+
+        if is_resp:
+            handle_response(resp_flows, rk, payload, now, out, pending_tbl,
+                            seq=seq, flags=flags, is_truncated=is_truncated, flows=flows)
+        else:
+            meta = (dst_ip, dport, src_ip, sport)
+            handle_payload(flows, req_k, None, payload, meta, ports, node_host, out,
+                           pending_tbl, now, wsse_body_bytes,
+                           seq=seq, flags=flags, is_truncated=is_truncated,
+                           resp_flows=resp_flows)
+        return True
+
     # Request direction: Client -> Server
-    elif dport in ports:
+    else:
         key = (src_ip, sport, dst_ip, dport)
         meta = (dst_ip, dport, src_ip, sport)
         handle_payload(flows, key, None, payload, meta, ports, node_host, out,
@@ -1612,12 +2127,22 @@ def maintenance_due(now, last_sweep):
     return now - last_sweep >= SWEEP_INTERVAL
 
 
-def enforce_limit(flows, now):
+def enforce_limit(flows, now, out=None, pending_tbl=None, resp_flows=None):
     """Cap flow-table size (py2.6: no OrderedDict — sweep stale, then FIFO
     by insertion order, which plain dicts preserve in CPython)."""
-    sweep_idle(flows, now)
+    sweep_idle(flows, now, out=out, pending_tbl=pending_tbl, resp_flows=resp_flows)
     while len(flows) > MAX_FLOWS:
-        flows.popitem()          # oldest-inserted key on CPython 2.6/2.7
+        k, fl = flows.popitem()          # oldest-inserted key on CPython 2.6/2.7
+        if fl is not None:
+            fl.awaiting_wsse = False
+            rk = (k[2], k[3], k[0], k[1])
+            invalidate_connection_correlation(flows, resp_flows, rk)
+            if pending_tbl is not None and rk in pending_tbl:
+                if out is not None:
+                    for item in pending_tbl[rk]:
+                        if not item[2]:
+                            out.append(item[0])
+                del pending_tbl[rk]
 
 
 def _control_config():
@@ -1802,10 +2327,7 @@ def main():
                        stats_state["last_packet_bytes"])
         events_delta = (stats_state["events_emitted_total"] -
                         stats_state["last_events"])
-        waiting_wsse = 0
-        for flow in flows.values():
-            if flow.event is not None and flow.body_goal:
-                waiting_wsse += 1
+        waiting_wsse = g_wsse_active_flows
         pending_count = sum(len(items) for items in pending.values())
         drop_pct = 100.0 * dropped_delta / max(1, packets_delta)
         capture = {
@@ -1854,28 +2376,31 @@ def main():
     dbg = os.environ.get("NT_SNIFF_DEBUG") == "1"
     dbg_rx = 0
     dbg_last = time.time()
+    pkt_batch_cnt = 0
     while running[0]:
-        emit_capture_stats()
-        # Poll independently of socket idle time. A busy monitored interface
-        # may never raise socket.timeout, but control changes must still apply.
-        if control_client is not None and time.time() >= control_next:
-            try:
-                ports, iface, control_action, control_status = _run_control_tick(
-                    ports, iface, control_run, control_client)
-                log("remote control: %s" % control_status)
-                if control_action == "restart":
-                    args = _restart_args(sys.argv[0], iface, ports,
-                                         verbose, workers, wsse_body_bytes)
-                    log("remote control: re-executing capture with updated configuration")
-                    s.close()
-                    os.execv(sys.executable, args)
-                elif control_action == "stop":
-                    log("remote control: stop requested; exiting")
-                    running[0] = False
-                    continue
-            except Exception as e:
-                log("WARN: remote control tick failed (%s)" % nt_control.safe_message(e))
-            control_next = time.time() + control_interval
+        pkt_batch_cnt += 1
+        if (pkt_batch_cnt & 0xFF) == 0:
+            emit_capture_stats()
+            # Poll independently of socket idle time. A busy monitored interface
+            # may never raise socket.timeout, but control changes must still apply.
+            if control_client is not None and time.time() >= control_next:
+                try:
+                    ports, iface, control_action, control_status = _run_control_tick(
+                        ports, iface, control_run, control_client)
+                    log("remote control: %s" % control_status)
+                    if control_action == "restart":
+                        args = _restart_args(sys.argv[0], iface, ports,
+                                             verbose, workers, wsse_body_bytes)
+                        log("remote control: re-executing capture with updated configuration")
+                        s.close()
+                        os.execv(sys.executable, args)
+                    elif control_action == "stop":
+                        log("remote control: stop requested; exiting")
+                        running[0] = False
+                        continue
+                except Exception as e:
+                    log("WARN: remote control tick failed (%s)" % nt_control.safe_message(e))
+                control_next = time.time() + control_interval
         try:
             pkt = s.recv(65535)
             dbg_rx += 1
@@ -1885,10 +2410,29 @@ def main():
                 log("DEBUG rx=%d" % dbg_rx)
                 dbg_last = time.time()
         except socket.timeout:
+            emit_capture_stats()
             if dbg:
                 log("DEBUG timeout rx=%d" % dbg_rx)
                 dbg_last = time.time()
             now = time.time()
+            if control_client is not None and now >= control_next:
+                try:
+                    ports, iface, control_action, control_status = _run_control_tick(
+                        ports, iface, control_run, control_client)
+                    log("remote control: %s" % control_status)
+                    if control_action == "restart":
+                        args = _restart_args(sys.argv[0], iface, ports,
+                                             verbose, workers, wsse_body_bytes)
+                        log("remote control: re-executing capture with updated configuration")
+                        s.close()
+                        os.execv(sys.executable, args)
+                    elif control_action == "stop":
+                        log("remote control: stop requested; exiting")
+                        running[0] = False
+                        continue
+                except Exception as e:
+                    log("WARN: remote control tick failed (%s)" % nt_control.safe_message(e))
+                control_next = now + control_interval
             if maintenance_due(now, last_sweep):
                 out_s = []
                 sweep_idle(flows, now, out_s, pending, resp_flows)
@@ -1908,7 +2452,7 @@ def main():
         if out:
             write_events(out)
 
-        if maintenance_due(now, last_sweep):
+        if (pkt_batch_cnt & 0xFF) == 0 and maintenance_due(now, last_sweep):
             out_s = []
             sweep_idle(flows, now, out_s, pending, resp_flows)
             sweep_pending(pending, now, out_s, flows=flows, resp_flows=resp_flows)

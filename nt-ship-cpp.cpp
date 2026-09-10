@@ -17,6 +17,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #if defined(__SANITIZE_ADDRESS__)
   #define NT_HAS_ASAN 1
@@ -92,11 +93,7 @@ static std::string jsonq(const std::string &s) {
   }
   return x + "\"";
 }
-static std::string shellq(const std::string &s) {
-  std::string o = "'";
-  for (size_t i = 0; i < s.size(); ++i) { if (s[i] == '\'') o += "'\\''"; else o += s[i]; }
-  return o + "'";
-}
+
 static double wall_seconds() {
   struct timeval tv; gettimeofday(&tv, NULL);
   return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
@@ -117,6 +114,8 @@ static std::string json_array(const std::vector<std::string> &a) {
   for (size_t i = 0; i < a.size(); ++i) { if (i) o += ","; o += a[i]; }
   return o + "]";
 }
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+
 static size_t bounded_batch_count(const std::deque<std::string> &buf, const std::string &node) {
   size_t size = std::string("{\"node\":").size() + jsonq(node).size() + std::string(",\"events\":[]}").size();
   size_t n = 0, limit = buf.size() < MAX_BATCH ? buf.size() : MAX_BATCH;
@@ -127,20 +126,101 @@ static size_t bounded_batch_count(const std::deque<std::string> &buf, const std:
   }
   return n;
 }
-static int post_json(const std::string &url, const std::string &body, unsigned timeout_sec) {
+
+static int post_json(const std::string &url, const std::string &body, unsigned timeout_sec, const std::string &batch_id = "") {
   if (body.size() > MAX_POST_BYTES) return 0;
   pace_upload(body.size());
-  std::string cmd = "curl -sSf --max-time " + ulls(timeout_sec) +
-    " --limit-rate " + ulls((unsigned long long)g_ship_rate_kbps * 1000ULL / 8ULL) +
-    " -o /dev/null -H 'Content-Type: application/json' --data-binary @- " + shellq(url);
-  FILE *fp = popen(cmd.c_str(), "w");
-  if (!fp) return 0;
-  size_t written = fwrite(body.data(), 1, body.size(), fp);
-  int rc = pclose(fp);
-  if (written != body.size() || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) return 0;
-  /* curl -f maps HTTP 4xx/5xx to failure. Exact success status is not exposed
-     by this write-only pipe, so the stable v1 success value is 200. */
-  return 200;
+
+  int in_pipe[2];
+  int out_pipe[2];
+  if (pipe(in_pipe) != 0) return 0;
+  if (pipe(out_pipe) != 0) {
+    close(in_pipe[0]);
+    close(in_pipe[1]);
+    return 0;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(in_pipe[0]); close(in_pipe[1]);
+    close(out_pipe[0]); close(out_pipe[1]);
+    return 0;
+  }
+
+  if (pid == 0) {
+    close(in_pipe[1]);
+    close(out_pipe[0]);
+    dup2(in_pipe[0], 0);
+    close(in_pipe[0]);
+    dup2(out_pipe[1], 1);
+    close(out_pipe[1]);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, 2);
+      close(devnull);
+    }
+
+    std::string to_str = ulls(timeout_sec);
+    std::string rate_str = ulls((unsigned long long)g_ship_rate_kbps * 1000ULL / 8ULL);
+    std::string batch_hdr = batch_id.empty() ? "" : ("X-Batch-Id: " + batch_id);
+
+    std::vector<const char *> args;
+    args.push_back("curl");
+    args.push_back("-s");
+    args.push_back("-S");
+    args.push_back("--max-time");
+    args.push_back(to_str.c_str());
+    args.push_back("--limit-rate");
+    args.push_back(rate_str.c_str());
+    args.push_back("-o");
+    args.push_back("/dev/null");
+    args.push_back("-w");
+    args.push_back("%{http_code}");
+    args.push_back("-H");
+    args.push_back("Content-Type: application/json");
+    if (!batch_hdr.empty()) {
+      args.push_back("-H");
+      args.push_back(batch_hdr.c_str());
+    }
+    args.push_back("--data-binary");
+    args.push_back("@-");
+    args.push_back(url.c_str());
+    args.push_back(NULL);
+
+    execvp("curl", (char *const *)&args[0]);
+    _exit(127);
+  }
+
+  close(in_pipe[0]);
+  close(out_pipe[1]);
+
+  size_t total_written = 0;
+  while (total_written < body.size()) {
+    ssize_t w = write(in_pipe[1], body.data() + total_written, body.size() - total_written);
+    if (w <= 0) break;
+    total_written += (size_t)w;
+  }
+  close(in_pipe[1]);
+
+  char out_buf[32];
+  memset(out_buf, 0, sizeof(out_buf));
+  size_t total_read = 0;
+  while (total_read < sizeof(out_buf) - 1) {
+    ssize_t r = read(out_pipe[0], out_buf + total_read, sizeof(out_buf) - 1 - total_read);
+    if (r <= 0) break;
+    total_read += (size_t)r;
+  }
+  close(out_pipe[0]);
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+
+  if (total_written != body.size()) return 0;
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    return 0;
+  }
+
+  return atoi(out_buf);
 }
 static unsigned long long json_uint(const std::string &s, const char *key) {
   std::string needle = std::string("\"") + key + "\":";
@@ -251,7 +331,7 @@ static std::string shipping_stats_body(const std::string &capture) {
     << ",\"cpu_system_seconds\":" << (usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0)
     << ",\"cpu_percent_one_core\":" << cpu_pct << ",\"rss_bytes\":" << rss
     << ",\"virtual_bytes\":" << virt << ",\"open_fds\":" << open_fd_count() << ",\"threads\":" << thread_count()
-    << "},\"limits\":{\"cpu_core\":" << jsonq(allowed_cpu()) << ",\"address_space_bytes\":268435456"
+    << "},\"limits\":{\"cpu_core\":" << (unsigned)atoi(allowed_cpu().c_str()) << ",\"address_space_bytes\":268435456"
     << ",\"ship_rate_kbps\":" << g_ship_rate_kbps << ",\"http_body_max_bytes\":" << MAX_POST_BYTES << ",\"ship_threads_max\":1"
     << ",\"wsse_body_bytes\":" << json_uint(capture, "wsse_body_bytes")
     << "}}";
@@ -275,33 +355,80 @@ static bool parse_capture_stats(const std::string &line, std::string *capture) {
 }
 static void *uploader_main(void *) {
   time_t last_flush = time(NULL);
+  double shutdown_deadline = 0.0;
   while (true) {
     std::vector<std::string> batch;
     std::string capture; unsigned long long capture_gen = 0;
     bool done, empty;
+    std::string batch_id;
+
     pthread_mutex_lock(&g_lock);
+    while (g_queue.empty() && !g_input_done && g_running) {
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_sec += 1;
+      pthread_cond_timedwait(&g_cond, &g_lock, &ts);
+    }
+
     time_t now = time(NULL);
     bool retry_ready = wall_seconds() >= g_next_event_attempt;
     bool flush = retry_ready && (g_queue.size() >= MAX_BATCH || (now - last_flush >= FLUSH_SEC) || g_input_done || !g_running);
     if (flush && !g_queue.empty()) {
       size_t n = bounded_batch_count(g_queue, g_node);
       if (!n) { g_queue.pop_front(); ++g_dropped_total; ++g_oversized_total; }
-      else { for (size_t i = 0; i < n; ++i) { batch.push_back(g_queue.front()); g_queue.pop_front(); } }
+      else {
+        batch_id = g_instance_id + "-" + ulls(++g_batches_total);
+        for (size_t i = 0; i < n; ++i) { batch.push_back(g_queue.front()); g_queue.pop_front(); }
+      }
       last_flush = now;
     }
     if (g_capture_generation != g_stats_generation_sent) { capture = g_capture_json; capture_gen = g_capture_generation; }
     done = g_input_done || !g_running; empty = g_queue.empty();
+
+    if (done && shutdown_deadline <= 0.0) {
+      shutdown_deadline = wall_seconds() + 10.0;
+    }
+    if (done && wall_seconds() > shutdown_deadline) {
+      if (!g_queue.empty()) {
+        g_dropped_total += g_queue.size();
+        g_queue_drops_total += g_queue.size();
+        g_queue.clear();
+      }
+      pthread_mutex_unlock(&g_lock);
+      break;
+    }
     pthread_mutex_unlock(&g_lock);
 
     if (!batch.empty()) {
       std::string body = "{\"node\":" + jsonq(g_node) + ",\"events\":" + json_array(batch) + "}";
-      int status = post_json(g_endpoint + "/api/ingest", body, 10);
+      unsigned timeout_sec = 5 + (unsigned)(body.size() / ((unsigned long long)g_ship_rate_kbps * 125ULL + 1ULL)) + 5;
+      if (timeout_sec < 10) timeout_sec = 10;
+      int status = post_json(g_endpoint + "/api/ingest", body, timeout_sec, batch_id);
+
+      for (int retry = 0; retry < 2 && (status < 200 || status >= 500); ++retry) {
+        if (shutdown_deadline > 0.0 && wall_seconds() >= shutdown_deadline) break;
+        // Bounded retry transient failure (5xx or connection error) with 500ms delay
+        usleep(500000);
+        if (shutdown_deadline > 0.0 && wall_seconds() >= shutdown_deadline) break;
+        status = post_json(g_endpoint + "/api/ingest", body, timeout_sec, batch_id);
+      }
+
       pthread_mutex_lock(&g_lock);
-      if (status) { g_posted_total += batch.size(); g_bytes_posted_total += body.size(); ++g_batches_total; g_consecutive_failures = 0; g_next_event_attempt = 0.0; g_last_http_status = status; g_last_success_epoch = time(NULL); }
-      else {
-        g_hub_drops_total += batch.size(); g_dropped_total += batch.size(); ++g_batches_failed_total;
+      if (status >= 200 && status < 300) {
+        g_posted_total += batch.size();
+        g_bytes_posted_total += body.size();
+        g_consecutive_failures = 0;
+        g_next_event_attempt = 0.0;
+        g_last_http_status = status;
+        g_last_success_epoch = time(NULL);
+      } else {
+        g_hub_drops_total += batch.size();
+        g_dropped_total += batch.size();
+        ++g_batches_failed_total;
         unsigned shift = g_consecutive_failures < 6 ? g_consecutive_failures : 6;
-        ++g_consecutive_failures; g_next_event_attempt = wall_seconds() + (double)(1U << shift); g_last_http_status = 0;
+        ++g_consecutive_failures;
+        g_next_event_attempt = wall_seconds() + (double)(1U << shift);
+        g_last_http_status = status;
       }
       pthread_mutex_unlock(&g_lock);
     }
@@ -310,11 +437,10 @@ static void *uploader_main(void *) {
       int status = body.size() <= MAX_STATS_BYTES ? post_json(g_endpoint + "/api/agent/stats", body, 2) : 0;
       pthread_mutex_lock(&g_lock);
       g_stats_generation_sent = capture_gen;
-      if (!status) ++g_stats_drops_total;
+      if (status < 200 || status >= 300) ++g_stats_drops_total;
       pthread_mutex_unlock(&g_lock);
     }
     if (done && empty && batch.empty()) break;
-    usleep(100000);
   }
   return NULL;
 }
@@ -391,13 +517,14 @@ int main(int argc, char **argv) {
     if (line.empty()) continue;
     std::string capture;
     if (parse_capture_stats(line, &capture)) {
-      pthread_mutex_lock(&g_lock); g_capture_json = capture; ++g_capture_generation; pthread_mutex_unlock(&g_lock);
+      pthread_mutex_lock(&g_lock); g_capture_json = capture; ++g_capture_generation; pthread_cond_signal(&g_cond); pthread_mutex_unlock(&g_lock);
       continue;
     }
     pthread_mutex_lock(&g_lock);
     ++g_input_total;
     if (line.size() > MAX_INPUT_LINE) { ++g_dropped_total; ++g_oversized_total; }
     else { if (g_queue.size() >= MAX_QUEUE) { g_queue.pop_front(); ++g_dropped_total; ++g_queue_drops_total; } g_queue.push_back(line); if (g_queue.size() > g_queue_high_water) g_queue_high_water = g_queue.size(); }
+    pthread_cond_signal(&g_cond);
     pthread_mutex_unlock(&g_lock);
   }
   pthread_mutex_lock(&g_lock);
@@ -408,6 +535,7 @@ int main(int argc, char **argv) {
      supervised restart cannot be delayed by a full 4,000-event backlog. */
   g_next_event_attempt = 0.0;
   g_input_done = true;
+  pthread_cond_signal(&g_cond);
   pthread_mutex_unlock(&g_lock);
   pthread_join(uploader, NULL);
   if (g_stopped_by_signal) { logmsg("stopped"); return 0; }
