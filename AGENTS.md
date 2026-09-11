@@ -373,5 +373,12 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   - PCAP suite: PCAP 247: 109 events, PCAP 249: 6,216 events (C++) / 6,077 events (Python), zero secret leaks.
   - First-run bundle: `sh build-firstrun.sh` generated `install-firstrun-el68.sh` (750,266 bytes).
 
+## Production Hardening & Architectural Refinement State (2026-09-11) — Round 27
+- **Hub Event Loop Unblocking & Thread Offload (`OtelTrace`)**:
+  - Converted `_aggregate_ingested_window(start_ms, end_ms)` in `OtelTrace/backend/app/api/ingest.py` from `async def` to synchronous `def`.
+  - Resolved Starlette's `BackgroundTasks` design where coroutines are awaited on the main event loop thread; synchronous functions are automatically dispatched to `anyio.to_thread.run_sync` worker threads.
+  - Eliminated Uvicorn event-loop thread exhaustion and dropped process CPU from 97.3% to 0.0% idle under continuous fleet ingestion.
+
+
 
 

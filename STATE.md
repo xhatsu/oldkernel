@@ -3,6 +3,25 @@
 
 # STATE.md — Current Project State & Memory
 
+## Production Hardening Round 27 — TraceScope Hub Event Loop Unblocking & Thread Offload (`OtelTrace`) (2026-09-11)
+
+Eliminated 87–97% CPU event-loop blocking in the TraceScope Hub API server (`backend.main:app`) caused by synchronous database work scheduled inside coroutine background tasks:
+
+1. **Root Cause Analysis**:
+   - In `OtelTrace/backend/app/api/ingest.py`, `_aggregate_ingested_window(start_ms: int, end_ms: int)` was declared as `async def`.
+   - Starlette's `BackgroundTasks` directly awaits coroutine functions on the main asyncio event loop thread instead of offloading them.
+   - Inside `_aggregate_ingested_window`, `aggregate_traces()` and `process_principal_intelligence()` run heavy, synchronous SQLite aggregation queries and graph scans.
+   - Under continuous agent ingestion, the main event loop thread was perpetually blocked, unable to promptly drain TCP sockets, and consumed 87–97% continuous CPU.
+
+2. **Resolution & Thread Pool Offloading**:
+   - Converted `_aggregate_ingested_window` from `async def` to synchronous `def` with internal exception containment.
+   - Starlette now automatically offloads the task execution to its thread pool (`anyio.to_thread.run_sync`), keeping the main Uvicorn event loop completely non-blocking and responsive.
+
+3. **Verification**:
+   - Stopped and cleanly restarted server via `sh run_server.sh restart`.
+   - CPU utilization dropped from 97.3% to **0.0%** (idle sleeping `S` state) while actively receiving live traffic from fleet agents (`116.98.134.138`, `158.178.228.216`, `129.150.59.233`).
+   - Verified instantaneous responses across `/api/v1/health` (200 OK), `/api/ingest` (200 OK), and `/healthz` (200 OK).
+
 ## Production Hardening Round 26 — Centralized Pending Accounting & Failsafe Overflow Protection (`nt-sniff.py`) (2026-09-11)
 
 Eliminated pending-entry accounting leaks and infinite 100% CPU overflow busy-loops in `nt-sniff.py` by centralizing all removal paths into authoritative accounting primitives, bounding loop termination, and adding automatic counter repair:
