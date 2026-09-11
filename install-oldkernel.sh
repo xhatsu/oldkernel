@@ -199,6 +199,14 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         sed -n '/^#__HYBRID_RUN_B64__$/,/^#__END_HYBRID_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-run-hybrid.sh" 2>/dev/null
         sed -n '/^#__RESOURCE_GUARD_B64__$/,/^#__END_RESOURCE_GUARD__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-resource-guard.sh" 2>/dev/null
         sed -n '/^#__SUPERVISOR_B64__$/,/^#__END_SUPERVISOR__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-supervise.sh" 2>/dev/null
+        if grep -q '^#__CPP_SNIFF_BIN_B64__$' "$SELF" 2>/dev/null; then
+            sed -n '/^#__CPP_SNIFF_BIN_B64__$/,/^#__END_CPP_SNIFF_BIN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-sniff-cpp" 2>/dev/null
+            chmod 755 "$WORKDIR/nt-sniff-cpp" 2>/dev/null || true
+        fi
+        if grep -q '^#__CPP_SHIP_BIN_B64__$' "$SELF" 2>/dev/null; then
+            sed -n '/^#__CPP_SHIP_BIN_B64__$/,/^#__END_CPP_SHIP_BIN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-ship-cpp" 2>/dev/null
+            chmod 755 "$WORKDIR/nt-ship-cpp" 2>/dev/null || true
+        fi
     fi
 
     # --- source 3: hub bootstrap server ---------------------------------
@@ -281,9 +289,33 @@ case "$(uname -r)" in
 esac
 
 if [ "$CAPTURE_MODE" = "cpp" ]; then
-    have g++ || die "--mode cpp requires g++ on target node"
+    HAVE_PREBUILT=0
+    if [ -x "$SCRIPT_DIR/nt-sniff-cpp" ] && [ -x "$SCRIPT_DIR/nt-ship-cpp" ]; then
+        if "$SCRIPT_DIR/nt-sniff-cpp" --help >/dev/null 2>&1 && "$SCRIPT_DIR/nt-ship-cpp" --help >/dev/null 2>&1; then
+            HAVE_PREBUILT=1
+        fi
+    elif [ -x "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" ] && [ -x "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" ]; then
+        if "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" --help >/dev/null 2>&1 && "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" --help >/dev/null 2>&1; then
+            HAVE_PREBUILT=1
+        fi
+    fi
+    if [ "$HAVE_PREBUILT" = 1 ]; then
+        log "prebuilt CentOS 6.8 x86_64 C++ binaries detected and verified"
+    else
+        have g++ || die "--mode cpp requires g++ or prebuilt C++ binaries on target node"
+    fi
 elif [ "$CAPTURE_MODE" = "hybrid" ] || [ "$CAPTURE_MODE" = "py-cpp" ]; then
-    have g++ || die "--mode hybrid requires g++ on target node"
+    HAVE_PREBUILT=0
+    if [ -x "$SCRIPT_DIR/nt-ship-cpp" ] && "$SCRIPT_DIR/nt-ship-cpp" --help >/dev/null 2>&1; then
+        HAVE_PREBUILT=1
+    elif [ -x "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" ] && "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" --help >/dev/null 2>&1; then
+        HAVE_PREBUILT=1
+    fi
+    if [ "$HAVE_PREBUILT" = 1 ]; then
+        log "prebuilt CentOS 6.8 x86_64 nt-ship-cpp detected and verified"
+    else
+        have g++ || die "--mode hybrid requires g++ or prebuilt nt-ship-cpp on target node"
+    fi
     PYBIN=""
     for c in python python2 python3; do
         if have "$c"; then PYBIN=$(command -v "$c"); break; fi
@@ -373,6 +405,16 @@ cp "$SCRIPT_DIR"/nt-run-cpp.sh "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-run-hybrid.sh "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-resource-guard.sh "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-supervise.sh "$PREFIX/"
+if [ -f "$SCRIPT_DIR/nt-sniff-cpp" ] && [ -x "$SCRIPT_DIR/nt-sniff-cpp" ]; then
+    cp -f "$SCRIPT_DIR/nt-sniff-cpp" "$PREFIX/nt-sniff-cpp"
+elif [ -f "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" ] && [ -x "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" ]; then
+    cp -f "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" "$PREFIX/nt-sniff-cpp"
+fi
+if [ -f "$SCRIPT_DIR/nt-ship-cpp" ] && [ -x "$SCRIPT_DIR/nt-ship-cpp" ]; then
+    cp -f "$SCRIPT_DIR/nt-ship-cpp" "$PREFIX/nt-ship-cpp"
+elif [ -f "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" ] && [ -x "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" ]; then
+    cp -f "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" "$PREFIX/nt-ship-cpp"
+fi
 if [ -f "$SCRIPT_DIR/install-oldkernel.sh" ]; then
     cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install-oldkernel.sh"
     cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install.sh"
@@ -438,8 +480,18 @@ fi
 # sniffer stdout must FEED the shipper's stdin; starting them separately
 # leaves events stranded in sniff.log (proven on el6). Build one pipeline.
 if [ "$CAPTURE_MODE" = "cpp" ]; then
-    CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
-    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-sniff-cpp.cpp -lrt -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -lrt -o nt-ship-cpp) || die "C++ build failed"
+    USE_PREBUILT=0
+    if [ -x "$PREFIX/nt-sniff-cpp" ] && [ -x "$PREFIX/nt-ship-cpp" ]; then
+        if "$PREFIX/nt-sniff-cpp" --help >/dev/null 2>&1 && "$PREFIX/nt-ship-cpp" --help >/dev/null 2>&1; then
+            USE_PREBUILT=1
+            log "using prebuilt CentOS 6.8 x86_64 C++ binaries (verified executable)"
+        fi
+    fi
+    if [ "$USE_PREBUILT" = 0 ]; then
+        have g++ || die "g++ missing and prebuilt C++ binaries not executable on this host"
+        CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
+        (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-sniff-cpp.cpp -lrt -o nt-sniff-cpp && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -lrt -o nt-ship-cpp) || die "C++ build failed"
+    fi
     if [ -f "$PREFIX/nt-sniff-cpp" ] && have setcap && have useradd; then
         chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         chmod 750 "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
@@ -460,8 +512,16 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     EXPECTED_SHIP=nt-ship-cpp
     log "native C++ nonblocking capture + bounded shipper pipeline selected"
 elif [ "$CAPTURE_MODE" = "hybrid" ] || [ "$CAPTURE_MODE" = "py-cpp" ]; then
-    CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
-    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -lrt -o nt-ship-cpp) || die "C++ build failed"
+    USE_PREBUILT=0
+    if [ -x "$PREFIX/nt-ship-cpp" ] && "$PREFIX/nt-ship-cpp" --help >/dev/null 2>&1; then
+        USE_PREBUILT=1
+        log "using prebuilt CentOS 6.8 x86_64 nt-ship-cpp (verified executable)"
+    fi
+    if [ "$USE_PREBUILT" = 0 ]; then
+        have g++ || die "g++ missing and prebuilt nt-ship-cpp not executable on this host"
+        CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
+        (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -lrt -o nt-ship-cpp) || die "C++ build failed"
+    fi
     [ "$SNIFF_AS" != root ] \
         || die "safe rootless Python capture unavailable; refusing to run the agent as root"
     SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES'"

@@ -7,6 +7,26 @@
 - **TraceScope Hub Server & Bootstrap**: Stopped for maintenance via `/home/ubuntu/Viettel/OtelTrace/run_server.sh stop`.
 - **Sessions & Ports**: `tracescope-30102` (port 30102), `tracescope-worker`, and bootstrap server (port 30105) cleanly shut down. Verified connection refused on both ports.
 
+## Production Hardening Round 28 — CentOS 6.8 x86_64 Containerized Build & Embedded Binary Shipping (2026-09-11)
+
+Enabled containerized builds for CentOS 6.8 x86_64 targets and embedded precompiled native binaries in `install-firstrun-el68.sh`:
+
+1. **CentOS 6.8 Docker Builder (`Dockerfile.el68` & `build-el68-docker.sh`)**:
+   - Uses `centos:6.8` base with `vault.centos.org` archive repositories.
+   - Installs native GCC 4.4.7 (`gcc-c++`, `make`, `util-linux-ng`).
+   - Compiles native C++03 binaries (`-std=gnu++98 -pthread -lrt`) targeting native glibc 2.12 / Linux 2.6.18+.
+   - Generates stripped binaries in `bin/el68-x86_64/nt-sniff-cpp` and `bin/el68-x86_64/nt-ship-cpp`.
+
+2. **Self-Contained Prebuilt Embedding (`build-firstrun.sh`)**:
+   - Automatically embeds precompiled binaries as `#__CPP_SNIFF_BIN_B64__` and `#__CPP_SHIP_BIN_B64__` when present in `bin/el68-x86_64/`.
+   - Single self-contained bundle `install-firstrun-el68.sh` contains both full source code and ready-to-run prebuilt binaries.
+
+3. **Installer Auto-Detection & Fallback (`install-oldkernel.sh`)**:
+   - Extracts precompiled binaries on first run.
+   - During preflight and installation, verifies executable compatibility (`--help`).
+   - Runs precompiled binaries directly on CentOS 6.8 nodes without requiring `g++` or dev headers.
+   - Gracefully falls back to local `g++` compilation if prebuilt binaries are missing or incompatible.
+
 ## Production Hardening Round 27 — TraceScope Hub Event Loop Unblocking & Thread Offload (`OtelTrace`) (2026-09-11)
 
 Eliminated 87–97% CPU event-loop blocking in the TraceScope Hub API server (`backend.main:app`) caused by synchronous database work scheduled inside coroutine background tasks:

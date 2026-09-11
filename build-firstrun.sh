@@ -40,6 +40,14 @@ cp install-oldkernel.sh "$OUT"
     printf '#__SUPERVISOR_B64__\n'
     base64 nt-supervise.sh
     printf '#__END_SUPERVISOR__\n'
+    if [ -f bin/el68-x86_64/nt-sniff-cpp ] && [ -f bin/el68-x86_64/nt-ship-cpp ]; then
+        printf '#__CPP_SNIFF_BIN_B64__\n'
+        base64 bin/el68-x86_64/nt-sniff-cpp
+        printf '#__END_CPP_SNIFF_BIN__\n'
+        printf '#__CPP_SHIP_BIN_B64__\n'
+        base64 bin/el68-x86_64/nt-ship-cpp
+        printf '#__END_CPP_SHIP_BIN__\n'
+    fi
 } >> "$OUT"
 chmod 755 "$OUT"
 echo "built $OUT ($(wc -c < "$OUT") bytes)"

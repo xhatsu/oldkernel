@@ -1,0 +1,10 @@
+# Dockerfile.el68 - CentOS 6.8 x86_64 builder and test environment
+FROM --platform=linux/amd64 centos:6.8
+
+# Configure CentOS 6.8 vault repository
+RUN rm -f /etc/yum.repos.d/* && \
+    printf '[vault-base]\nname=CentOS-6.8 - Base\nbaseurl=https://vault.centos.org/6.8/os/x86_64/\ngpgcheck=0\nenabled=1\n' > /etc/yum.repos.d/vault.repo && \
+    yum install -y gcc-c++ make util-linux-ng curl && \
+    yum clean all
+
+WORKDIR /build

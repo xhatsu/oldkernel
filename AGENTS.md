@@ -11,6 +11,7 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 - **`install-oldkernel.sh`**: SysV installer script supporting `--check`, `--install`, and `--uninstall`. Manages rootless `ntsniff` user with `cap_net_raw` file capabilities.
 - **`build-firstrun.sh`**: Bundle generator creating `install-firstrun-el68.sh` with embedded base64 payloads of all kit components.
 - **`install-firstrun-el68.sh`**: Self-contained single-file installer suitable for `curl | sh` bootstrap.
+- **`Dockerfile.el68` & `build-el68-docker.sh`**: CentOS 6.8 x86_64 containerized build toolchain producing prebuilt native C++ binaries embedded directly into the installer bundle.
 - **`RUNNING.md`**: Detailed operator guide for installation, custom
   parameters, safety behavior, service lifecycle, verification, and removal.
 - **`ANSIBLE.md`**: Stable mass-deployment pattern using a controller-copied,
