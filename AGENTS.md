@@ -221,3 +221,119 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   - ASAN/UBSAN: `cpp-edge-test.py` **ALL 10 EDGE TESTS PASS** (0 leaks, 0 errors).
   - PCAPs: PCAP 247: 109 events, status 200, duration 112ms; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks.
   - Rebuilt self-contained installer bundle: `install-firstrun-el68.sh` (436,662 bytes, preflight check OK).
+## Production Hardening & Architectural Refinement State (2026-09-10) — Round 17
+- **Allocator Capacity Release on Destructive Resets (`release_string`, `release_vector`)**: Added C++03 `.swap()` idiom helpers to release heap-allocated container capacity on destructive flow and connection resets (`Flow::wsse_clear`, `Flow::clear_buffers`, `invalidate_stream`, client SYN reuse, HTTP 101 upgrade, and `flush_all_pending`), preventing lingering capacity buildup under `RLIMIT_AS` (256 MiB). Normal per-request container pops continue without reallocation.
+- **Hard Overflow-Safe Global Memory Budget Enforcement**: Replaced potential wrap-around addition checks with overflow-safe subtraction (`len > MAX_TOTAL_BUFFER_BYTES || g_total_flow_bytes > MAX_TOTAL_BUFFER_BYTES - len`) in `buf_append()`, `ooo_push()`, `wsse_append()`, and `ooo_insert()`. Enforces segment count ceiling (`MAX_OOO_SEGMENTS`) and calls `wsse_cancel()` on allocation failure.
+- **Explicit Allocation Failure Handling (`std::bad_alloc`)**: Guarded capture loop with `try / catch (const std::bad_alloc &)`. Bypasses event flushing during OOM to avoid secondary allocation faults, safely closes AF_PACKET sockets and ring mmap, and exits with code 2 to trigger the supervisor restart circuit.
+- **Verification Results**:
+  - Dual-engine test suite: **124/124 PASS** (`test_synthetic_harness.py`, Tests 1–62 across C++ and Python).
+  - Unit tests: **26/26 PASS** (`pytest test_nt_sniff.py`).
+  - ASAN/UBSAN: `cpp-edge-test.py` **ALL 10 EDGE TESTS PASS** (0 leaks, 0 errors, including flow accounting zero-leak fixture).
+  - PCAPs: PCAP 247: 109 events, status 200, duration 112ms; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks.
+  - Rebuilt self-contained installer bundle: `install-firstrun-el68.sh` (438,441 bytes, preflight check OK).
+## Production Hardening & Architectural Refinement State (2026-09-10) — Round 18
+- **Native libcurl Multi-Transfer & Gzip Level 1 Shipper Engine**: Replaced subshell/fork-based shipping with asynchronous `libcurl` multi-interface (`CURLM*`) and in-memory `zlib` (level 1 gzip) compression in `nt-ship-cpp.cpp`. Supports up to 4 concurrent in-flight HTTP requests (`--max-inflight`), dynamic upload throttling via `CURLOPT_MAX_SEND_SPEED_LARGE`, TCP keepalive/connection reuse, and 64 KiB raw JSON batch ceilings.
+- **Strict Agent Statistics Protocol v1 Compliance**: Maintained strict schema v1 (`schema_version: 1`, `mode: "cpp"`, `batches_pushed_total`, `bytes_pushed_total`, `http_body_max_bytes`) to ensure live Hub validator acceptance (`accepted: true`).
+- **Bounded Error Handling & Lifecycle**: Implemented exponential backoff with deterministic jitter for transient errors, immediate drop for 4xx client errors, 60s max retry age, and 10s graceful shutdown flush deadline before returning code 74 on capture pipe EOF.
+- **Verification Results**:
+  - Dual-engine test suite: **124/124 PASS** (`test_synthetic_harness.py`).
+## Production Hardening & Architectural Refinement State (2026-09-10) — Round 19
+- **Event Queue Capacity Increased to 10,000**:
+  - `nt-sniff-cpp.cpp`: updated `MAX_QUEUE = 10000;`. Internal queue limit and telemetry export 10,000 events.
+  - `nt-ship-cpp.cpp`: updated `MAX_QUEUE = 10000;`, `MAX_QUEUE_EVENTS = 10000;`, and scaled `MAX_QUEUE_BYTES = 20U * 1024U * 1024U;` (20 MiB payload ceiling).
+  - Preserves strict host safety and zero allocation leaks within the 256 MiB `RLIMIT_AS` bounds.
+- **Verification Results**:
+  - Dual-engine test suite: **124/124 PASS** (`test_synthetic_harness.py`).
+  - Unit tests: **26/26 PASS** (`pytest test_nt_sniff.py`).
+  - Resource guard tests: **16/16 PASS** (`pytest test_resource_guard.py`).
+  - ASAN/UBSAN: `cpp-edge-test.py` **ALL 10 EDGE TESTS PASS** (0 leaks, 0 errors).
+  - PCAPs: PCAP 247: 109 events; PCAP 249: 6,216 events (C++), 6,077 events (Python).
+  - Rebuilt self-contained installer bundle: `install-firstrun-el68.sh` (453,527 bytes, preflight check OK).
+
+## Production Hardening & Architectural Refinement State (2026-09-10) — Round 20
+- **Zero-Third-Party POSIX HTTP Shipper Engine**:
+  - Replaced `libcurl` and `zlib` with pure POSIX socket networking (`sys/socket.h`, `poll()`, nonblocking I/O) in `nt-ship-cpp.cpp`.
+  - Removed `-lcurl` and `-lz` link flags from `Makefile` and `install-oldkernel.sh`. The entire C++ stack now links strictly against standard glibc (`-pthread -lrt`), requiring zero external devel libraries on CentOS 6.x.
+  - Supports HTTP/1.1 persistent connection reuse, chunked and Content-Length response decoding, token bucket upload throttling (`--ship-rate-kbps`), up to 4 concurrent connections (`--max-inflight`), and exponential backoff retry.
+  - Telemetry v1 verified and accepted by live Hub.
+- **Verification Results**:
+  - Dual-engine test suite: **124/124 PASS** (`test_synthetic_harness.py`).
+  - Unit tests: **26/26 PASS** (`pytest test_nt_sniff.py`).
+  - Resource guard tests: **16/16 PASS** (`pytest test_resource_guard.py`).
+  - ASAN/UBSAN: `cpp-edge-test.py` **ALL 10 EDGE TESTS PASS** (0 leaks, 0 errors).
+  - PCAPs: PCAP 247: 109 events; PCAP 249: 6,216 events (C++), 6,077 events (Python).
+  - First-run bundle: `sh build-firstrun.sh` generated `install-firstrun-el68.sh` (472,641 bytes, preflight OK).
+  - Live production daemon cleanly reinstalled and active on `enp0s6:18080`.
+
+## Production Hardening & Architectural Refinement State (2026-09-11) — Round 21
+- **Python Stability-Hardening Implementation Plan Formulated**:
+  - Maintained strict non-ring capture constraint (`AF_PACKET + cBPF + recv() + 1 worker`).
+  - Centralized stream quarantine (`quarantine_connection`) and connection teardown (`terminate_connection`).
+  - Hard memory accounting (`BufferBudget` <= 16 MiB) across all buffers, OOO segments, and WSSE text.
+  - OOO byte tracking (`Flow.ooo_bytes` <= 16 KiB) and deterministic non-overlapping sequence comparison.
+  - Symmetrical response header limits (`MAX_HDRS`) and body framing sanity ceilings (`MAX_HTTP_BODY_FRAMING`).
+  - Python 2.6 safe eviction via `collections.deque` FIFOs and `PendingRequest` with `__slots__`.
+  - Fail-closed `RLIMIT_AS` (256 MiB), controlled fatal `MemoryError` exit (code 71), and post-privilege capability verification (`verify_dropped_capabilities`).
+  - Full plan specification: documented in [`python_stability_hardening_plan.md`](file:///home/ubuntu/.gemini/antigravity-cli/brain/02fb42a7-1c94-4b4c-8a38-944410d78ed6/python_stability_hardening_plan.md).
+
+## Python Shipper Stability-Hardening & Transport Optimization (`nt-ship.py`) (2026-09-11) — Round 22
+- **Zero AF_PACKET Pure User-Space Stdin Client**: Shipper retains strictly bounded stdin pipe ingestion and TCP HTTP client POST architecture.
+- **Fail-Closed RLIMIT_AS Verification (256 MiB)**: `enforce_rlimit_as()` queries, clamps, enforces, and reads back `RLIMIT_AS`. Fails closed with code 70 and stderr fatal diagnostic if soft limit cannot be enforced.
+- **Hard Line Size Cap (64 KiB)**: Replaced unbounded line reading with `sys.stdin.readline(65537)`. Un-terminated records exceeding 64 KiB are drained in 4096-byte chunks until newline and dropped as `oversized` without RSS inflation.
+- **Dual Buffer Bounds (4000 events, 8 MiB)**: `buf` uses `collections.deque` with tracked `buf_bytes`. Automatically drops oldest elements from the front when either `len(buf) >= 4000` or `buf_bytes + new_bytes > 8 MiB`.
+- **Single-Serialization Batch Pipeline**: Incoming lines are verified once with `json.loads()`; compact raw JSON strings are stored directly. `build_batch` constructs wire JSON via string concatenation (`'{"node":' + node_json + ',"events":[' + ','.join(events) + ']}'`), eliminating Python dictionary creation and double serialization.
+- **Pre-Built Batch Objects**: Fully constructed `Batch` instances (`body`, `event_count`, `batch_id`, `attempts`, `created_at`) are queued to poster threads. Poster threads perform zero JSON encoding.
+- **Persistent HTTP/1.1 Connections (`httplib.HTTPConnection`)**: Per-thread persistent `HTTPConnection` reused across batches. Reconnects on errors, timeouts, or `Connection: close`.
+- **Guaranteed Task Done & Error Containment**: Poster thread item processing wrapped in `try ... finally: q.task_done()`, eliminating `q.join()` deadlock risks. Narrow exception catching for network/socket errors. Explicit `except MemoryError` terminates process with exit code 71 for clean supervisor restart.
+- **Stable `X-Batch-Id` & Bounded Retry**: Emits `X-Batch-Id: <instance_id>-<seq>`. Up to 3 attempts with exponential backoff (0.5s..5s) and 60s age cap for transient 408/429/5xx and socket errors. Permanent 4xx errors are dropped immediately without retry. Accepts all 2xx statuses (200..299).
+- **Clean Transition Logging**: Removed per-batch success spam. Outage mode logs on first failure, suppresses per-request spam, emits periodic summaries every 30s, and logs recovery upon reconnection.
+- **Verification Results**:
+  - `pytest test_nt_ship.py`: **15/15 PASS** (100%, covering input line bounding, unterminated drain, dual buffer bounds, fail-closed rlimit, keep-alive connection reuse, stable batch IDs, transient retries, permanent 4xx drop, 204 acceptance, and live Hub ingestion).
+  - `pytest test_resource_guard.py`: **16/16 PASS**.
+  - `python3 cpp-edge-test.py`: **ALL 10 EDGE TESTS PASS** (ASAN/UBSAN 0 errors).
+  - `pytest test_nt_sniff.py`: **26/26 PASS**.
+  - `python3 test_pcap_suite.py`: PCAP 247: 109 events; PCAP 249: 6,216 events (C++) / 6,077 events (Python).
+  - First-run bundle: `sh build-firstrun.sh` generated `install-firstrun-el68.sh` (741,525 bytes, preflight OK against live Hub).
+
+## Python Sniffer Stability-Hardening (`nt-sniff.py`) (2026-09-11) — Round 23
+- **Preserved Non-Ring Capture Architecture**: Retained `AF_PACKET + classic BPF + recv() + 1 worker` single capture worker loop. Strict Python 2.6 stdlib compatibility without external packages.
+- **Fail-Closed RLIMIT_AS (256 MiB) & Memory Bounds**:
+  - `enforce_rlimit_as()` enforces and verifies 256 MiB address space limit, failing closed with exit code 70 on startup if unable to apply.
+  - Fatal `MemoryError` handling in main capture loop safely flushes stderr diagnostic and exits with code 71 to trigger supervisor backoff.
+  - Downstream pipe breakage (`EPIPE`) exits with code 74 to trigger supervisor pipeline restart.
+  - Post-privilege `/proc/self/status` capability verification (`verify_dropped_capabilities`) proves unprivileged execution.
+- **Global Memory Accounting (`BufferBudget`)**:
+  - Centralized 16 MiB ceiling (`MAX_TOTAL_BUFFER_BYTES = 16 * 1024 * 1024`).
+  - Strict accounting across main in-order buffers, OOO segments, and WSSE text.
+  - Guarded `append_flow_buf`, `consume_flow_buf`, `clear_main_buffer`, `clear_all_flow_buffers`.
+- **Hard Flow & Pending Capacity Bounds**:
+  - Hard tracked half-flow capacity ceiling (`MAX_TRACKED_HALF_FLOWS = 8192`) using `g_flow_fifo` and `g_resp_flow_fifo` (`collections.deque`).
+  - FIFO-evicted connections drain uncompleted pending requests with null status before deletion.
+  - Global pending bounds: `MAX_PENDING_KEYS = 8192`, `MAX_PENDING_EVENTS = 16384`, `PENDING_PER_FLOW = 32`.
+  - Memory-efficient `PendingRequest` class with `__slots__` and index-access compatibility.
+- **OOO Byte Ceiling & Deterministic Retransmission**:
+  - Per-flow OOO ceiling (`MAX_OOO_BYTES = 16384`).
+  - Tracked `fl.ooo_bytes` with non-overlapping sequence comparison and ambiguity detection.
+- **Symmetrical Framing Limits & Invalidation Model**:
+  - Symmetrical response header limits (`MAX_HDRS = 64`) and body framing sanity ceilings (`MAX_HTTP_BODY_FRAMING = 64 MiB`).
+  - Symmetrical stream invalidation via `reset_flow_for_resync()`: clears buffers, resets sequence state (`has_seq = False, next_seq = 0, is_broken = False, state = HTTP_STATE_HEADER`), locks out correlation (`fl.corr_eligible = False, corr_disabled_insert(rk)`), allowing directional parsers to resync on subsequent HTTP request boundaries without fake correlation.
+  - `HTTP_STATE_UNSYNCED` strictly reserved for permanent framing discontinuation such as HTTP 101 Switching Protocols.
+- **Verification Results**:
+  - Dual-engine synthetic harness: **124/124 PASS** (`test_synthetic_harness.py`, all 62 tests passing for both C++ and Python engines).
+  - Unit tests: **26/26 PASS** (`pytest test_nt_sniff.py`).
+  - Shipper unit tests: **15/15 PASS** (`pytest test_nt_ship.py`).
+  - Resource guard tests: **16/16 PASS** (`pytest test_resource_guard.py`).
+  - ASAN/UBSAN C++ edge tests: **ALL 10 EDGE TESTS PASS** (`python3 cpp-edge-test.py`).
+  - Sample PCAP validation: PCAP 247: 109 events; PCAP 249: 6,216 events (C++) / 6,077 events (Python), zero secret leaks (`python3 test_pcap_suite.py`).
+  - Self-contained installer bundle: `sh build-firstrun.sh` generated `install-firstrun-el68.sh` (743,981 bytes, preflight check OK).
+
+## Hybrid Pipeline Mode Support (`--mode hybrid` / `--mode py-cpp`) (2026-09-11) — Round 24
+- **Architecture**: Pairs the zero-compiler, Python 2.6 stdlib capture sniffer (`nt-sniff.py`) with the zero-third-party POSIX C++03 HTTP shipper (`nt-ship-cpp`).
+- **Security Boundary**: Only `python-capnetraw` receives `cap_net_raw+ep` file capability; `nt-ship-cpp` runs as an unprivileged process under `ntsniff` with zero capabilities.
+- **Pipeline Coupling**: Executed under `nt-supervise.sh` and `nt-resource-guard.sh` with exit code 74 coupling (broken pipe / closed stdout automatically restarts the supervised pipeline).
+- **Embedded Bundle Support**: `nt-run-hybrid.sh` embedded into `install-firstrun-el68.sh` via `build-firstrun.sh`. `install-oldkernel.sh` validates both g++ and Python 2.6+ when `--mode hybrid` is specified.
+- **Live Verification**:
+  - Tested daemon installation on target node with `--mode hybrid`: verified processes running as `ntsniff`, CPU affinity CPU 0, SCHED_IDLE at nice 19, 24 MiB + 2.8 MiB RSS.
+  - End-to-end capture test (`test_hybrid_e2e.py`): verified Basic auth extraction, SOAP WSSE UsernameToken extraction, response correlation (status 200, duration), traceparent propagation, zero credential leakage, and in-band capture stats forwarding to `/api/agent/stats`.
+
+

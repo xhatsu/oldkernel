@@ -31,6 +31,9 @@ cp install-oldkernel.sh "$OUT"
     printf '#__CPP_RUN_B64__\n'
     base64 nt-run-cpp.sh
     printf '#__END_CPP_RUN__\n'
+    printf '#__HYBRID_RUN_B64__\n'
+    base64 nt-run-hybrid.sh
+    printf '#__END_HYBRID_RUN__\n'
     printf '#__RESOURCE_GUARD_B64__\n'
     base64 nt-resource-guard.sh
     printf '#__END_RESOURCE_GUARD__\n'

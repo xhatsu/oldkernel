@@ -120,7 +120,7 @@ for port_value do
         || die "each port must be in range 1..65535"
 done
 [ "$PORT_COUNT" -le 30 ] || die "at most 30 monitored ports are allowed by the safe cBPF program"
-case "$CAPTURE_MODE" in python|cpp) : ;; *) die "mode must be python or cpp" ;; esac
+case "$CAPTURE_MODE" in python|cpp|hybrid|py-cpp) : ;; *) die "mode must be python, cpp, or hybrid" ;; esac
 case "$SHIPPERS" in ''|*[!0-9]*) die "ship threads must be an integer 1..8" ;; esac
 [ "$SHIPPERS" -ge 1 ] && [ "$SHIPPERS" -le 8 ] || die "ship threads must be in range 1..8"
 case "$SHIP_RATE_KBPS" in ''|*[!0-9]*) die "ship rate must be an integer 64..10000" ;; esac
@@ -169,7 +169,7 @@ fetch() { # fetch <url> <dest>
 #   3. fetched from an explicitly configured bootstrap URL (--kit-url)
 # Uninstall never needs the kit.
 need_kit=0
-for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh nt-supervise.sh; do
+for f in nt-sniff.py nt-ship.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-run-hybrid.sh nt-resource-guard.sh nt-supervise.sh; do
     [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$f" ] || need_kit=1
 done
 
@@ -196,6 +196,7 @@ if [ "$need_kit" = 1 ] && [ "$MODE" != uninstall ]; then
         sed -n '/^#__CPP_B64__$/,/^#__END_CPP__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-sniff-cpp.cpp" 2>/dev/null
         sed -n '/^#__CPP_MAKE_B64__$/,/^#__END_CPP_MAKE__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/Makefile" 2>/dev/null
         sed -n '/^#__CPP_RUN_B64__$/,/^#__END_CPP_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-run-cpp.sh" 2>/dev/null
+        sed -n '/^#__HYBRID_RUN_B64__$/,/^#__END_HYBRID_RUN__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-run-hybrid.sh" 2>/dev/null
         sed -n '/^#__RESOURCE_GUARD_B64__$/,/^#__END_RESOURCE_GUARD__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-resource-guard.sh" 2>/dev/null
         sed -n '/^#__SUPERVISOR_B64__$/,/^#__END_SUPERVISOR__$/p' "$SELF" | sed '1d;$d' | base64 -d > "$WORKDIR/nt-supervise.sh" 2>/dev/null
     fi
@@ -279,9 +280,17 @@ case "$(uname -r)" in
         ;;
 esac
 
-# C++ native mode uses the shipped binary; do not require Python 2.6.
 if [ "$CAPTURE_MODE" = "cpp" ]; then
     have g++ || die "--mode cpp requires g++ on target node"
+elif [ "$CAPTURE_MODE" = "hybrid" ] || [ "$CAPTURE_MODE" = "py-cpp" ]; then
+    have g++ || die "--mode hybrid requires g++ on target node"
+    PYBIN=""
+    for c in python python2 python3; do
+        if have "$c"; then PYBIN=$(command -v "$c"); break; fi
+    done
+    [ -n "$PYBIN" ] || die "python (2.6+) required on target node"
+    "$PYBIN" -c 'import sys; assert sys.version_info >= (2,6)' 2>/dev/null \
+        || die "python 2.6+ required on target node"
 else
     PYBIN=""
     for c in python python2 python3; do
@@ -350,7 +359,7 @@ rm -f "$PREFIX/nt-sniff-cpp" "$PREFIX/nt-ship-cpp"
 
 mkdir -p "$PREFIX" || die "mkdir $PREFIX failed"
 # Python control client is bundled for CentOS 6.x nodes.
-for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-resource-guard.sh nt-supervise.sh; do
+for f in nt-sniff.py nt-ship.py nt_control.py nt-control.py nt-ship-cpp.cpp nt-sniff-cpp.cpp Makefile nt-run-cpp.sh nt-run-hybrid.sh nt-resource-guard.sh nt-supervise.sh; do
     [ -f "$SCRIPT_DIR/$f" ] || die "bundle incomplete: missing $f"
 done
 cp "$SCRIPT_DIR"/nt-sniff.py "$PREFIX/"
@@ -361,6 +370,7 @@ cp "$SCRIPT_DIR"/nt-ship-cpp.cpp "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-sniff-cpp.cpp "$PREFIX/"
 cp "$SCRIPT_DIR"/Makefile "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-run-cpp.sh "$PREFIX/"
+cp "$SCRIPT_DIR"/nt-run-hybrid.sh "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-resource-guard.sh "$PREFIX/"
 cp "$SCRIPT_DIR"/nt-supervise.sh "$PREFIX/"
 if [ -f "$SCRIPT_DIR/install-oldkernel.sh" ]; then
@@ -449,6 +459,16 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
     EXPECTED_SHIP=nt-ship-cpp
     log "native C++ nonblocking capture + bounded shipper pipeline selected"
+elif [ "$CAPTURE_MODE" = "hybrid" ] || [ "$CAPTURE_MODE" = "py-cpp" ]; then
+    CXXSTD=$(g++ -std=gnu++03 -x c++ -E /dev/null >/dev/null 2>&1 && echo -std=gnu++03 || echo -std=gnu++98)
+    (cd "$PREFIX" && g++ -O2 -Wall -Wextra $CXXSTD -pthread nt-ship-cpp.cpp -lrt -o nt-ship-cpp) || die "C++ build failed"
+    [ "$SNIFF_AS" != root ] \
+        || die "safe rootless Python capture unavailable; refusing to run the agent as root"
+    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES'"
+    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
+    RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
+    EXPECTED_SHIP=nt-ship-cpp
+    log "hybrid mode (Python capture + native bounded C++ shipper) selected"
 else
     if [ "$SNIFF_AS" != root ]; then
         SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES'"

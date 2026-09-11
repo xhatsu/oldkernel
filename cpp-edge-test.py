@@ -81,7 +81,7 @@ print('Native agent statistics v1 fixture: PASS')
 # 2. Test Shipper under AddressSanitizer & UndefinedBehaviorSanitizer
 src_ship = Path(__file__).with_name('nt-ship-cpp.cpp')
 out_ship = Path('/tmp/nt-ship-cpp-edge-test')
-cmd_ship = ['g++','-std=gnu++03','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread',str(src_ship),'-o',str(out_ship)]
+cmd_ship = ['g++','-std=gnu++03','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread',str(src_ship),'-lrt','-o',str(out_ship)]
 r = subprocess.run(cmd_ship, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 if r.returncode:
     print('Shipper compile failed:', r.stderr); sys.exit(r.returncode)
