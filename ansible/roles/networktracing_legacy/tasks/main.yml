@@ -1,118 +1,76 @@
 ---
-- name: Copy tested self-contained bundle
-  ansible.builtin.copy:
-    src: "files/install-firstrun-el68.sh"
-    dest: "{{ nt_bundle_dest }}"
-    owner: root
-    group: root
-    mode: "0750"
-  register: nt_bundle_copy
+- name: Stage self-contained bundle on managed host
+  ansible.builtin.raw: >
+    test -s {{ nt_bundle_dest }} || curl -sSf {{ nt_bundle_url }} -o {{ nt_bundle_dest }} && chmod 750 {{ nt_bundle_dest }}
+  changed_when: false
 
 - name: Write desired configuration manifest
-  ansible.builtin.copy:
-    dest: "{{ nt_desired_dest }}"
-    owner: root
-    group: root
-    mode: "0600"
-    content: |
-      version={{ nt_agent_version }}
-      bundle_checksum={{ nt_bundle_copy.checksum }}
-      hub={{ nt_hub_url }}
-      iface={{ nt_capture_iface }}
-      ports={{ nt_capture_ports }}
-      mode={{ nt_capture_mode }}
-      wsse_bytes={{ nt_wsse_bytes }}
-      ship_threads={{ nt_ship_threads }}
-      ship_rate_kbps={{ nt_ship_rate_kbps }}
-      stats_interval_sec={{ nt_stats_interval_sec }}
-  register: nt_desired_copy
-
-- name: Inspect deployed configuration stamp
-  ansible.builtin.stat:
-    path: "{{ nt_deployed_stamp }}"
-    checksum_algorithm: sha1
-  register: nt_deployed
-
-- name: Inspect service script existence
-  ansible.builtin.stat:
-    path: /etc/init.d/networktracing-legacy
-  register: nt_init
-
-- name: Query current service status
-  ansible.builtin.command:
-    argv:
-      - /etc/init.d/networktracing-legacy
-      - status
-  register: nt_status
+  ansible.builtin.raw: |
+    cat << 'CONF' > {{ nt_desired_dest }}
+    version={{ nt_agent_version }}
+    hub={{ nt_hub_url }}
+    iface={{ nt_capture_iface }}
+    ports={{ nt_capture_ports }}
+    mode={{ nt_capture_mode }}
+    wsse_bytes={{ nt_wsse_bytes }}
+    ship_threads={{ nt_ship_threads }}
+    ship_rate_kbps={{ nt_ship_rate_kbps }}
+    stats_interval_sec={{ nt_stats_interval_sec }}
+    CONF
+    chmod 600 {{ nt_desired_dest }}
   changed_when: false
-  failed_when: false
-  when: nt_init.stat.exists
+
+- name: Inspect deployed configuration stamp and service health
+  ansible.builtin.raw: |
+    STAMP_MATCH=0
+    if [ -f {{ nt_deployed_stamp }} ] && cmp -s {{ nt_desired_dest }} {{ nt_deployed_stamp }}; then
+        STAMP_MATCH=1
+    fi
+    SVC_RUNNING=0
+    if /etc/init.d/networktracing-legacy status 2>/dev/null | grep -q "running"; then
+        SVC_RUNNING=1
+    fi
+    echo "STAMP_MATCH=$STAMP_MATCH SVC_RUNNING=$SVC_RUNNING"
+  register: nt_eval_raw
+  changed_when: false
 
 - name: Evaluate installation requirement
   ansible.builtin.set_fact:
-    nt_install_required: >-
-      {{
-        (not nt_deployed.stat.exists) or
-        (nt_deployed.stat.checksum != nt_desired_copy.checksum) or
-        (not nt_init.stat.exists) or
-        (nt_init.stat.exists and nt_status.rc != 0)
-      }}
+    nt_install_required: "{{ ('STAMP_MATCH=1 SVC_RUNNING=1' not in nt_eval_raw.stdout) }}"
 
 - name: Preflight check before modifying host
-  ansible.builtin.command:
-    argv:
-      - sh
-      - "{{ nt_bundle_dest }}"
-      - --check
-      - --mode
-      - "{{ nt_capture_mode }}"
-      - --server
-      - "{{ nt_hub_url }}"
-      - --iface
-      - "{{ nt_capture_iface }}"
-      - --ports
-      - "{{ nt_capture_ports }}"
+  ansible.builtin.raw: >
+    sh {{ nt_bundle_dest }} --check
+    --mode {{ nt_capture_mode }}
+    --server {{ nt_hub_url }}
+    --iface {{ nt_capture_iface }}
+    --ports {{ nt_capture_ports }}
   when: nt_install_required | bool
   changed_when: false
 
 - name: Install NetworkTracing agent with fail-closed safeguards
-  ansible.builtin.command:
-    argv:
-      - sh
-      - "{{ nt_bundle_dest }}"
-      - --offline
-      - --mode
-      - "{{ nt_capture_mode }}"
-      - --server
-      - "{{ nt_hub_url }}"
-      - --iface
-      - "{{ nt_capture_iface }}"
-      - --ports
-      - "{{ nt_capture_ports }}"
-      - --wsse-bytes
-      - "{{ nt_wsse_bytes }}"
-      - --ship-threads
-      - "{{ nt_ship_threads }}"
-      - --ship-rate-kbps
-      - "{{ nt_ship_rate_kbps }}"
-      - --stats-interval-sec
-      - "{{ nt_stats_interval_sec }}"
+  ansible.builtin.raw: >
+    sh {{ nt_bundle_dest }} --offline
+    --mode {{ nt_capture_mode }}
+    --server {{ nt_hub_url }}
+    --iface {{ nt_capture_iface }}
+    --ports {{ nt_capture_ports }}
+    --wsse-bytes {{ nt_wsse_bytes }}
+    --ship-threads {{ nt_ship_threads }}
+    --ship-rate-kbps {{ nt_ship_rate_kbps }}
+    --stats-interval-sec {{ nt_stats_interval_sec }}
   when: nt_install_required | bool
 
 - name: Record configuration stamp upon successful install
-  ansible.builtin.copy:
-    src: "{{ nt_desired_dest }}"
-    dest: "{{ nt_deployed_stamp }}"
-    remote_src: true
-    owner: root
-    group: root
-    mode: "0600"
+  ansible.builtin.raw: >
+    cp -f {{ nt_desired_dest }} {{ nt_deployed_stamp }} && chmod 600 {{ nt_deployed_stamp }}
   when: nt_install_required | bool
 
 - name: Verify running capture daemon
-  ansible.builtin.command:
-    argv:
-      - /etc/init.d/networktracing-legacy
-      - status
+  ansible.builtin.raw: /etc/init.d/networktracing-legacy status
   register: nt_final_status
   changed_when: false
+
+- name: Display service status
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} service status: {{ nt_final_status.stdout.strip() }}"

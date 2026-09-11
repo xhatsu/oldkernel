@@ -1,8 +1,9 @@
 ---
 - name: Deploy NetworkTracing Legacy Agent to Fleet
   hosts: legacy_capture
+  gather_facts: false
   become: true
-  serial: "10%"
+  serial: "100%"
   max_fail_percentage: 10
 
   roles:

@@ -1,25 +1,20 @@
 ---
 - name: Verify NetworkTracing Legacy Agent Fleet Health
   hosts: legacy_capture
+  gather_facts: false
   become: true
 
   tasks:
     - name: Query SysV service status
-      ansible.builtin.command:
-        argv:
-          - /etc/init.d/networktracing-legacy
-          - status
+      ansible.builtin.raw: /etc/init.d/networktracing-legacy status 2>&1 || true
       register: nt_status_cmd
-      changed_when: false
 
     - name: Query running processes
-      ansible.builtin.shell: |
-        ps -eo pid,user,comm,pri,ni,stat,cls,rss,vsz,args | grep -E 'nt-sniff|nt-ship|python-capnetraw' | grep -v grep || true
+      ansible.builtin.raw: ps -eo pid,user,comm,pri,ni,stat,cls,rss,vsz,args | grep -E 'nt-sniff|nt-ship|python-capnetraw' | grep -v grep || true
       register: nt_proc_cmd
-      changed_when: false
 
     - name: Display service and process health
       ansible.builtin.debug:
         msg:
-          - "Service Status: {{ nt_status_cmd.stdout_lines | default([]) }}"
+          - "Service Status: {{ nt_status_cmd.stdout.strip() }}"
           - "Processes: {{ nt_proc_cmd.stdout_lines | default([]) }}"
