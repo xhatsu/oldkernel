@@ -7,11 +7,11 @@
 
 Eliminated pending-entry accounting leaks and infinite 100% CPU overflow busy-loops in `nt-sniff.py` by centralizing all removal paths into authoritative accounting primitives, bounding loop termination, and adding automatic counter repair:
 
-1. **Centralized Accounting Primitives**:
-   - `pending_take(pending_tbl, rk, index=0)`: Pops entry at `index`, safely decrements `g_pending_events_total` (clamped to $\ge 0$), removes key from dict when list is empty, and returns the `PendingRequest`.
-   - `pending_take_all(pending_tbl, rk)`: Pops entire list `pending_tbl.pop(rk, None)`, decrements `g_pending_events_total -= len(lst)` safely, and returns the list.
+1. **Centralized Accounting Primitives with Underflow Self-Repair**:
+   - `pending_take(pending_tbl, rk, index=0)`: Pops entry at `index`, safely decrements `g_pending_events_total` if $> 0$, or immediately repairs from the table via `pending_repair_count(pending_tbl)` if an under-count was detected. Automatically removes key from dict when empty.
+   - `pending_take_all(pending_tbl, rk)`: Pops entire list `pending_tbl.pop(rk, None)`, decrements `g_pending_events_total -= len(lst)` if $\ge \text{len}$, or repairs from table via `pending_repair_count(pending_tbl)` if an under-count was detected.
    - `pending_actual_count(pending_tbl)`: Authoritative sum of `len(lst)` across all keys in `pending_tbl`.
-   - `pending_repair_count(pending_tbl)`: Compares `actual` with `g_pending_events_total` and synchronizes counter.
+   - `pending_repair_count(pending_tbl)`: Authoritatively re-synchronizes `g_pending_events_total` to actual table contents.
 
 2. **Elimination of All Direct List/Dict Mutation Bypasses**:
    - In `handle_response`:
@@ -27,13 +27,13 @@ Eliminated pending-entry accounting leaks and infinite 100% CPU overflow busy-lo
    - In `sweep_pending`: Uses `rem_entries = pending_take_all(pending_tbl, rk)` on expired tombstones.
    - In `drain_pending`: Uses `lst = pending_take_all(pending_tbl, rk)` and synchronizes via `pending_repair_count`.
 
-3. **Structural Loop Termination & Failsafe Overflow Protection (`ensure_pending_capacity`)**:
-   - Replaced unbounded `while len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS:` in `_emit_request` and `_emit_request_to_pending` with `ensure_pending_capacity(pending_tbl, out, flows, resp_flows)`.
-   - Pre-repairs if counter is negative or $> 2 \times \text{MAX\_PENDING\_EVENTS}$.
-   - Fast path returns immediately if within limits.
-   - Bounds loop attempts to `min(MAX_PENDING_KEYS + 1, ...)`.
-   - Forward progress verification: If `_flush_oldest_pending` frees nothing or keys/events do not decrease, triggers `pending_repair_count(pending_tbl)`.
-   - Fail-closed correlation: If capacity cannot be made, returns `False`, causing `_emit_request` / `_emit_request_to_pending` to emit request immediately with `status: null` (uncorrelated) rather than hanging or spinning at 100% CPU.
+3. **Structural Loop Termination & Pre-Repair on Suspicious State (`ensure_pending_capacity`)**:
+   - Replaced unbounded `while` loops with `ensure_pending_capacity(pending_tbl, out, flows, resp_flows)`.
+   - Pre-repairs table when near capacity or in suspicious state (`g_pending_events_total < 0 or g_pending_events_total >= MAX_PENDING_EVENTS or len(pending_tbl) >= MAX_PENDING_KEYS`) **before** evicting anything. Legitimate requests are never evicted due to stale/inflated counters.
+   - If capacity is fine after repair, returns `True` immediately without eviction.
+   - Bounded attempts: `min(MAX_PENDING_KEYS + 1, max(32, len(pending_tbl) + 1))`.
+   - Forward progress verification: Triggers `pending_repair_count` if `_flush_oldest_pending` frees nothing or does not reduce keys/events.
+   - Fail-closed correlation: If capacity cannot be made after `max_attempts`, returns `False`, causing requests to emit immediately with `status: null` rather than spinning at 100% CPU.
 
 4. **Continuous Invariant Verification & Self-Healing**:
    - `assert_internal_invariants` validates `g_pending_events_total == pending_actual_count(pending_tbl)` whenever `pending_tbl is not None`.
@@ -43,11 +43,11 @@ Eliminated pending-entry accounting leaks and infinite 100% CPU overflow busy-lo
 
 | Suite | Result |
 |---|---|
-| `pytest test_nt_sniff.py` | **27/27 PASS** (includes comprehensive lifecycle, WebSocket 101, RST, tombstone, and corrupted-counter failsafe tests) |
+| `pytest test_nt_sniff.py` | **27/27 PASS** (includes comprehensive lifecycle, WebSocket 101, RST, tombstone, stale-counter non-eviction, and underflow detection tests) |
 | `pytest test_nt_ship.py` | **15/15 PASS** |
 | `python3 test_synthetic_harness.py` | **124/124 PASS** (Tests 1–62 across both C++ and Python engines) |
 | `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks ✓ |
-| `sh build-firstrun.sh` | **750,465 bytes** bundle rebuilt & verified |
+| `sh build-firstrun.sh` | **750,266 bytes** bundle rebuilt & verified |
 
 ## Production Hardening Round 23 — Python Sniffer Stability-Hardening (`nt-sniff.py`) (2026-09-11)
 

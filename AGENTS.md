@@ -354,15 +354,15 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
 
 ## Production Hardening & Architectural Refinement State (2026-09-11) — Round 26
 - **Centralized Pending Accounting Primitives (`nt-sniff.py`)**:
-  - `pending_take(pending_tbl, rk, index=0)`: Authoritatively extracts a single pending request and decrements `g_pending_events_total` with bottom-clamp to 0, automatically deleting the key when empty.
-  - `pending_take_all(pending_tbl, rk)`: Atomically pops the entire list and decrements `g_pending_events_total` by `len(lst)`.
+  - `pending_take(pending_tbl, rk, index=0)`: Authoritatively extracts a single pending request and decrements `g_pending_events_total` if $> 0$, or immediately repairs from the table via `pending_repair_count(pending_tbl)` if under-counted, automatically deleting the key when empty.
+  - `pending_take_all(pending_tbl, rk)`: Atomically pops the entire list and decrements `g_pending_events_total` by `len(lst)`, or repairs from the table if under-counted.
   - `pending_actual_count(pending_tbl)`: Computes actual element count across all keys in `pending_tbl`.
   - `pending_repair_count(pending_tbl)`: Authoritatively re-synchronizes `g_pending_events_total` if any drift occurs.
 - **Elimination of All Direct List/Dict Mutation Accounting Bypasses**:
   - Centralized accounting across `handle_response` (WebSocket 101 upgrade, stale generation, tombstones, matched responses), `correlate_response`, `drain_pending_requests_unresolved`, `terminate_connection`, `pending_del`, `pending_pop`, `sweep_pending`, and `drain_pending`.
-- **Structural Loop Termination & Failsafe Overflow Protection (`ensure_pending_capacity`)**:
-  - Replaced unbounded `while` loops in `_emit_request` and `_emit_request_to_pending` with `ensure_pending_capacity`.
-  - Bounds loop attempts, detects corruption, repairs accounting, and fails closed for correlation (`status: null`) if room cannot be made, permanently preventing 100% CPU infinite busy-loops.
+- **Pre-Repair on Suspicious State & Failsafe Overflow Protection (`ensure_pending_capacity`)**:
+  - Checks if `g_pending_events_total < 0 or g_pending_events_total >= MAX_PENDING_EVENTS or len(pending_tbl) >= MAX_PENDING_KEYS` and repairs the counter **before** evicting anything. Legitimate requests are never evicted due to stale/inflated counters.
+  - Bounds loop attempts, detects zero forward progress, and fails closed for correlation (`status: null`) if room cannot be made, permanently preventing 100% CPU infinite busy-loops.
 - **Invariant Enforcement & Continuous Self-Healing**:
   - `assert_internal_invariants` validates `g_pending_events_total == pending_actual_count(pending_tbl)`.
   - `sweep_pending` runs self-healing `pending_repair_count` on every sweep tick.
@@ -371,7 +371,7 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   - Dual-engine synthetic harness: **124/124 PASS** (`test_synthetic_harness.py`).
   - Shipper tests: **15/15 PASS** (`pytest test_nt_ship.py`).
   - PCAP suite: PCAP 247: 109 events, PCAP 249: 6,216 events (C++) / 6,077 events (Python), zero secret leaks.
-  - First-run bundle: `sh build-firstrun.sh` generated `install-firstrun-el68.sh` (750,465 bytes).
+  - First-run bundle: `sh build-firstrun.sh` generated `install-firstrun-el68.sh` (750,266 bytes).
 
 
 

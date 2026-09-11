@@ -1196,6 +1196,22 @@ g_resp_flow_fifo = deque()
 g_pending_events_total = 0
 
 
+def pending_actual_count(pending_tbl):
+    """Count actual entries across all keys in pending_tbl."""
+    if not pending_tbl:
+        return 0
+    return sum(len(lst) for lst in pending_tbl.values())
+
+
+def pending_repair_count(pending_tbl):
+    """Repair g_pending_events_total if it drifted out of sync."""
+    global g_pending_events_total
+    actual = pending_actual_count(pending_tbl)
+    if g_pending_events_total != actual:
+        g_pending_events_total = actual
+    return actual
+
+
 def pending_take(pending_tbl, rk, index=0):
     """Remove exactly one pending entry and keep global accounting correct.
 
@@ -1222,7 +1238,8 @@ def pending_take(pending_tbl, rk, index=0):
     if g_pending_events_total > 0:
         g_pending_events_total -= 1
     else:
-        g_pending_events_total = 0
+        # Counter was already corrupt. Table is authoritative.
+        pending_repair_count(pending_tbl)
 
     return item
 
@@ -1246,25 +1263,10 @@ def pending_take_all(pending_tbl, rk):
     if g_pending_events_total >= count:
         g_pending_events_total -= count
     else:
-        g_pending_events_total = 0
+        # Under-count detected.
+        pending_repair_count(pending_tbl)
 
     return lst
-
-
-def pending_actual_count(pending_tbl):
-    """Count actual entries across all keys in pending_tbl."""
-    if not pending_tbl:
-        return 0
-    return sum(len(lst) for lst in pending_tbl.values())
-
-
-def pending_repair_count(pending_tbl):
-    """Repair g_pending_events_total if it drifted out of sync."""
-    global g_pending_events_total
-    actual = pending_actual_count(pending_tbl)
-    if g_pending_events_total != actual:
-        g_pending_events_total = actual
-    return actual
 
 
 def drain_pending_requests_unresolved(pending_tbl, rk, out=None, reason="unknown"):
@@ -2498,48 +2500,62 @@ def _flush_oldest_pending(pending_tbl, out, flows=None, resp_flows=None):
 
 
 def ensure_pending_capacity(pending_tbl, out, flows=None, resp_flows=None):
-    """Ensure pending_tbl has room for at least one new entry.
-
-    Returns True if capacity is available, False if capacity could not be made.
-    Guarantees structural termination: bounded loop, forward-progress checks,
-    and automatic accounting repair if corruption is detected.
-    """
+    """Ensure pending_tbl has room for at least one new entry."""
     global g_pending_events_total
 
     if pending_tbl is None:
         return True
 
-    # Pre-repair if counter drifted wildly or went negative
-    if g_pending_events_total < 0 or g_pending_events_total > (MAX_PENDING_EVENTS * 2):
+    # Slow path / suspicious state:
+    # table is authoritative before we evict anything.
+    if (g_pending_events_total < 0 or
+            g_pending_events_total >= MAX_PENDING_EVENTS or
+            len(pending_tbl) >= MAX_PENDING_KEYS):
         pending_repair_count(pending_tbl)
 
-    # Fast path: already within capacity
-    if len(pending_tbl) < MAX_PENDING_KEYS and g_pending_events_total < MAX_PENDING_EVENTS:
+    # After repair, capacity may already be fine.
+    if (len(pending_tbl) < MAX_PENDING_KEYS and
+            g_pending_events_total < MAX_PENDING_EVENTS):
         return True
 
     attempts = 0
-    max_attempts = min(MAX_PENDING_KEYS + 1, max(32, len(pending_tbl) + 1))
+    max_attempts = min(
+        MAX_PENDING_KEYS + 1,
+        max(32, len(pending_tbl) + 1)
+    )
 
-    while (len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS) and attempts < max_attempts:
+    while (len(pending_tbl) >= MAX_PENDING_KEYS or
+           g_pending_events_total >= MAX_PENDING_EVENTS):
+
+        if attempts >= max_attempts:
+            pending_repair_count(pending_tbl)
+            return False
+
         attempts += 1
+
         before_keys = len(pending_tbl)
         before_count = g_pending_events_total
 
-        flushed = _flush_oldest_pending(pending_tbl, out, flows=flows, resp_flows=resp_flows)
+        flushed = _flush_oldest_pending(
+            pending_tbl,
+            out,
+            flows=flows,
+            resp_flows=resp_flows
+        )
 
-        # If flush reported failure, or no keys or events were removed, repair count
-        if not flushed or (len(pending_tbl) >= before_keys and g_pending_events_total >= before_count):
-            actual = pending_repair_count(pending_tbl)
-            if len(pending_tbl) < MAX_PENDING_KEYS and g_pending_events_total < MAX_PENDING_EVENTS:
+        if (not flushed or
+                (len(pending_tbl) >= before_keys and
+                 g_pending_events_total >= before_count)):
+
+            pending_repair_count(pending_tbl)
+
+            if (len(pending_tbl) < MAX_PENDING_KEYS and
+                    g_pending_events_total < MAX_PENDING_EVENTS):
                 return True
-            if not pending_tbl or actual == 0:
-                return True
-            break
 
-    if len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS:
-        pending_repair_count(pending_tbl)
+            return False
 
-    return (len(pending_tbl) < MAX_PENDING_KEYS and g_pending_events_total < MAX_PENDING_EVENTS)
+    return True
 
 
 def _emit_request(flows, key, fl, meta, out, pending_tbl, now, resp_flows=None):

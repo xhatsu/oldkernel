@@ -637,4 +637,38 @@ def test_pending_accounting_lifecycle_and_overflow_failsafe():
     assert nt_sniff.g_pending_events_total == 0
     nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
 
+    # 7. Single legitimate request with g_pending_events_total = 16384 (corrupted/stale)
+    # Must repair BEFORE eviction so the legitimate request is NOT evicted!
+    test_rk = ("10.0.0.2", 80, "10.0.0.1", 30001)
+    pending[test_rk] = [nt_sniff.PendingRequest({"path": "/legit"}, 500.0, 1, 999)]
+    nt_sniff.g_pending_events_total = nt_sniff.MAX_PENDING_EVENTS
+    res = nt_sniff.ensure_pending_capacity(pending, out, flows=flows, resp_flows=resp_flows)
+    assert res is True
+    assert len(pending) == 1
+    assert test_rk in pending
+    assert pending[test_rk][0].event["path"] == "/legit"
+    assert nt_sniff.g_pending_events_total == 1
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    # 8. Under-count detection in pending_take and pending_take_all
+    # Add a second request to test_rk
+    pending[test_rk].append(nt_sniff.PendingRequest({"path": "/second"}, 501.0, 1, 1000))
+    # Deliberately set counter to 0 while 2 entries exist in table
+    nt_sniff.g_pending_events_total = 0
+    # pending_take must pop first entry and repair count to 1 (2 - 1)
+    popped = nt_sniff.pending_take(pending, test_rk, 0)
+    assert popped.event["path"] == "/legit"
+    assert nt_sniff.g_pending_events_total == 1
+    assert len(pending[test_rk]) == 1
+
+    # Now set counter to 0 again, and pending_take_all must drain and repair count to 0
+    nt_sniff.g_pending_events_total = 0
+    all_popped = nt_sniff.pending_take_all(pending, test_rk)
+    assert len(all_popped) == 1
+    assert all_popped[0].event["path"] == "/second"
+    assert nt_sniff.g_pending_events_total == 0
+    assert len(pending) == 0
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+
 
