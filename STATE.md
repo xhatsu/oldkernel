@@ -3,6 +3,10 @@
 
 # STATE.md — Current Project State & Memory
 
+## Maintenance State Notice (2026-09-11)
+- **TraceScope Hub Server & Bootstrap**: Stopped for maintenance via `/home/ubuntu/Viettel/OtelTrace/run_server.sh stop`.
+- **Sessions & Ports**: `tracescope-30102` (port 30102), `tracescope-worker`, and bootstrap server (port 30105) cleanly shut down. Verified connection refused on both ports.
+
 ## Production Hardening Round 27 — TraceScope Hub Event Loop Unblocking & Thread Offload (`OtelTrace`) (2026-09-11)
 
 Eliminated 87–97% CPU event-loop blocking in the TraceScope Hub API server (`backend.main:app`) caused by synchronous database work scheduled inside coroutine background tasks:
