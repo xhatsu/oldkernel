@@ -336,4 +336,21 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   - Tested daemon installation on target node with `--mode hybrid`: verified processes running as `ntsniff`, CPU affinity CPU 0, SCHED_IDLE at nice 19, 24 MiB + 2.8 MiB RSS.
   - End-to-end capture test (`test_hybrid_e2e.py`): verified Basic auth extraction, SOAP WSSE UsernameToken extraction, response correlation (status 200, duration), traceparent propagation, zero credential leakage, and in-band capture stats forwarding to `/api/agent/stats`.
 
+## Ansible Fleet Deployment Implementation — Approach A (2026-09-11) — Round 25
+- **Design Principles**:
+  - Controller stages single-file self-contained bundle `install-firstrun-el68.sh` via `ansible/stage-bundle.sh` without compiling C++ binaries locally, eliminating glibc forward-compatibility errors on CentOS 6.8.
+  - Target nodes compile on-host with local `g++` (for `cpp`/`hybrid` mode) or execute without a compiler (for `python` mode).
+- **Automation Components**:
+  - `ansible/ansible.cfg`: Pipelining enabled, roles path configured, standard callback.
+  - `ansible/inventory/hosts.ini`: Groups `legacy_capture` and `local_test`.
+  - `ansible/group_vars/legacy_capture.yml`: Configurable Hub URL, capture interface/ports, mode (`hybrid`/`cpp`/`python`), WSSE window, and shipping rate limits.
+  - `ansible/roles/networktracing_legacy/tasks/main.yml`: Idempotent installation driven by `/etc/networktracing-legacy.deploy` configuration stamp, preflight `--check` guard before mutation, fail-closed offline execution.
+  - Playbooks: `deploy-networktracing.yml` (rolling `serial: 10%`), `verify-networktracing.yml` (fleet health audit), `uninstall-networktracing.yml` (clean fleet teardown).
+- **Verification**:
+  - Syntax check: **PASS** across all playbooks.
+  - Local test deployment: **PASS** (`ok=11 changed=4 failed=0`).
+  - Idempotency test: **PASS** (`ok=8 changed=0 skipped=3`).
+  - Fleet health audit: **PASS** (`ok=4 changed=0`).
+
+
 

@@ -1114,5 +1114,32 @@ Seven additional reproducible bugs fixed in both `nt-sniff-cpp.cpp` and `nt-snif
     * Agent Telemetry: In-band `capture_stats_v1` captured, parsed, and posted to `/api/agent/stats` with full capture, shipping, and resource metrics.
     * Pipe Closure Recovery: Exit code 74 validated when shipper pipe closes.
 
+## Round 25 — Ansible Fleet Deployment Automation (Approach A) (2026-09-11)
+- **Architecture**:
+  - Implemented Approach A: Ansible controller packages and stages the tested self-contained bundle `install-firstrun-el68.sh` via `ansible/stage-bundle.sh`.
+  - Avoids glibc version mismatches by not compiling on the controller; nodes compile on-host via local `g++` or execute under pure Python 2.6 stdlib.
+- **Directory Layout & Roles**:
+  - `ansible/ansible.cfg`: Pipelining enabled, roles path configured, standard stdout callback.
+  - `ansible/inventory/hosts.ini`: Inventory with `legacy_capture` group and `local_test` localhost target.
+  - `ansible/group_vars/legacy_capture.yml`: Central configuration parameters (`nt_hub_url`, `nt_capture_iface`, `nt_capture_ports`, `nt_capture_mode`, `nt_wsse_bytes`, `nt_ship_rate_kbps`, `nt_stats_interval_sec`).
+  - `ansible/roles/networktracing_legacy/tasks/main.yml`:
+    * Copies tested bundle to `/var/tmp/install-firstrun-el68.sh`.
+    * Computes desired configuration hash.
+    * Inspects deployed stamp `/etc/networktracing-legacy.deploy` and service status.
+    * Runs preflight check (`--check`) before mutation.
+    * Installs with `--offline` and enforces fail-closed safeguards.
+    * Stamps configuration and validates active running daemon.
+  - `ansible/deploy-networktracing.yml`: Main rolling playbook with `serial: 10%` and `max_fail_percentage: 10`.
+  - `ansible/verify-networktracing.yml`: Read-only health audit playbook checking SysV status, process list, CPU affinity, and RSS.
+  - `ansible/uninstall-networktracing.yml`: Fleet-wide service uninstallation and cleanup.
+  - `ansible/stage-bundle.sh`: Helper script to build and stage the installer bundle.
+  - `ansible/README.md`: Operator runbook.
+- **Verification Results**:
+  - Syntax check: **PASS** across all 3 playbooks.
+  - Local test deployment: **PASS** (`ok=11 changed=4 failed=0`).
+  - Idempotency re-run: **PASS** (`ok=8 changed=0 skipped=3`).
+  - Health audit: **PASS** (`ok=4 changed=0`).
+
+
 
 

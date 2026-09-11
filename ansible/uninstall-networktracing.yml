@@ -1,0 +1,24 @@
+---
+- name: Uninstall NetworkTracing Legacy Agent from Fleet
+  hosts: legacy_capture
+  become: true
+  serial: "25%"
+
+  tasks:
+    - name: Stop and uninstall service
+      ansible.builtin.command:
+        argv:
+          - /etc/init.d/networktracing-legacy
+          - uninstall
+      register: nt_uninstall_cmd
+      failed_when: false
+
+    - name: Remove deployment stamp
+      ansible.builtin.file:
+        path: /etc/networktracing-legacy.deploy
+        state: absent
+
+    - name: Clean temporary installer bundle
+      ansible.builtin.file:
+        path: /var/tmp/install-firstrun-el68.sh
+        state: absent
