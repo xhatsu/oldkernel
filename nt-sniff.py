@@ -1196,12 +1196,82 @@ g_resp_flow_fifo = deque()
 g_pending_events_total = 0
 
 
+def pending_take(pending_tbl, rk, index=0):
+    """Remove exactly one pending entry and keep global accounting correct.
+
+    Returns the PendingRequest, or None if the key/index does not exist.
+    Does NOT emit the event.
+    """
+    global g_pending_events_total
+
+    if pending_tbl is None:
+        return None
+
+    lst = pending_tbl.get(rk)
+    if not lst:
+        return None
+
+    if index < 0 or index >= len(lst):
+        return None
+
+    item = lst.pop(index)
+
+    if not lst:
+        pending_tbl.pop(rk, None)
+
+    if g_pending_events_total > 0:
+        g_pending_events_total -= 1
+    else:
+        g_pending_events_total = 0
+
+    return item
+
+
+def pending_take_all(pending_tbl, rk):
+    """Remove all pending entries for rk and keep global accounting correct.
+
+    Returns list of PendingRequests (may be empty).
+    Does NOT emit the events.
+    """
+    global g_pending_events_total
+
+    if pending_tbl is None:
+        return []
+
+    lst = pending_tbl.pop(rk, None)
+    if not lst:
+        return []
+
+    count = len(lst)
+    if g_pending_events_total >= count:
+        g_pending_events_total -= count
+    else:
+        g_pending_events_total = 0
+
+    return lst
+
+
+def pending_actual_count(pending_tbl):
+    """Count actual entries across all keys in pending_tbl."""
+    if not pending_tbl:
+        return 0
+    return sum(len(lst) for lst in pending_tbl.values())
+
+
+def pending_repair_count(pending_tbl):
+    """Repair g_pending_events_total if it drifted out of sync."""
+    global g_pending_events_total
+    actual = pending_actual_count(pending_tbl)
+    if g_pending_events_total != actual:
+        g_pending_events_total = actual
+    return actual
+
+
 def drain_pending_requests_unresolved(pending_tbl, rk, out=None, reason="unknown"):
     """Flush all uncompleted pending requests for rk without fake status or duration."""
-    global g_pending_events_total
-    if pending_tbl is None or rk not in pending_tbl:
+    if pending_tbl is None:
         return
-    lst = pending_tbl.pop(rk, None)
+    lst = pending_take_all(pending_tbl, rk)
     if not lst:
         return
     for item in lst:
@@ -1218,8 +1288,6 @@ def drain_pending_requests_unresolved(pending_tbl, rk, out=None, reason="unknown
                     out.write(json.dumps(ev) + "\n")
                     if hasattr(out, "flush"):
                         out.flush()
-        if g_pending_events_total > 0:
-            g_pending_events_total -= 1
 
 
 def reset_flow_for_resync(fl, budget=None):
@@ -1319,9 +1387,9 @@ def terminate_connection(flows, resp_flows, pending_tbl, flow_fifo=None, resp_fi
         del resp_flows[resp_k]
     if pending_tbl is not None:
         if resp_k is not None and resp_k in pending_tbl:
-            del pending_tbl[resp_k]
+            pending_take_all(pending_tbl, resp_k)
         if req_k is not None and req_k in pending_tbl:
-            del pending_tbl[req_k]
+            pending_take_all(pending_tbl, req_k)
 
 
 def ensure_flow_capacity(flows, resp_flows, flow_fifo, resp_fifo, pending_tbl,
@@ -1431,6 +1499,12 @@ def assert_internal_invariants(flows, resp_flows, pending_tbl=None, budget=None)
         assert rfl.ooo_bytes <= MAX_OOO_BYTES, "Resp flow OOO exceeds limit: %d" % rfl.ooo_bytes
         if rfl.state == HTTP_STATE_UNSYNCED:
             assert len(rfl.buf) == 0, "UNSYNCED resp flow has non-empty buf: %d" % len(rfl.buf)
+    if pending_tbl is not None:
+        actual = pending_actual_count(pending_tbl)
+        assert g_pending_events_total == actual, (
+            "Pending accounting mismatch: counter=%d actual=%d" %
+            (g_pending_events_total, actual)
+        )
 
 
 def invalidate_connection_correlation(flows, resp_flows, rk, pending_tbl=None, out=None, reason="invalidated"):
@@ -1445,15 +1519,16 @@ def is_correlation_allowed(rk, flows=None, resp_flows=None, gen=0, syn_seen=Fals
 
     Combines several vetoes: an explicitly disabled key, a caller-provided
     eligibility flag, the framing health of either direction, and -- once the
-    disabled-set overflowed -- whether this connection showed a real SYN.
+    overflow ceiling has been touched -- proof of a genuine new SYN.
     """
-    # 1) Explicitly disabled connection.
+    global corr_capacity_reached
+    # 1) Explicit disable (e.g. from an earlier overflow or parse error).
     if rk in corr_disabled:
         return False
-    # 2) Caller says this flow/generation is not trustworthy.
+    # 2) Caller-level veto (e.g. flow is un-synchronized).
     if not corr_eligible:
         return False
-    # 3) Response direction must be eligible and not broken.
+    # 3) Health of the response flow for this key.
     if resp_flows is not None:
         rfl = resp_flows.get(rk)
         if rfl is not None:
@@ -1475,24 +1550,18 @@ def is_correlation_allowed(rk, flows=None, resp_flows=None, gen=0, syn_seen=Fals
 
 def pending_del(rk):
     """Drop every pending request for rk and re-enable correlation for it."""
-    pending.pop(rk, None)
+    pending_take_all(pending, rk)
     corr_disabled_erase(rk)
 
 
 def pending_pop(rk, out, pending_tbl=None):
     """Flush the oldest pending event for this response tuple (FIN/RST or
     overflow path). Emits whatever the event has — status stays null."""
-    global g_pending_events_total
     if pending_tbl is None:
         pending_tbl = pending
-    lst = pending_tbl.get(rk)
-    if not lst:
+    item = pending_take(pending_tbl, rk, 0)
+    if item is None:
         return None
-    item = lst.pop(0)
-    if not lst:
-        pending_tbl.pop(rk, None)
-    if g_pending_events_total > 0:
-        g_pending_events_total -= 1
     is_tombstone = item[2] if len(item) > 2 else False
     if not is_tombstone:
         ev = item[0]
@@ -1809,8 +1878,9 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             # HTTP framing can be trusted, so report the 101 and lock out.
             if st == 101:
                 consume_flow_buf(rfl, head_len, g_buffer_budget)
-                if ent:
-                    item = ent[0]
+                removed = pending_take_all(pending_tbl, rk)
+                if removed:
+                    item = removed[0]
                     is_tombstone = item[2] if len(item) > 2 else False
                     if not is_tombstone:
                         ev = item[0]
@@ -1825,9 +1895,7 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                                 out.write(json.dumps(ev) + "\n")
                                 if hasattr(out, "flush"):
                                     out.flush()
-                    ent.pop(0)
-                    while ent:
-                        rem_item = ent.pop(0)
+                    for rem_item in removed[1:]:
                         if not (rem_item[2] if len(rem_item) > 2 else False):
                             if out is not None:
                                 if isinstance(out, list):
@@ -1836,7 +1904,6 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                                     out.write(json.dumps(rem_item[0]) + "\n")
                                     if hasattr(out, "flush"):
                                         out.flush()
-                    pending_tbl.pop(rk, None)
                 corr_disabled_insert(rk)
                 quarantine_connection(flows, resp_flows, pending_tbl, response_key=rk, out=out, reason="websocket_upgrade_101")
                 rfl.state = HTTP_STATE_UNSYNCED
@@ -1872,37 +1939,9 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                 # Stale generation: the queued request belongs to an older
                 # connection, so emit it un-correlated instead of mismatching.
                 if rfl.generation != 0 and gen != 0 and gen != rfl.generation:
-                    ev = item[0]
-                    if out is not None:
-                        if isinstance(out, list):
-                            out.append(ev)
-                        elif hasattr(out, "write"):
-                            out.write(json.dumps(ev) + "\n")
-                            if hasattr(out, "flush"):
-                                out.flush()
-                    ent.pop(0)
-                    if not ent:
-                        pending_tbl.pop(rk, None)
-                else:
-                    ev = item[0]
-                    # Remember HEAD so no body is expected.
-                    if ev.get("method") == "HEAD":
-                        is_head = True
-                    # Tombstone = request already emitted; drop and move on.
-                    if is_tombstone:
-                        ent.pop(0)
-                        if not ent:
-                            pending_tbl.pop(rk, None)
-                    else:
-                        # Attach status/duration_ms/resp_bytes to the match.
-                        started = item[1]
-                        ent.pop(0)
-                        if not ent:
-                            pending_tbl.pop(rk, None)
-                        ev["status"] = st
-                        ev["duration_ms"] = max(0, int((now - started) * 1000))
-                        if clen is not None:
-                            ev["resp_bytes"] = clen
+                    titem = pending_take(pending_tbl, rk, 0)
+                    if titem is not None:
+                        ev = titem[0]
                         if out is not None:
                             if isinstance(out, list):
                                 out.append(ev)
@@ -1910,6 +1949,31 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                                 out.write(json.dumps(ev) + "\n")
                                 if hasattr(out, "flush"):
                                     out.flush()
+                else:
+                    ev = item[0]
+                    # Remember HEAD so no body is expected.
+                    if ev.get("method") == "HEAD":
+                        is_head = True
+                    # Tombstone = request already emitted; drop and move on.
+                    if is_tombstone:
+                        pending_take(pending_tbl, rk, 0)
+                    else:
+                        # Attach status/duration_ms/resp_bytes to the match.
+                        started = item[1]
+                        titem = pending_take(pending_tbl, rk, 0)
+                        if titem is not None:
+                            ev = titem[0]
+                            ev["status"] = st
+                            ev["duration_ms"] = max(0, int((now - started) * 1000))
+                            if clen is not None:
+                                ev["resp_bytes"] = clen
+                            if out is not None:
+                                if isinstance(out, list):
+                                    out.append(ev)
+                                elif hasattr(out, "write"):
+                                    out.write(json.dumps(ev) + "\n")
+                                    if hasattr(out, "flush"):
+                                        out.flush()
 
             # Consume the head just processed.
             consume_flow_buf(rfl, head_len, g_buffer_budget)
@@ -2063,13 +2127,11 @@ def correlate_response(pending_tbl, rk, payload, now, out, resp_flows=None, seq=
         if head_len is not None and len(payload) > head_len:
             return correlate_response(pending_tbl, rk, payload[head_len:], now, out)
         return False
-    ent = pending_tbl.get(rk)
-    if not ent:
+    item = pending_take(pending_tbl, rk, 0)
+    if item is None:
         return False
     # Consume exactly one request (pipelining-safe) and enrich it.
-    ev, started = ent.pop(0)
-    if not ent:
-        pending_tbl.pop(rk, None)
+    ev, started = item[0], item[1]
     ev["status"] = st
     ev["duration_ms"] = max(0, int((now - started) * 1000))
     if clen is not None:
@@ -2404,6 +2466,82 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     return ev if (dport in ports or h.get("_method")) else None
 
 
+def _flush_oldest_pending(pending_tbl, out, flows=None, resp_flows=None):
+    """Overflow guard: emit all events for the oldest pending key and lock it out.
+
+    Returns True if at least one key/entry was flushed, False otherwise.
+    """
+    if not pending_tbl:
+        return False
+
+    oldest_key, oldest_ts = None, None
+    for rk, lst in pending_tbl.items():
+        if not lst:
+            continue
+        ts = lst[0][1]
+        if oldest_ts is None or ts < oldest_ts:
+            oldest_key, oldest_ts = rk, ts
+
+    if oldest_key is None:
+        pending_tbl.clear()
+        pending_repair_count(pending_tbl)
+        return False
+
+    had_entries = False
+    while pending_tbl.get(oldest_key):
+        pending_pop(oldest_key, out, pending_tbl)
+        had_entries = True
+
+    invalidate_connection_correlation(flows, resp_flows, oldest_key)
+    pending_take_all(pending_tbl, oldest_key)
+    return True
+
+
+def ensure_pending_capacity(pending_tbl, out, flows=None, resp_flows=None):
+    """Ensure pending_tbl has room for at least one new entry.
+
+    Returns True if capacity is available, False if capacity could not be made.
+    Guarantees structural termination: bounded loop, forward-progress checks,
+    and automatic accounting repair if corruption is detected.
+    """
+    global g_pending_events_total
+
+    if pending_tbl is None:
+        return True
+
+    # Pre-repair if counter drifted wildly or went negative
+    if g_pending_events_total < 0 or g_pending_events_total > (MAX_PENDING_EVENTS * 2):
+        pending_repair_count(pending_tbl)
+
+    # Fast path: already within capacity
+    if len(pending_tbl) < MAX_PENDING_KEYS and g_pending_events_total < MAX_PENDING_EVENTS:
+        return True
+
+    attempts = 0
+    max_attempts = min(MAX_PENDING_KEYS + 1, max(32, len(pending_tbl) + 1))
+
+    while (len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS) and attempts < max_attempts:
+        attempts += 1
+        before_keys = len(pending_tbl)
+        before_count = g_pending_events_total
+
+        flushed = _flush_oldest_pending(pending_tbl, out, flows=flows, resp_flows=resp_flows)
+
+        # If flush reported failure, or no keys or events were removed, repair count
+        if not flushed or (len(pending_tbl) >= before_keys and g_pending_events_total >= before_count):
+            actual = pending_repair_count(pending_tbl)
+            if len(pending_tbl) < MAX_PENDING_KEYS and g_pending_events_total < MAX_PENDING_EVENTS:
+                return True
+            if not pending_tbl or actual == 0:
+                return True
+            break
+
+    if len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS:
+        pending_repair_count(pending_tbl)
+
+    return (len(pending_tbl) < MAX_PENDING_KEYS and g_pending_events_total < MAX_PENDING_EVENTS)
+
+
 def _emit_request(flows, key, fl, meta, out, pending_tbl, now, resp_flows=None):
     """Discard capture buffers, then emit/queue the sanitized event only."""
     global g_pending_events_total
@@ -2446,8 +2584,15 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now, resp_flows=None):
     # global key cap and a per-connection entry cap.
     ent = pending_tbl.get(rk)
     if ent is None:
-        while len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS:
-            _flush_oldest_pending(pending_tbl, out, flows=flows, resp_flows=resp_flows)
+        if not ensure_pending_capacity(pending_tbl, out, flows=flows, resp_flows=resp_flows):
+            if out is not None:
+                if isinstance(out, list):
+                    out.append(ev)
+                elif hasattr(out, "write"):
+                    out.write(json.dumps(ev) + "\n")
+                    if hasattr(out, "flush"):
+                        out.flush()
+            return
         ent = pending_tbl[rk] = []
     elif len(ent) >= PENDING_PER_FLOW:
         while pending_tbl.get(rk):
@@ -2462,8 +2607,16 @@ def _emit_request(flows, key, fl, meta, out, pending_tbl, now, resp_flows=None):
                     out.flush()
         return
 
-    while g_pending_events_total >= MAX_PENDING_EVENTS:
-        _flush_oldest_pending(pending_tbl, out, flows=flows, resp_flows=resp_flows)
+    if g_pending_events_total >= MAX_PENDING_EVENTS:
+        if not ensure_pending_capacity(pending_tbl, out, flows=flows, resp_flows=resp_flows):
+            if out is not None:
+                if isinstance(out, list):
+                    out.append(ev)
+                elif hasattr(out, "write"):
+                    out.write(json.dumps(ev) + "\n")
+                    if hasattr(out, "flush"):
+                        out.flush()
+            return
         ent = pending_tbl.get(rk)
         if ent is None:
             ent = pending_tbl[rk] = []
@@ -2523,8 +2676,15 @@ def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_t
         return 0
     ent = pending_tbl.get(rk)
     if ent is None:
-        while len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS:
-            _flush_oldest_pending(pending_tbl, out, flows=flows, resp_flows=resp_flows)
+        if not ensure_pending_capacity(pending_tbl, out, flows=flows, resp_flows=resp_flows):
+            if out is not None:
+                if isinstance(out, list):
+                    out.append(ev)
+                elif hasattr(out, "write"):
+                    out.write(json.dumps(ev) + "\n")
+                    if hasattr(out, "flush"):
+                        out.flush()
+            return 0
         ent = pending_tbl[rk] = []
     elif len(ent) >= PENDING_PER_FLOW:
         while pending_tbl.get(rk):
@@ -2539,8 +2699,16 @@ def _emit_request_to_pending(ev, head_bytes, first_byte_ts, meta, out, pending_t
                     out.flush()
         return 0
 
-    while g_pending_events_total >= MAX_PENDING_EVENTS:
-        _flush_oldest_pending(pending_tbl, out, flows=flows, resp_flows=resp_flows)
+    if g_pending_events_total >= MAX_PENDING_EVENTS:
+        if not ensure_pending_capacity(pending_tbl, out, flows=flows, resp_flows=resp_flows):
+            if out is not None:
+                if isinstance(out, list):
+                    out.append(ev)
+                elif hasattr(out, "write"):
+                    out.write(json.dumps(ev) + "\n")
+                    if hasattr(out, "flush"):
+                        out.flush()
+            return 0
         ent = pending_tbl.get(rk)
         if ent is None:
             ent = pending_tbl[rk] = []
@@ -3298,27 +3466,11 @@ def process_packet(pkt, ports, node_host, flows, resp_flows, pending_tbl, out, n
     return False
 
 
-def _flush_oldest_pending(pending_tbl, out, flows=None, resp_flows=None):
-    """Overflow guard: emit all events for the oldest pending key and lock it out."""
-    # Find the pending key whose oldest queued request is the earliest.
-    oldest_key, oldest_ts = None, None
-    for rk, lst in pending_tbl.items():
-        if not lst:
-            continue
-        ts = lst[0][1]
-        if oldest_ts is None or ts < oldest_ts:
-            oldest_key, oldest_ts = rk, ts
-    # Emit every entry for that key, then persistently disable correlation for
-    # it (its response ordering can no longer be trusted).
-    if oldest_key is not None:
-        while pending_tbl.get(oldest_key):
-            pending_pop(oldest_key, out, pending_tbl)
-        invalidate_connection_correlation(flows, resp_flows, oldest_key)
-        pending_tbl.pop(oldest_key, None)
-
-
 def sweep_pending(pending_tbl, now, out, flows=None, resp_flows=None):
     """TTL flush: emit requests whose responses never showed up."""
+    # Periodic self-healing invariant check
+    pending_repair_count(pending_tbl)
+
     # Iterate over a snapshot of the keys; entries are mutated below.
     for rk in list(pending_tbl.keys()):
         lst = pending_tbl.get(rk)
@@ -3337,15 +3489,13 @@ def sweep_pending(pending_tbl, now, out, flows=None, resp_flows=None):
                     # Tombstone expired un-consumed: ordering is now ambiguous.
                     # Flush all remaining entries immediately and persistently
                     # disable response correlation for this connection until SYN.
-                    lst.pop(i)
-                    while i < len(lst):
-                        tail = lst[i]
-                        tail_tomb = tail[2] if len(tail) > 2 else False
-                        if not tail_tomb:
-                            out.append(tail[0])
-                        lst.pop(i)
+                    rem_entries = pending_take_all(pending_tbl, rk)
+                    for rem_item in rem_entries:
+                        rem_tomb = rem_item[2] if len(rem_item) > 2 else False
+                        if not rem_tomb:
+                            out.append(rem_item[0])
                     invalidate_connection_correlation(flows, resp_flows, rk)
-                    # Leave i unchanged; the while condition will exit naturally
+                    break
                 else:
                     i += 1
             # Live request whose response never arrived within PENDING_TTL:
@@ -3360,9 +3510,8 @@ def sweep_pending(pending_tbl, now, out, flows=None, resp_flows=None):
                 i += 1
             else:
                 i += 1
-        if not lst:
+        if not pending_tbl.get(rk):
             pending_tbl.pop(rk, None)
-
 
 
 def drain_pending(pending_tbl, out):
@@ -3374,13 +3523,14 @@ def drain_pending(pending_tbl, out):
     """
     # Emit every non-tombstone request, ignoring response correlation.
     for rk in list(pending_tbl.keys()):
-        lst = pending_tbl.pop(rk, None)
+        lst = pending_take_all(pending_tbl, rk)
         if lst:
             for item in lst:
                 is_tomb = item[2] if len(item) > 2 else False
                 if not is_tomb:
                     out.append(item[0])
     corr_disabled_clear()
+    pending_repair_count(pending_tbl)
 
 
 

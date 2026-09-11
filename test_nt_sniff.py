@@ -527,3 +527,114 @@ def test_rlimit_as_enforced():
     except Exception:
         pass
 
+
+def _make_tcp_pkt(src_ip_str, sport, dst_ip_str, dport, seq, ack, flags, payload):
+    import socket, struct
+    src_ip = socket.inet_aton(src_ip_str)
+    dst_ip = socket.inet_aton(dst_ip_str)
+    eth = b"\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x08\x00"
+    tot_len = 20 + 20 + len(payload)
+    ip_hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, tot_len, 100, 0x4000, 64, 6, 0, src_ip, dst_ip)
+    tcp_hdr = struct.pack("!HHIIBBHHH", sport, dport, seq, ack, (5 << 4), flags, 65535, 0, 0)
+    return eth + ip_hdr + tcp_hdr + payload
+
+
+def test_pending_accounting_lifecycle_and_overflow_failsafe():
+    """Verify pending accounting never leaks across lifecycles and overflow protection is failsafe."""
+    flows = {}
+    resp_flows = {}
+    pending = {}
+    out = []
+
+    # Reset global accounting before starting test
+    nt_sniff.g_pending_events_total = 0
+    nt_sniff.corr_disabled_clear()
+
+    # 1. 500 requests + 500 responses lifecycle
+    for i in range(500):
+        src_port = 10000 + i
+        syn_pkt = _make_tcp_pkt("10.0.0.1", src_port, "10.0.0.2", 80, 1000 + i * 100, 0, 0x02, b"")
+        req_pkt = _make_tcp_pkt("10.0.0.1", src_port, "10.0.0.2", 80, 1001 + i * 100, 0, 0x18,
+                                b"GET /req%d HTTP/1.1\r\nHost: example.com\r\n\r\n" % i)
+        nt_sniff.process_packet(syn_pkt, {80}, "node", flows, resp_flows, pending, out, now=10.0 + i * 0.01)
+        nt_sniff.process_packet(req_pkt, {80}, "node", flows, resp_flows, pending, out, now=10.0 + i * 0.01)
+
+    assert nt_sniff.g_pending_events_total == len(pending) == 500
+    assert nt_sniff.pending_actual_count(pending) == 500
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    for i in range(500):
+        src_port = 10000 + i
+        resp_pkt = _make_tcp_pkt("10.0.0.2", 80, "10.0.0.1", src_port, 5000 + i * 100, 0, 0x18,
+                                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        nt_sniff.process_packet(resp_pkt, {80}, "node", flows, resp_flows, pending, out, now=20.0 + i * 0.01)
+
+    assert nt_sniff.g_pending_events_total == 0
+    assert len(pending) == 0
+    assert nt_sniff.pending_actual_count(pending) == 0
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    # 2. WebSocket 101 upgrade accounting
+    syn_pkt = _make_tcp_pkt("10.0.0.1", 20001, "10.0.0.2", 80, 50000, 0, 0x02, b"")
+    req_pkt = _make_tcp_pkt("10.0.0.1", 20001, "10.0.0.2", 80, 50001, 0, 0x18,
+                            b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n")
+    nt_sniff.process_packet(syn_pkt, {80}, "node", flows, resp_flows, pending, out, now=200.0)
+    nt_sniff.process_packet(req_pkt, {80}, "node", flows, resp_flows, pending, out, now=200.0)
+    assert nt_sniff.g_pending_events_total == 1
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    resp_101 = _make_tcp_pkt("10.0.0.2", 80, "10.0.0.1", 20001, 70000, 0, 0x18,
+                             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+    nt_sniff.process_packet(resp_101, {80}, "node", flows, resp_flows, pending, out, now=200.1)
+    assert nt_sniff.g_pending_events_total == 0
+    assert len(pending) == 0
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    # 3. RST teardown accounting
+    syn_pkt = _make_tcp_pkt("10.0.0.1", 20002, "10.0.0.2", 80, 60000, 0, 0x02, b"")
+    req_pkt = _make_tcp_pkt("10.0.0.1", 20002, "10.0.0.2", 80, 60001, 0, 0x18,
+                            b"GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    nt_sniff.process_packet(syn_pkt, {80}, "node", flows, resp_flows, pending, out, now=300.0)
+    nt_sniff.process_packet(req_pkt, {80}, "node", flows, resp_flows, pending, out, now=300.0)
+    assert nt_sniff.g_pending_events_total == 1
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    rst_pkt = _make_tcp_pkt("10.0.0.2", 80, "10.0.0.1", 20002, 80000, 0, 0x04, b"")
+    nt_sniff.process_packet(rst_pkt, {80}, "node", flows, resp_flows, pending, out, now=300.1)
+    assert nt_sniff.g_pending_events_total == 0
+    assert len(pending) == 0
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    # 4. Tombstone expiration sweep accounting
+    syn_pkt = _make_tcp_pkt("10.0.0.1", 20003, "10.0.0.2", 80, 70000, 0, 0x02, b"")
+    req_pkt = _make_tcp_pkt("10.0.0.1", 20003, "10.0.0.2", 80, 70001, 0, 0x18,
+                            b"GET /timeout HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    nt_sniff.process_packet(syn_pkt, {80}, "node", flows, resp_flows, pending, out, now=400.0)
+    nt_sniff.process_packet(req_pkt, {80}, "node", flows, resp_flows, pending, out, now=400.0)
+    assert nt_sniff.g_pending_events_total == 1
+
+    # Sweep after PENDING_TTL converts to tombstone
+    nt_sniff.sweep_pending(pending, 400.0 + nt_sniff.PENDING_TTL + 0.1, out, flows=flows, resp_flows=resp_flows)
+    assert nt_sniff.g_pending_events_total == 1
+
+    # Sweep after tombstone expiry (10s) removes tombstone and clears connection
+    nt_sniff.sweep_pending(pending, 400.0 + nt_sniff.PENDING_TTL + 15.0, out, flows=flows, resp_flows=resp_flows)
+    assert nt_sniff.g_pending_events_total == 0
+    assert len(pending) == 0
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    # 5. Corruption resilience: g_pending_events_total corrupted to MAX_PENDING_EVENTS with empty table
+    nt_sniff.g_pending_events_total = nt_sniff.MAX_PENDING_EVENTS + 500
+    res = nt_sniff.ensure_pending_capacity(pending, out, flows=flows, resp_flows=resp_flows)
+    assert res is True
+    assert nt_sniff.g_pending_events_total == 0
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+    # 6. Corruption resilience: g_pending_events_total corrupted to negative value
+    nt_sniff.g_pending_events_total = -42
+    res = nt_sniff.ensure_pending_capacity(pending, out, flows=flows, resp_flows=resp_flows)
+    assert res is True
+    assert nt_sniff.g_pending_events_total == 0
+    nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
+
+

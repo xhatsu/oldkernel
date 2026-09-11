@@ -3,6 +3,52 @@
 
 # STATE.md — Current Project State & Memory
 
+## Production Hardening Round 26 — Centralized Pending Accounting & Failsafe Overflow Protection (`nt-sniff.py`) (2026-09-11)
+
+Eliminated pending-entry accounting leaks and infinite 100% CPU overflow busy-loops in `nt-sniff.py` by centralizing all removal paths into authoritative accounting primitives, bounding loop termination, and adding automatic counter repair:
+
+1. **Centralized Accounting Primitives**:
+   - `pending_take(pending_tbl, rk, index=0)`: Pops entry at `index`, safely decrements `g_pending_events_total` (clamped to $\ge 0$), removes key from dict when list is empty, and returns the `PendingRequest`.
+   - `pending_take_all(pending_tbl, rk)`: Pops entire list `pending_tbl.pop(rk, None)`, decrements `g_pending_events_total -= len(lst)` safely, and returns the list.
+   - `pending_actual_count(pending_tbl)`: Authoritative sum of `len(lst)` across all keys in `pending_tbl`.
+   - `pending_repair_count(pending_tbl)`: Compares `actual` with `g_pending_events_total` and synchronizes counter.
+
+2. **Elimination of All Direct List/Dict Mutation Bypasses**:
+   - In `handle_response`:
+     * HTTP 101 WebSocket Upgrade: Uses `removed = pending_take_all(pending_tbl, rk)`. First request emitted with status 101, all subsequent pipelined requests emitted uncorrelated (`status: null`), cleanly draining all entries and updating accounting.
+     * Stale Generation: Uses `titem = pending_take(pending_tbl, rk, 0)` and emits `titem[0]`.
+     * Tombstone: Uses `pending_take(pending_tbl, rk, 0)` to drop expired entry.
+     * Matched Response: Uses `titem = pending_take(pending_tbl, rk, 0)` and enriches `titem[0]`.
+   - In `correlate_response`: Uses `item = pending_take(pending_tbl, rk, 0)`.
+   - In `drain_pending_requests_unresolved`: Uses `lst = pending_take_all(pending_tbl, rk)`.
+   - In `terminate_connection`: Uses `pending_take_all(pending_tbl, resp_k)` and `pending_take_all(pending_tbl, req_k)`.
+   - In `pending_del`: Uses `pending_take_all(pending, rk)` and `corr_disabled_erase(rk)`.
+   - In `pending_pop`: Uses `item = pending_take(pending_tbl, rk, 0)`.
+   - In `sweep_pending`: Uses `rem_entries = pending_take_all(pending_tbl, rk)` on expired tombstones.
+   - In `drain_pending`: Uses `lst = pending_take_all(pending_tbl, rk)` and synchronizes via `pending_repair_count`.
+
+3. **Structural Loop Termination & Failsafe Overflow Protection (`ensure_pending_capacity`)**:
+   - Replaced unbounded `while len(pending_tbl) >= MAX_PENDING_KEYS or g_pending_events_total >= MAX_PENDING_EVENTS:` in `_emit_request` and `_emit_request_to_pending` with `ensure_pending_capacity(pending_tbl, out, flows, resp_flows)`.
+   - Pre-repairs if counter is negative or $> 2 \times \text{MAX\_PENDING\_EVENTS}$.
+   - Fast path returns immediately if within limits.
+   - Bounds loop attempts to `min(MAX_PENDING_KEYS + 1, ...)`.
+   - Forward progress verification: If `_flush_oldest_pending` frees nothing or keys/events do not decrease, triggers `pending_repair_count(pending_tbl)`.
+   - Fail-closed correlation: If capacity cannot be made, returns `False`, causing `_emit_request` / `_emit_request_to_pending` to emit request immediately with `status: null` (uncorrelated) rather than hanging or spinning at 100% CPU.
+
+4. **Continuous Invariant Verification & Self-Healing**:
+   - `assert_internal_invariants` validates `g_pending_events_total == pending_actual_count(pending_tbl)` whenever `pending_tbl is not None`.
+   - `sweep_pending` runs periodic self-healing `pending_repair_count(pending_tbl)` on every sweep tick.
+
+### Test Results After Round 26 Implementation
+
+| Suite | Result |
+|---|---|
+| `pytest test_nt_sniff.py` | **27/27 PASS** (includes comprehensive lifecycle, WebSocket 101, RST, tombstone, and corrupted-counter failsafe tests) |
+| `pytest test_nt_ship.py` | **15/15 PASS** |
+| `python3 test_synthetic_harness.py` | **124/124 PASS** (Tests 1–62 across both C++ and Python engines) |
+| `python3 test_pcap_suite.py` | PCAP 247: 109 events ✓; PCAP 249: 6,216 events (C++), 6,077 events (Python), zero secret leaks ✓ |
+| `sh build-firstrun.sh` | **750,465 bytes** bundle rebuilt & verified |
+
 ## Production Hardening Round 23 — Python Sniffer Stability-Hardening (`nt-sniff.py`) (2026-09-11)
 
 Implemented complete Python Capture Engine Stability-Hardening plan in `nt-sniff.py` under strict **Python 2.6 stdlib compatibility** and host resource bounds:
