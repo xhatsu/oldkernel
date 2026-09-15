@@ -1236,6 +1236,57 @@ Seven additional reproducible bugs fixed in both `nt-sniff-cpp.cpp` and `nt-snif
   - Idempotency re-run: **PASS** (`ok=8 changed=0 skipped=3`).
   - Health audit: **PASS** (`ok=4 changed=0`).
 
+## Round 28 — Authenticated Stats-Response Control & Sniffer CPU (2026-09-15)
+- **Control Transport**:
+  - Reuses the successful `POST /api/agent/stats` response in Python, C++, and
+    hybrid shipping modes; no separate 60-second probe or egress allowance.
+  - Backward-compatible acknowledgement responses with no `command` continue
+    to work unchanged.
+- **Hub Response Contract**:
+  - Optional flat control fields are `control_version: 1`, `command: "off"`,
+    `command_id`, integer `issued_at`, integer `expires_at`, and a lowercase
+    HMAC-SHA256 `signature`.
+  - Canonical signed UTF-8 bytes are
+    `v1\n<node>\n<command_id>\n<command>\n<issued_at>\n<expires_at>\n`.
+  - Responses are restricted to HTTP 2xx, explicit bounded bodies (4096 bytes
+    maximum), command IDs matching `[A-Za-z0-9._:-]{1,128}`, a maximum
+    600-second lifetime, and 300 seconds of clock-skew tolerance.
+- **Application & Lifecycle**:
+  - `nt_control.py` supplies Python 2.6-compatible signing, validation,
+    constant-time comparison, bounded token loading, and atomic receipts.
+  - `nt-ship-cpp.cpp` supplies an in-process C++03 SHA-256/HMAC implementation,
+    strict bounded HTTP response reading, signed-command validation, and atomic
+    receipt persistence without third-party libraries.
+  - Receipt path is `/var/lib/networktracing/stats-control-applied.json`.
+    Applying `off` selects exit status 0 so the supervisor does not restart the
+    intentionally stopped pipeline. A stopped service must be started by the
+    operator/service manager; it cannot receive an `on` command while stopped.
+- **Capture CPU Metrics**:
+  - `nt-sniff.py` and `nt-sniff-cpp.cpp` now report
+    `capture.cpu_user_seconds`, `capture.cpu_system_seconds`, and
+    `capture.cpu_percent_one_core` in each stats sample.
+  - `resources.*` continues to describe the shipper process for split
+    pipelines.
+- **Verification**:
+  - `pytest -q`: **70/70 PASS**.
+  - `test_synthetic_harness.py`: **124/124 PASS**.
+  - `cpp-edge-test.py`: **ALL PASS** under ASAN/UBSAN, including authenticated
+    native HTTP response and clean-stop behavior.
+  - `test_pcap_suite.py`: PCAP 247 109/109 events; PCAP 249 6,216 C++ and 6,077
+    Python events; zero secret leakage. Live veth skipped without
+    `CAP_NET_ADMIN`.
+  - C++03 strict builds, Python syntax, POSIX shell syntax, and diff whitespace
+    checks: **PASS**.
+  - CentOS 6.8 x86_64 prebuilts refreshed with GCC 4.4.7 and verified on the
+    stock CentOS 6.8 image; bundle rebuilt as `install-firstrun-el68.sh`
+    (**1,133,513 bytes**).
 
-
-
+## Round 29 — OTLP Collector Export Foundation (2026-09-15)
+- Python and C++ shippers accept `--export-mode hub|otlp` and
+  `--otlp-traces-endpoint`; OTLP mode posts bounded OTLP/HTTP JSON to
+  `/v1/traces` while retaining Hub mode as the default.
+- Capture events now distinguish received W3C context from generated roots and
+  carry local `span_id` and optional `parent_span_id`. Trusted IPv4 proxy CIDRs
+  control when XFF may replace the packet peer as caller.
+- Collector mode deliberately suppresses Hub stats/control posts. Body capture
+  remains header-only by default; existing WSSE bounded scanning is unchanged.

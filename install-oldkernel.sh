@@ -23,6 +23,8 @@
 #                NT_CPU_CORE=N (default: first CPU allowed for the installer)
 #                NT_SHIP_THREADS=1..8 NT_SHIP_RATE_KBPS=64..10000
 #                NT_STATS_INTERVAL_SEC=10..300 (default: 30)
+#                NT_EXPORT_MODE=hub|otlp (default: hub)
+#                NT_TRUSTED_PROXY_CIDRS=a.b.c.d/prefix,... (optional IPv4 XFF trust list)
 set -u
 
 PREFIX=/opt/networktracing-legacy
@@ -40,6 +42,8 @@ KIT_URLS="${NT_HUB:-}"
 CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
 WSSE_BODY_BYTES="${NT_WSSE_BODY_BYTES:-0}"
+EXPORT_MODE="${NT_EXPORT_MODE:-hub}"
+TRUSTED_PROXY_CIDRS="${NT_TRUSTED_PROXY_CIDRS:-}"
 CPU_CORE="${NT_CPU_CORE:-}"
 TOKEN_INPUT_FILE=""
 ALLOW_KIT_FETCH=1
@@ -63,6 +67,8 @@ Usage: install-firstrun-el68.sh --server URL [options]
   --ship-threads N          Python poster threads, 1..8 (default: 4)
   --ship-rate-kbps N        Egress ceiling, 64..10000 kbit/s (default: 1024)
   --stats-interval-sec N    Agent statistics interval, 10..300s (default: 30)
+  --export-mode hub|otlp    Send Hub events or OTLP traces (default: hub)
+  --trusted-proxy-cidrs L   Comma-separated IPv4 CIDRs allowed to supply XFF
   --control-token-file FILE Read the control token from FILE
   --offline                 Use only local/embedded kit; never fetch fallback
   --check                   Preflight only; make no installation changes
@@ -85,6 +91,8 @@ while [ $# -gt 0 ]; do
         --ship-threads) need_value "$@"; SHIPPERS="$2"; shift 2 ;;
         --ship-rate-kbps) need_value "$@"; SHIP_RATE_KBPS="$2"; shift 2 ;;
         --stats-interval-sec) need_value "$@"; STATS_INTERVAL_SEC="$2"; shift 2 ;;
+        --export-mode) need_value "$@"; EXPORT_MODE="$2"; shift 2 ;;
+        --trusted-proxy-cidrs) need_value "$@"; TRUSTED_PROXY_CIDRS="$2"; shift 2 ;;
         --control-token-file) need_value "$@"; TOKEN_INPUT_FILE="$2"; shift 2 ;;
         --offline)  ALLOW_KIT_FETCH=0; shift ;;
         --install)  MODE=install; shift ;;
@@ -334,6 +342,7 @@ else
 fi
 
 [ -n "$ENDPOINT" ] || die "--endpoint http://hub:port required"
+case "$EXPORT_MODE" in hub|otlp) ;; *) die "--export-mode must be hub or otlp" ;; esac
 
 # Runtime containment is mandatory. Pick the first CPU from the installer's
 # allowed cpuset unless explicitly selected, then prove it is bindable before
@@ -351,7 +360,7 @@ taskset -c "$CPU_CORE" true >/dev/null 2>&1 \
 taskset -c "$CPU_CORE" chrt -i 0 nice -n 19 true >/dev/null 2>&1 \
     || die "cannot enforce SCHED_IDLE, nice 19, and CPU affinity"
 
-if have curl; then
+if have curl && [ "$EXPORT_MODE" = hub ]; then
     PROBE=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
         -d '{"node":"legacy-compat-probe","events":[]}' \
         "$ENDPOINT/api/ingest" 2>/dev/null) || PROBE=""
@@ -360,8 +369,10 @@ if have curl; then
         "") die "hub $ENDPOINT unreachable" ;;
         *)  log "WARN: unexpected hub reply '$PROBE' — continuing" ;;
     esac
-else
+elif ! have curl; then
     log "WARN: curl absent — cannot probe hub before installing"
+else
+    log "OTLP mode: skipping Hub ingest preflight"
 fi
 
 IFACE="${IFACE:-$(awk 'NR==2{print $1}' /proc/net/route)}"
@@ -410,10 +421,21 @@ if [ -f "$SCRIPT_DIR/nt-sniff-cpp" ] && [ -x "$SCRIPT_DIR/nt-sniff-cpp" ]; then
 elif [ -f "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" ] && [ -x "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" ]; then
     cp -f "$SCRIPT_DIR/bin/el68-x86_64/nt-sniff-cpp" "$PREFIX/nt-sniff-cpp"
 fi
+
 if [ -f "$SCRIPT_DIR/nt-ship-cpp" ] && [ -x "$SCRIPT_DIR/nt-ship-cpp" ]; then
     cp -f "$SCRIPT_DIR/nt-ship-cpp" "$PREFIX/nt-ship-cpp"
 elif [ -f "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" ] && [ -x "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" ]; then
     cp -f "$SCRIPT_DIR/bin/el68-x86_64/nt-ship-cpp" "$PREFIX/nt-ship-cpp"
+fi
+
+# Older embedded native binaries predate the OTLP exporter.  Never select one
+# for an OTLP install: force the just-copied C++03 source to be compiled, or
+# fail safely if the target lacks a compiler.
+if [ "$EXPORT_MODE" = otlp ] && [ -x "$PREFIX/nt-ship-cpp" ]; then
+    if ! "$PREFIX/nt-ship-cpp" --help 2>/dev/null | grep -- '--export-mode' >/dev/null 2>&1; then
+        rm -f "$PREFIX/nt-ship-cpp"
+        log "embedded native shipper lacks OTLP support; source rebuild required"
+    fi
 fi
 if [ -f "$SCRIPT_DIR/install-oldkernel.sh" ]; then
     cp "$SCRIPT_DIR/install-oldkernel.sh" "$PREFIX/install-oldkernel.sh"
@@ -464,6 +486,12 @@ if [ -n "${NT_CONTROL_TOKEN:-}" ]; then
 fi
 if [ "$SNIFF_AS" != root ]; then
     chown "$SNIFF_USER" /var/lib/networktracing 2>/dev/null || true
+    if [ -f "$CONTROL_TOKEN_FILE" ]; then
+        chown "$SNIFF_USER" "$CONTROL_TOKEN_FILE" 2>/dev/null \
+            || die "cannot assign protected control token to runtime user"
+        chmod 600 "$CONTROL_TOKEN_FILE" \
+            || die "cannot protect control token file"
+    fi
 fi
 
 # sniff.log is appended by $SNIFF_USER inside su -c; pre-create it or the
@@ -507,7 +535,7 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     [ "$SNIFF_AS" != root ] \
         || die "safe rootless C++ capture unavailable; refusing to run the agent as root"
     SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --stats-interval-sec $STATS_INTERVAL_SEC --wsse-body-bytes $WSSE_BODY_BYTES'"
-    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
+    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --export-mode $EXPORT_MODE --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
     EXPECTED_SHIP=nt-ship-cpp
     log "native C++ nonblocking capture + bounded shipper pipeline selected"
@@ -525,7 +553,7 @@ elif [ "$CAPTURE_MODE" = "hybrid" ] || [ "$CAPTURE_MODE" = "py-cpp" ]; then
     [ "$SNIFF_AS" != root ] \
         || die "safe rootless Python capture unavailable; refusing to run the agent as root"
     SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES'"
-    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
+    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --export-mode $EXPORT_MODE --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
     EXPECTED_SHIP=nt-ship-cpp
     log "hybrid mode (Python capture + native bounded C++ shipper) selected"
@@ -535,7 +563,7 @@ else
     else
         SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES"
     fi
-    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT'"
+    SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT --export-mode $EXPORT_MODE'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
     EXPECTED_SHIP=nt-ship.py
 fi
@@ -561,6 +589,8 @@ export NT_SHIP_THREADS=$SHIPPERS
 export NT_SHIP_RATE_KBPS=$SHIP_RATE_KBPS
 export NT_STATS_INTERVAL_SEC=$STATS_INTERVAL_SEC
 export NT_WSSE_BODY_BYTES=$WSSE_BODY_BYTES
+export NT_EXPORT_MODE=$EXPORT_MODE
+export NT_TRUSTED_PROXY_CIDRS=$TRUSTED_PROXY_CIDRS
 CPU_CORE=$CPU_CORE
 PIDFILE=/var/run/networktracing-legacy.pid
 CONTROL_FILE=/var/lib/networktracing/remote-desired.json

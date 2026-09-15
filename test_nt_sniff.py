@@ -99,6 +99,12 @@ def test_wsse_configuration_bounds():
         nt_sniff.parse_wsse_body_bytes(nt_sniff.MAX_WSSE_BODY_BYTES + 1)
 
 
+def test_xff_is_used_only_for_configured_trusted_proxy(monkeypatch):
+    monkeypatch.setenv("NT_TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
+    assert nt_sniff.caller_from_xff("10.0.0.9", "198.51.100.8, 10.0.0.2") == ("198.51.100.8", "xff")
+    assert nt_sniff.caller_from_xff("192.0.2.9", "198.51.100.8") == ("192.0.2.9", "peer")
+
+
 def test_dual_auth_reports_wsse_primary_and_both_users():
     head, raw = request(soap(OASIS_2004, "soap.user"),
                         "Basic YmFzaWMudXNlcjpwYXNzd29yZA==")
@@ -669,6 +675,5 @@ def test_pending_accounting_lifecycle_and_overflow_failsafe():
     assert nt_sniff.g_pending_events_total == 0
     assert len(pending) == 0
     nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
-
 
 

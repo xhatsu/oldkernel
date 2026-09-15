@@ -3,7 +3,7 @@
   hosts: legacy_capture
   gather_facts: false
   become: true
-  serial: "100%"
+  serial: "10%"
   max_fail_percentage: 10
 
   roles:

@@ -321,7 +321,9 @@ sudo sh install-oldkernel.sh \
 
 ### 4.6 Remote control token
 
-Python capture can poll the Hub control API when a token is installed:
+All shipping modes can accept an authenticated `off` command in the response
+to their existing `POST /api/agent/stats` report. Python capture can also poll
+the older desired-state control API. Install the shared per-node token with:
 
 ```sh
 sudo NT_CONTROL_TOKEN='replace-with-issued-token' \
@@ -335,11 +337,13 @@ The installer writes the token to:
 /var/lib/networktracing/control.token
 ```
 
-The file mode is `0600`, and the installer removes the token from its own
-environment after writing it. Do not place real tokens in shell history,
-terminal recordings, or shared scripts. The integrated remote-control path is
-implemented by the Python sniffer; native C++ mode does not currently poll or
-apply desired-state changes.
+The file mode is `0600`, it is owned by the dedicated runtime user, and the
+installer removes the token from its own environment after writing it. Do not
+place real tokens in shell history, terminal recordings, or shared scripts.
+The signed response shape and exact HMAC input are specified in
+`AGENT-STATS-PROTOCOL.md`. An accepted `off` command cleanly stops the complete
+pipeline and the supervisor does not restart it; an operator can later start
+the SysV service normally.
 
 ## 5. Installer parameters
 
@@ -655,11 +659,39 @@ the shipper consumes those records and posts the merged v1 document to
 `/api/agent/stats`. Internal records never enter `/api/ingest`. At most one
 unsent statistics sample is retained, and a newer sample replaces it. The full
 server contract and field definitions are in `AGENT-STATS-PROTOCOL.md`.
+Sniffer CPU is reported under `capture.cpu_user_seconds`,
+`capture.cpu_system_seconds`, and `capture.cpu_percent_one_core`; the similarly
+named `resources` fields describe the shipper process.
 
 ### 11.4 `nt-ship-cpp`
 
 ```text
 nt-ship-cpp --endpoint URL
+
+### 11.5 OpenTelemetry Collector export
+
+Both shippers can send OTLP/HTTP JSON directly to a Collector instead of the
+Hub event API:
+
+```sh
+nt-sniff-cpp | nt-ship-cpp --otlp-traces-endpoint http://collector:4318
+# or: nt-ship.py --endpoint http://collector:4318 --export-mode otlp
+```
+
+`--export-mode hub|otlp` (or `NT_EXPORT_MODE`) defaults to `hub` for backward
+compatibility. OTLP mode posts bounded JSON to `/v1/traces`; the native C++03
+shipper supports plain `http://` only, while Python may use HTTPS. It preserves
+an incoming valid W3C trace ID as `traceId`, makes the received span ID the
+OTLP `parentSpanId`, and creates a new local span ID. Without `traceparent` it
+creates a root trace and records `networktracing.trace_context_source=generated`.
+
+Set `NT_TRUSTED_PROXY_CIDRS` to an explicit comma-separated IPv4 CIDR allow-list
+before `X-Forwarded-For` is used as `client.address`; otherwise `client.address`
+falls back to the packet peer. `network.peer.address` always remains the
+immediate packet peer. OTLP mode intentionally does not post Hub agent stats or
+accept Hub control responses, because a Collector trace endpoint is not the Hub
+control API. Capture remains one worker; exporter concurrency stays bounded by
+the existing Python thread/native `--max-inflight` limits.
 ```
 
 It continuously reads JSONL from stdin into a 4,000-event bounded queue,
@@ -667,7 +699,8 @@ batches up to 400 events, and posts to the Hub from one 512 KiB-stack uploader
 thread. `--ship-rate-kbps` limits aggregate payload egress and
 `--stats-interval-sec` accepts `10..300`. It consumes native capture-stat
 records and posts the merged v1 sample to `/api/agent/stats`; those records
-never enter `/api/ingest`. `--spool PATH` is accepted but ignored.
+never enter `/api/ingest`. A signed `off` command in the successful stats
+response stops the pipeline cleanly. `--spool PATH` is accepted but ignored.
 `NT_NODE_NAME` overrides the hostname. Unexpected stdin EOF exits nonzero so
 the supervisor restarts the complete pipeline.
 

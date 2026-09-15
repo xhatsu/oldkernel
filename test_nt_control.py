@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import time
 
 SPEC = importlib.util.spec_from_file_location(
     "nt_control", os.path.join(os.path.dirname(__file__), "nt_control.py"))
@@ -54,3 +55,35 @@ def test_message_redacts_secrets_and_is_bounded():
     assert "hunter2" not in msg
     assert "secret" not in msg
     assert len(msg) <= 256
+
+
+def test_signed_stats_off_command_validation_and_replay_receipt(tmp_path):
+    now = int(time.time())
+    token = "fixture-control-secret"
+    reply = {
+        "ok": True, "accepted": True, "control_version": 1,
+        "command": "off", "command_id": "off-42",
+        "issued_at": now, "expires_at": now + 300}
+    reply["signature"] = nt_control.sign_stats_control(
+        token, "node-1", reply["command_id"], reply["command"],
+        reply["issued_at"], reply["expires_at"])
+
+    command = nt_control.validate_stats_control(reply, token, "node-1", now)
+    assert command["command"] == "off"
+    assert nt_control.record_stats_command(str(tmp_path), command) is True
+    assert nt_control.record_stats_command(str(tmp_path), command) is False
+    assert json.loads((tmp_path / "stats-control-applied.json").read_text())["command_id"] == "off-42"
+
+    tampered = dict(reply)
+    tampered["command_id"] = "off-43"
+    try:
+        nt_control.validate_stats_control(tampered, token, "node-1", now)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected signature mismatch")
+
+
+def test_stats_control_no_command_is_backward_compatible():
+    assert nt_control.validate_stats_control(
+        {"ok": True, "accepted": True}, "", "node-1") is None

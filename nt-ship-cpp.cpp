@@ -58,6 +58,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <stdint.h>
+#include <sys/stat.h>
 
 /*
  * AddressSanitizer detection. When ASAN is active the RLIMIT_AS clamp below is
@@ -99,6 +101,10 @@ static const size_t MAX_STATS_BYTES = 16384;   /* largest capture-stats line acc
 static const size_t MAX_INPUT_LINE = 65535;   /* largest single JSONL event accepted from stdin */
 static const size_t MAX_RESPONSE_BYTES = 1024U * 1024U;   /* largest response body we will drain before giving up */
 static const size_t MAX_HEADER_BYTES = 32U * 1024U;   /* largest response header block accepted */
+static const size_t MAX_CONTROL_RESPONSE_BYTES = 4096;   /* bounded stats response JSON */
+static const size_t MAX_CONTROL_TOKEN_BYTES = 4096;   /* matches installer token bound */
+static const unsigned MAX_CONTROL_LIFETIME_SEC = 600;   /* signed command validity window */
+static const unsigned CONTROL_CLOCK_SKEW_SEC = 300;   /* tolerate old-node clock skew */
 static const unsigned FLUSH_MS = 1000;   /* flush a partial batch once its oldest event is ~1 s old */
 static const unsigned DEFAULT_INFLIGHT = 2;   /* default parallel connections (small bounded pipeline) */
 static const unsigned MAX_INFLIGHT_LIMIT = 4;   /* upper bound for --max-inflight / NT_MAX_INFLIGHT */
@@ -113,6 +119,7 @@ static const unsigned CONNECT_TIMEOUT_MS = 3000;   /* TCP connect deadline while
  */
 static volatile sig_atomic_t g_running = 1;   /* 1 while the process should keep running */
 static volatile sig_atomic_t g_stopped_by_signal = 0;   /* 1 when SIGTERM/SIGINT asked us to stop (selects exit code) */
+static volatile sig_atomic_t g_stopped_by_remote = 0;   /* authenticated Hub command selected clean exit */
 static unsigned g_ship_rate_kbps = 1024;   /* aggregate application-payload ceiling, kbit/s (validated 64..10000) */
 static unsigned g_stats_interval_sec = 30;   /* target seconds between /api/agent/stats posts */
 static unsigned g_max_inflight = DEFAULT_INFLIGHT;   /* number of Connection slots in the uploader pool */
@@ -179,8 +186,12 @@ static time_t g_started_epoch = 0;   /* process start time; seeds instance id an
 static double g_last_stats_at = 0.0;   /* time base for the "window_seconds" of the last stats sample */
 static double g_last_stats_cpu = 0.0;   /* total CPU seconds at the last stats sample (for cpu_percent_one_core) */
 static std::string g_endpoint;   /* raw --endpoint argument */
+static bool g_export_otlp = false;   /* OTLP/HTTP JSON /v1/traces instead of Hub ingest */
 static std::string g_node;   /* node name: NT_NODE_NAME or the system hostname */
 static std::string g_instance_id;   /* "<start_epoch>-<pid>"; prefixes batch ids so a restart yields fresh ids */
+static std::string g_control_token;   /* optional local HMAC key; never sent over HTTP */
+static std::string g_control_run;   /* directory containing the replay receipt */
+static std::string g_last_control_id;   /* most recently persisted command id */
 
 /*
  * Parsed form of the --endpoint URL. Kept deliberately flat: host/port feed
@@ -347,6 +358,203 @@ static unsigned long long json_uint(const std::string &s, const char *key) {
     v = v * 10ULL + (unsigned)(s[p] - '0'); ++p;
   }
   return v;
+}
+
+/* Minimal SHA-256/HMAC implementation for authenticating the only stats
+ * response command ("off"). Keeping it in-process preserves the zero-library
+ * CentOS 6 build and, unlike a bearer header over plain HTTP, never transmits
+ * the control secret. */
+struct Sha256State {
+  uint32_t h[8];
+  uint64_t bits;
+  unsigned char block[64];
+  size_t used;
+};
+
+static uint32_t sha_rotr(uint32_t x, unsigned n) { return (x >> n) | (x << (32U - n)); }
+
+static void sha256_transform(Sha256State *s, const unsigned char *p) {
+  static const uint32_t k[64] = {
+    0x428a2f98U,0x71374491U,0xb5c0fbcfU,0xe9b5dba5U,0x3956c25bU,0x59f111f1U,0x923f82a4U,0xab1c5ed5U,
+    0xd807aa98U,0x12835b01U,0x243185beU,0x550c7dc3U,0x72be5d74U,0x80deb1feU,0x9bdc06a7U,0xc19bf174U,
+    0xe49b69c1U,0xefbe4786U,0x0fc19dc6U,0x240ca1ccU,0x2de92c6fU,0x4a7484aaU,0x5cb0a9dcU,0x76f988daU,
+    0x983e5152U,0xa831c66dU,0xb00327c8U,0xbf597fc7U,0xc6e00bf3U,0xd5a79147U,0x06ca6351U,0x14292967U,
+    0x27b70a85U,0x2e1b2138U,0x4d2c6dfcU,0x53380d13U,0x650a7354U,0x766a0abbU,0x81c2c92eU,0x92722c85U,
+    0xa2bfe8a1U,0xa81a664bU,0xc24b8b70U,0xc76c51a3U,0xd192e819U,0xd6990624U,0xf40e3585U,0x106aa070U,
+    0x19a4c116U,0x1e376c08U,0x2748774cU,0x34b0bcb5U,0x391c0cb3U,0x4ed8aa4aU,0x5b9cca4fU,0x682e6ff3U,
+    0x748f82eeU,0x78a5636fU,0x84c87814U,0x8cc70208U,0x90befffaU,0xa4506cebU,0xbef9a3f7U,0xc67178f2U};
+  uint32_t w[64];
+  for (unsigned i = 0; i < 16; ++i)
+    w[i] = ((uint32_t)p[i*4] << 24) | ((uint32_t)p[i*4+1] << 16) |
+           ((uint32_t)p[i*4+2] << 8) | (uint32_t)p[i*4+3];
+  for (unsigned i = 16; i < 64; ++i) {
+    uint32_t a = w[i-15], b = w[i-2];
+    uint32_t s0 = sha_rotr(a,7) ^ sha_rotr(a,18) ^ (a >> 3);
+    uint32_t s1 = sha_rotr(b,17) ^ sha_rotr(b,19) ^ (b >> 10);
+    w[i] = w[i-16] + s0 + w[i-7] + s1;
+  }
+  uint32_t a=s->h[0],b=s->h[1],c=s->h[2],d=s->h[3];
+  uint32_t e=s->h[4],f=s->h[5],g=s->h[6],h=s->h[7];
+  for (unsigned i = 0; i < 64; ++i) {
+    uint32_t s1=sha_rotr(e,6)^sha_rotr(e,11)^sha_rotr(e,25);
+    uint32_t ch=(e&f)^((~e)&g), t1=h+s1+ch+k[i]+w[i];
+    uint32_t s0=sha_rotr(a,2)^sha_rotr(a,13)^sha_rotr(a,22);
+    uint32_t maj=(a&b)^(a&c)^(b&c), t2=s0+maj;
+    h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+  }
+  s->h[0]+=a;s->h[1]+=b;s->h[2]+=c;s->h[3]+=d;
+  s->h[4]+=e;s->h[5]+=f;s->h[6]+=g;s->h[7]+=h;
+}
+
+static void sha256_init(Sha256State *s) {
+  static const uint32_t iv[8] = {0x6a09e667U,0xbb67ae85U,0x3c6ef372U,0xa54ff53aU,
+                                  0x510e527fU,0x9b05688cU,0x1f83d9abU,0x5be0cd19U};
+  memcpy(s->h, iv, sizeof(iv)); s->bits = 0; s->used = 0;
+}
+
+static void sha256_update(Sha256State *s, const unsigned char *p, size_t n) {
+  s->bits += (uint64_t)n * 8ULL;
+  while (n) {
+    size_t take = 64U - s->used; if (take > n) take = n;
+    memcpy(s->block + s->used, p, take); s->used += take; p += take; n -= take;
+    if (s->used == 64U) { sha256_transform(s, s->block); s->used = 0; }
+  }
+}
+
+static void sha256_final(Sha256State *s, unsigned char out[32]) {
+  uint64_t bits = s->bits;
+  s->block[s->used++] = 0x80;
+  if (s->used > 56U) {
+    while (s->used < 64U) s->block[s->used++] = 0;
+    sha256_transform(s, s->block); s->used = 0;
+  }
+  while (s->used < 56U) s->block[s->used++] = 0;
+  for (unsigned i = 0; i < 8; ++i) s->block[63U-i] = (unsigned char)(bits >> (i*8));
+  sha256_transform(s, s->block);
+  for (unsigned i = 0; i < 8; ++i) {
+    out[i*4]=(unsigned char)(s->h[i]>>24); out[i*4+1]=(unsigned char)(s->h[i]>>16);
+    out[i*4+2]=(unsigned char)(s->h[i]>>8); out[i*4+3]=(unsigned char)s->h[i];
+  }
+}
+
+static void sha256_bytes(const std::string &x, unsigned char out[32]) {
+  Sha256State s; sha256_init(&s);
+  sha256_update(&s, (const unsigned char *)x.data(), x.size()); sha256_final(&s, out);
+}
+
+static std::string hmac_sha256_hex(const std::string &key, const std::string &message) {
+  unsigned char k0[64]; memset(k0, 0, sizeof(k0));
+  if (key.size() > sizeof(k0)) { unsigned char kh[32]; sha256_bytes(key, kh); memcpy(k0, kh, sizeof(kh)); }
+  else if (!key.empty()) memcpy(k0, key.data(), key.size());
+  unsigned char ipad[64], opad[64];
+  for (unsigned i = 0; i < 64; ++i) { ipad[i]=(unsigned char)(k0[i]^0x36); opad[i]=(unsigned char)(k0[i]^0x5c); }
+  Sha256State inner; sha256_init(&inner); sha256_update(&inner, ipad, 64);
+  sha256_update(&inner, (const unsigned char *)message.data(), message.size());
+  unsigned char ih[32]; sha256_final(&inner, ih);
+  Sha256State outer; sha256_init(&outer); sha256_update(&outer, opad, 64); sha256_update(&outer, ih, 32);
+  unsigned char oh[32]; sha256_final(&outer, oh);
+  static const char hex[] = "0123456789abcdef"; std::string result(64, '0');
+  for (unsigned i = 0; i < 32; ++i) { result[i*2]=hex[oh[i]>>4]; result[i*2+1]=hex[oh[i]&15]; }
+  return result;
+}
+
+static bool constant_time_equal(const std::string &a, const std::string &b) {
+  unsigned diff = (unsigned)(a.size() ^ b.size()); size_t n = a.size() < b.size() ? a.size() : b.size();
+  for (size_t i = 0; i < n; ++i) diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+  return diff == 0;
+}
+
+static bool json_value_terminated(const std::string &body, size_t p) {
+  while (p < body.size() && (body[p]==' ' || body[p]=='\t' || body[p]=='\r' || body[p]=='\n')) ++p;
+  return p < body.size() && (body[p] == ',' || body[p] == '}');
+}
+
+static bool unique_json_string(const std::string &body, const char *key, std::string *out) {
+  std::string needle = std::string("\"") + key + "\""; size_t p = body.find(needle);
+  if (p == std::string::npos || body.find(needle, p + needle.size()) != std::string::npos) return false;
+  p += needle.size(); while (p < body.size() && (body[p]==' ' || body[p]=='\t' || body[p]=='\r' || body[p]=='\n')) ++p;
+  if (p >= body.size() || body[p++] != ':') return false;
+  while (p < body.size() && (body[p]==' ' || body[p]=='\t' || body[p]=='\r' || body[p]=='\n')) ++p;
+  if (p >= body.size() || body[p++] != '"') return false;
+  std::string value;
+  while (p < body.size() && body[p] != '"') {
+    unsigned char c = (unsigned char)body[p++]; if (c < 0x20 || c == '\\') return false; value += (char)c;
+  }
+  if (p >= body.size() || body[p] != '"' || !json_value_terminated(body, p + 1)) return false;
+  if (out) *out = value;
+  return true;
+}
+
+static bool unique_json_uint(const std::string &body, const char *key, unsigned long long *out) {
+  std::string needle = std::string("\"") + key + "\""; size_t p = body.find(needle);
+  if (p == std::string::npos || body.find(needle, p + needle.size()) != std::string::npos) return false;
+  p += needle.size(); while (p < body.size() && (body[p]==' ' || body[p]=='\t' || body[p]=='\r' || body[p]=='\n')) ++p;
+  if (p >= body.size() || body[p++] != ':') return false;
+  while (p < body.size() && (body[p]==' ' || body[p]=='\t' || body[p]=='\r' || body[p]=='\n')) ++p;
+  if (p >= body.size() || body[p] < '0' || body[p] > '9') return false;
+  unsigned long long v = 0;
+  while (p < body.size() && body[p] >= '0' && body[p] <= '9') {
+    unsigned d=(unsigned)(body[p++]-'0'); if (v > (~0ULL-d)/10ULL) return false; v=v*10ULL+d;
+  }
+  if (!json_value_terminated(body, p)) return false;
+  if (out) *out=v;
+  return true;
+}
+
+static std::string control_signing_input(const std::string &node, const std::string &id,
+                                         const std::string &command,
+                                         unsigned long long issued, unsigned long long expires) {
+  return "v1\n" + node + "\n" + id + "\n" + command + "\n" + ulls(issued) + "\n" + ulls(expires) + "\n";
+}
+
+static bool validate_stats_control(const std::string &body, time_t now, std::string *command_id) {
+  if (g_control_token.empty() || body.empty() || body.size() > MAX_CONTROL_RESPONSE_BYTES) return false;
+  unsigned long long version=0, issued=0, expires=0; std::string command, id, signature;
+  if (!unique_json_uint(body,"control_version",&version) || version != 1 ||
+      !unique_json_string(body,"command",&command) || command != "off" ||
+      !unique_json_string(body,"command_id",&id) || id.empty() || id.size() > 128 ||
+      !unique_json_uint(body,"issued_at",&issued) || !unique_json_uint(body,"expires_at",&expires) ||
+      !unique_json_string(body,"signature",&signature) || signature.size() != 64) return false;
+  for (size_t i=0;i<id.size();++i) { char c=id[i]; if (!((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='.'||c=='_'||c==':'||c=='-')) return false; }
+  for (size_t i=0;i<signature.size();++i) if (!((signature[i]>='0'&&signature[i]<='9')||(signature[i]>='a'&&signature[i]<='f'))) return false;
+  unsigned long long current = now < 0 ? 0 : (unsigned long long)now;
+  if (expires < issued || expires - issued > MAX_CONTROL_LIFETIME_SEC ||
+      issued > current + CONTROL_CLOCK_SKEW_SEC || expires + CONTROL_CLOCK_SKEW_SEC < current) return false;
+  std::string expected=hmac_sha256_hex(g_control_token,control_signing_input(g_node,id,command,issued,expires));
+  if (!constant_time_equal(signature,expected)) return false;
+  if (command_id) *command_id=id;
+  return true;
+}
+
+static bool read_bounded_file(const std::string &path, size_t limit, std::string *out) {
+  FILE *f=fopen(path.c_str(),"rb"); if (!f) return false; std::string value; char buf[512];
+  while (!feof(f) && value.size() <= limit) { size_t n=fread(buf,1,sizeof(buf),f); if (n) value.append(buf,n); if (ferror(f)) { fclose(f); return false; } }
+  fclose(f); if (value.empty() || value.size() > limit || value.find('\0') != std::string::npos) return false;
+  while (!value.empty() && (value[value.size()-1]=='\r'||value[value.size()-1]=='\n')) value.erase(value.size()-1);
+  if (value.empty()) return false;
+  if (out) *out=value;
+  return true;
+}
+
+static bool persist_control_receipt(const std::string &id) {
+  if (id == g_last_control_id || g_control_run.empty()) return false;
+  std::string path=g_control_run+"/stats-control-applied.json";
+  std::string tmp=path+".tmp."+ulls((unsigned long long)getpid());
+  FILE *f=fopen(tmp.c_str(),"wb"); if (!f) return false;
+  std::string body="{\"control_version\":1,\"command_id\":"+jsonq(id)+",\"command\":\"off\",\"applied_at\":"+ulls((unsigned long long)time(NULL))+"}\n";
+  bool ok=fwrite(body.data(),1,body.size(),f)==body.size() && fflush(f)==0 && fsync(fileno(f))==0;
+  if (fclose(f)!=0) ok=false;
+  if (chmod(tmp.c_str(),0600)!=0) ok=false;
+  if (!ok || rename(tmp.c_str(),path.c_str())!=0) { unlink(tmp.c_str()); return false; }
+  g_last_control_id=id; return true;
+}
+
+static void init_stats_control() {
+  const char *run=getenv("NT_CONTROL_RUN"); g_control_run=(run&&*run)?run:"/var/lib/networktracing";
+  const char *direct=getenv("NT_CONTROL_TOKEN");
+  if (direct && *direct && strlen(direct) <= MAX_CONTROL_TOKEN_BYTES) g_control_token=direct;
+  else { const char *path=getenv("NT_CONTROL_TOKEN_FILE"); if (path&&*path) read_bounded_file(path,MAX_CONTROL_TOKEN_BYTES,&g_control_token); }
+  std::string receipt; if (read_bounded_file(g_control_run+"/stats-control-applied.json",MAX_CONTROL_RESPONSE_BYTES,&receipt)) unique_json_string(receipt,"command_id",&g_last_control_id);
 }
 
 /* Count OS threads by enumerating /proc/self/task (present on Linux 2.6.32). */
@@ -587,6 +795,10 @@ static Batch *build_event_batch() {
 
   pthread_mutex_lock(&g_lock);
   size_t n = bounded_batch_count(g_queue, g_node);
+  /* OTLP adds a resource/scope envelope and attribute objects.  Keep a small,
+   * fixed event count so the existing 64 KiB hard body cap remains meaningful
+   * even for long-but-valid JSONL input records. */
+  if (g_export_otlp && n > 10) n = 10;
   /* Queue non-empty but nothing fits: drop just the head event as oversized.
    * This guarantees progress even if a single line is pathologically large. */
   if (!n && !g_queue.empty()) {
@@ -614,7 +826,37 @@ static Batch *build_event_batch() {
   b->id = id;
   b->event_count = events.size();
   b->created_at = wall_seconds();
-  /* Encode the batch payload: {"node":"<node>","events":[<event>,<event>,...]}.
+  /* Encode the batch payload. OTLP mode intentionally converts at the bounded
+   * shipper boundary: packet capture stays free of Collector dependencies. */
+  if (g_export_otlp) {
+    std::string body = "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"networktracing\"}},{\"key\":\"host.name\",\"value\":{\"stringValue\":" + jsonq(g_node) + "}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"networktracing.oldkernel\"},\"spans\":[";
+    size_t span_count = 0;
+    for (size_t i = 0; i < events.size(); ++i) {
+      std::string tid, sid, parent, method, path, caller, peer; unsigned long long ts = 0, duration = 0, status = 0;
+      unique_json_string(events[i], "trace_id", &tid); unique_json_string(events[i], "span_id", &sid);
+      unique_json_string(events[i], "parent_span_id", &parent); unique_json_string(events[i], "method", &method);
+      unique_json_string(events[i], "path", &path); unique_json_string(events[i], "caller", &caller);
+      unique_json_string(events[i], "network_peer_address", &peer);
+      unique_json_uint(events[i], "ts", &ts); unique_json_uint(events[i], "duration_ms", &duration); unique_json_uint(events[i], "status", &status);
+      /* Invalid/malformed input has already been admitted as JSONL. Do not
+       * emit malformed OTLP IDs: drop that event from this export batch. */
+      if (tid.size() != 32 || sid.size() != 16) { ++g_dropped_total; continue; }
+      if (span_count++) body += ',';
+      unsigned long long start = ts * 1000000000ULL;
+      unsigned long long end = start + duration * 1000000ULL;
+      body += "{\"traceId\":" + jsonq(tid) + ",\"spanId\":" + jsonq(sid);
+      if (parent.size() == 16) body += ",\"parentSpanId\":" + jsonq(parent);
+      body += ",\"name\":" + jsonq(method + " " + path) + ",\"kind\":2,\"startTimeUnixNano\":" + jsonq(ulls(start)) + ",\"endTimeUnixNano\":" + jsonq(ulls(end)) + ",\"attributes\":[";
+      body += "{\"key\":\"client.address\",\"value\":{\"stringValue\":" + jsonq(caller) + "}},{\"key\":\"network.peer.address\",\"value\":{\"stringValue\":" + jsonq(peer.empty() ? caller : peer) + "}}";
+      if (status) body += ",{\"key\":\"http.response.status_code\",\"value\":{\"intValue\":" + jsonq(ulls(status)) + "}}";
+      body += "]}";
+    }
+    body += "]}]}]}";
+    if (body.size() > MAX_POST_BYTES || !span_count) { ++g_dropped_total; delete b; return NULL; }
+    b->event_count = span_count;
+    b->body.swap(body); return b;
+  }
+  /* Hub payload: {"node":"<node>","events":[<event>,<event>,...]}. */
    * Events are raw pre-validated JSONL, joined with commas (no comma before the
    * first one). The wrapper adds the surrounding braces/array. */
   std::string body = "{\"node\":" + jsonq(g_node) + ",\"events\":[";
@@ -651,7 +893,7 @@ static bool queue_ready_to_flush(bool shutdown_started) {
  */
 static std::string make_request(const Batch &b) {
   std::ostringstream o;
-  o << "POST " << endpoint_path("/api/ingest") << " HTTP/1.1\r\n"
+  o << "POST " << endpoint_path(g_export_otlp ? "/v1/traces" : "/api/ingest") << " HTTP/1.1\r\n"
     << "Host: " << g_ep.host_header << "\r\n"
     << "User-Agent: nt-ship-cpp-posix/1\r\n"
     << "Content-Type: application/json\r\n"
@@ -1175,28 +1417,68 @@ static bool send_all_blockingish(int fd, const std::string &s, unsigned timeout_
   return true;
 }
 
-/*
- * Read response header bytes until "\r\n\r\n" (or the deadline / header cap) and
- * return the parsed status code, or 0 on timeout/malformed input. The stats path
- * does not need the body, so it stops at the end of the headers.
- */
-static int read_status_blockingish(int fd, unsigned timeout_ms) {
+struct StatsReply {
+  int status;
+  std::string body;
+  StatsReply() : status(0) {}
+};
+
+/* Read the complete bounded stats response. Commands require Content-Length;
+ * chunked or oversized bodies are ignored while the HTTP status is retained. */
+static StatsReply read_stats_reply_blockingish(int fd, unsigned timeout_ms) {
+  StatsReply reply;
   std::string buf;
   double deadline = wall_seconds() + (double)timeout_ms / 1000.0;
-  while (buf.find("\r\n\r\n") == std::string::npos) {
-    if (buf.size() > MAX_HEADER_BYTES) return 0;
+  size_t head_end = std::string::npos;
+  while ((head_end = buf.find("\r\n\r\n")) == std::string::npos) {
+    if (buf.size() > MAX_HEADER_BYTES) return reply;
     int left = (int)((deadline - wall_seconds()) * 1000.0);
-    if (left <= 0) return 0;
+    if (left <= 0) return reply;
     struct pollfd pfd; pfd.fd = fd; pfd.events = POLLIN; pfd.revents = 0;
     int rc = poll(&pfd, 1, left);
     if (rc < 0 && errno == EINTR) continue;
-    if (rc <= 0) return 0;
+    if (rc <= 0) return reply;
     char tmp[2048]; ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-    if (n <= 0) return 0;
+    if (n <= 0) return reply;
     buf.append(tmp, (size_t)n);
   }
-  int status = 0;
-  return parse_status_line(buf, &status) ? status : 0;
+  if (!parse_status_line(buf, &reply.status)) { reply.status = 0; return reply; }
+
+  bool have_length = false, invalid = false;
+  size_t content_length = 0;
+  size_t line = buf.find("\r\n");
+  line = line == std::string::npos ? head_end : line + 2;
+  while (line < head_end) {
+    size_t eol = buf.find("\r\n", line); if (eol == std::string::npos || eol > head_end) break;
+    size_t colon = buf.find(':', line);
+    if (colon != std::string::npos && colon < eol) {
+      std::string name = lower_ascii(trim_ascii(buf.substr(line, colon-line)));
+      std::string value = trim_ascii(buf.substr(colon+1, eol-colon-1));
+      if (name == "transfer-encoding") invalid = true;
+      else if (name == "content-length") {
+        if (value.empty()) invalid = true;
+        unsigned long long n = 0;
+        for (size_t i=0;i<value.size() && !invalid;++i) {
+          if (value[i]<'0'||value[i]>'9') { invalid=true; break; }
+          unsigned d=(unsigned)(value[i]-'0'); if (n>(~0ULL-d)/10ULL) { invalid=true; break; } n=n*10ULL+d;
+        }
+        if (n > MAX_CONTROL_RESPONSE_BYTES || (have_length && content_length != (size_t)n)) invalid=true;
+        content_length=(size_t)n; have_length=true;
+      }
+    }
+    line=eol+2;
+  }
+  if (invalid || !have_length) return reply;
+  size_t body_start=head_end+4;
+  while (buf.size()-body_start < content_length) {
+    int left=(int)((deadline-wall_seconds())*1000.0); if (left<=0) return reply;
+    struct pollfd pfd; pfd.fd=fd; pfd.events=POLLIN; pfd.revents=0;
+    int rc=poll(&pfd,1,left); if (rc<0&&errno==EINTR) continue; if (rc<=0) return reply;
+    char tmp[2048]; ssize_t n=recv(fd,tmp,sizeof(tmp),0); if (n<=0) return reply; buf.append(tmp,(size_t)n);
+    if (buf.size()-body_start > MAX_CONTROL_RESPONSE_BYTES) return reply;
+  }
+  reply.body.assign(buf,body_start,content_length);
+  return reply;
 }
 
 /*
@@ -1205,10 +1487,11 @@ static int read_status_blockingish(int fd, unsigned timeout_ms) {
  * status or 0. Deliberately synchronous and off the event path, so a slow stats
  * call can only delay stats -- never event shipping.
  */
-static int post_stats_once(const std::string &body) {
-  if (body.size() > MAX_STATS_BYTES) return 0;
+static StatsReply post_stats_once(const std::string &body) {
+  StatsReply reply;
+  if (body.size() > MAX_STATS_BYTES) return reply;
   int fd = -1;
-  if (!connect_blocking(g_ep, 1000, &fd)) return 0;
+  if (!connect_blocking(g_ep, 1000, &fd)) return reply;
   std::ostringstream o;
   o << "POST " << endpoint_path("/api/agent/stats") << " HTTP/1.1\r\n"
     << "Host: " << g_ep.host_header << "\r\n"
@@ -1217,10 +1500,9 @@ static int post_stats_once(const std::string &body) {
     << "Content-Length: " << body.size() << "\r\n"
     << "Connection: close\r\n\r\n";
   std::string req = o.str(); req += body;
-  int status = 0;
-  if (send_all_blockingish(fd, req, 1000)) status = read_status_blockingish(fd, 1000);
+  if (send_all_blockingish(fd, req, 1000)) reply = read_stats_reply_blockingish(fd, 1000);
   close(fd);
-  return status;
+  return reply;
 }
 
 /*
@@ -1369,6 +1651,7 @@ static unsigned count_retry_wait(const std::vector<Connection> &conns) {
  * keep-alive event socket.
  */
 static void maybe_send_stats(const std::vector<Connection> &conns, double *last_attempt) {
+  if (g_export_otlp) return; /* Collector trace endpoints do not implement Hub control/stats. */
   if (!last_attempt || wall_seconds() - *last_attempt < 1.0) return;
   std::string capture; unsigned long long gen = 0;
   pthread_mutex_lock(&g_lock);
@@ -1378,11 +1661,22 @@ static void maybe_send_stats(const std::vector<Connection> &conns, double *last_
 
   *last_attempt = wall_seconds();
   std::string body = shipping_stats_body(capture, count_inflight(conns), count_retry_wait(conns));
-  int status = post_stats_once(body);
+  StatsReply reply = post_stats_once(body);
   pthread_mutex_lock(&g_lock);
   g_stats_generation_sent = gen;
-  if (status < 200 || status >= 300) ++g_stats_drops_total;
+  if (reply.status < 200 || reply.status >= 300) ++g_stats_drops_total;
   pthread_mutex_unlock(&g_lock);
+  if (reply.status >= 200 && reply.status < 300 && !reply.body.empty()) {
+    std::string id;
+    if (validate_stats_control(reply.body, time(NULL), &id)) {
+      if (id != g_last_control_id && persist_control_receipt(id)) {
+        logmsg("authenticated remote stats command accepted: off (" + id + ")");
+        g_stopped_by_remote = 1;
+        g_running = 0;
+        pthread_cond_broadcast(&g_cond);
+      }
+    }
+  }
 }
 
 /*
@@ -1555,6 +1849,7 @@ static void *uploader_main(void *arg) {
  */
 int main(int argc, char **argv) {
   bool stats_fixture = false;   /* --stats-fixture: print one synthetic stats body and exit */
+  bool control_fixture = false;   /* --control-fixture: validate HMAC/JSON interoperability */
   const char *rate_env = getenv("NT_SHIP_RATE_KBPS");
   const char *stats_env = getenv("NT_STATS_INTERVAL_SEC");
   const char *inflight_env = getenv("NT_MAX_INFLIGHT");
@@ -1566,13 +1861,16 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--endpoint" && i + 1 < argc) g_endpoint = argv[++i];
+    else if (a == "--export-mode" && i + 1 < argc) { std::string m=argv[++i]; if (m=="otlp") g_export_otlp=true; else if (m=="hub") g_export_otlp=false; else { std::cerr << "export mode must be hub or otlp\n"; return 2; } }
+    else if (a == "--otlp-traces-endpoint" && i + 1 < argc) { g_endpoint = argv[++i]; g_export_otlp = true; }
     else if (a == "--ship-rate-kbps" && i + 1 < argc) g_ship_rate_kbps = (unsigned)atoi(argv[++i]);
     else if (a == "--stats-interval-sec" && i + 1 < argc) g_stats_interval_sec = (unsigned)atoi(argv[++i]);
     else if (a == "--max-inflight" && i + 1 < argc) g_max_inflight = (unsigned)atoi(argv[++i]);
     else if (a == "--spool" && i + 1 < argc) ++i; /* accepted for CLI compatibility; still intentionally unused */
     else if (a == "--stats-fixture") stats_fixture = true;
+    else if (a == "--control-fixture") control_fixture = true;
     else if (a == "-h" || a == "--help") {
-      std::cout << "usage: nt-ship-cpp --endpoint http://HOST[:PORT][/base] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..3600] [--max-inflight 1..4]\n";
+      std::cout << "usage: nt-ship-cpp --endpoint http://HOST[:PORT][/base] [--export-mode hub|otlp] [--otlp-traces-endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..3600] [--max-inflight 1..4]\n";
       return 0;
     } else { std::cerr << "unknown arg: " << a << "\n"; return 2; }
   }
@@ -1588,8 +1886,25 @@ int main(int argc, char **argv) {
   /* Node identity: NT_NODE_NAME if set, else the hostname (always NUL-terminated). */
   char host[256]; gethostname(host, sizeof(host)); host[sizeof(host) - 1] = 0;
   const char *node_env = getenv("NT_NODE_NAME"); g_node = (node_env && *node_env) ? node_env : host;
+  init_stats_control();
   g_started_epoch = time(NULL); g_instance_id = ulls((unsigned long long)g_started_epoch) + "-" + ulls((unsigned long long)getpid());
   g_last_stats_at = wall_seconds();
+
+  if (control_fixture) {
+    std::string rfc_key(20, (char)0x0b);
+    if (hmac_sha256_hex(rfc_key, "Hi There") !=
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7") return 1;
+    g_node="fixture-node"; g_control_token="fixture-token"; g_last_control_id.clear();
+    std::string response="{\"ok\":true,\"accepted\":true,\"control_version\":1,\"command\":\"off\",\"command_id\":\"cmd-1\",\"issued_at\":1700000000,\"expires_at\":1700000300,\"signature\":\"8725d9ff3433965b6f705300dba850dfdedad2c7b2431687a26edfe419cb876c\"}";
+    std::string id;
+    if (!validate_stats_control(response,(time_t)1700000100,&id) || id!="cmd-1") return 1;
+    std::string malformed=response; malformed.replace(malformed.find("1700000000"),10,"1700000000.5");
+    if (validate_stats_control(malformed,(time_t)1700000100,&id)) return 1;
+    response.replace(response.find("cmd-1"),5,"cmd-2");
+    if (validate_stats_control(response,(time_t)1700000100,&id)) return 1;
+    std::cout << "stats control HMAC fixture: PASS\n";
+    return 0;
+  }
 
   /* Test hook: emit one deterministic stats sample to stdout and exit, so the
    * stats contract can be validated without a Hub or any real traffic. */
@@ -1695,7 +2010,7 @@ int main(int argc, char **argv) {
 
   /* Distinguish a requested stop from an unexpected pipe closure: the latter
    * returns 74 so the supervisor restarts the full sniff|ship pipeline. */
-  if (g_stopped_by_signal) { logmsg("stopped"); return 0; }
+  if (g_stopped_by_signal || g_stopped_by_remote) { logmsg("stopped"); return 0; }
   logmsg("capture input closed unexpectedly; requesting supervised pipeline restart");
   return 74;
 }

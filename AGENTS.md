@@ -383,6 +383,49 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   - Resolved Starlette's `BackgroundTasks` design where coroutines are awaited on the main event loop thread; synchronous functions are automatically dispatched to `anyio.to_thread.run_sync` worker threads.
   - Eliminated Uvicorn event-loop thread exhaustion and dropped process CPU from 97.3% to 0.0% idle under continuous fleet ingestion.
 
+## Authenticated Stats-Response Control & Sniffer CPU Telemetry (2026-09-15) — Round 28
+- **No Extra Control Probe**: Python, native C++, and hybrid pipelines consume
+  commands from the existing successful `POST /api/agent/stats` response. This
+  preserves the coalesced stats cadence (30 seconds by default), shares the
+  existing egress budget, and creates no second polling stream.
+- **Authenticated `off` Command**: A bounded v1 response supports only `off`,
+  identified by a bounded command ID and Unix issue/expiry times. The Hub signs
+  `v1\n<node>\n<command_id>\n<command>\n<issued_at>\n<expires_at>\n` with
+  HMAC-SHA256 and the protected per-node control token. Both shipping engines
+  enforce a 4096-byte response cap, 600-second maximum command lifetime,
+  300-second clock skew, lowercase hexadecimal signatures, constant-time
+  comparison, and HTTP 2xx before applying a command.
+- **Replay-Safe Clean Stop**: Accepted command IDs are atomically persisted to
+  `/var/lib/networktracing/stats-control-applied.json` before the shipper exits
+  successfully. `nt-supervise.sh` treats the pipeline status as intentional and
+  does not restart it. Token files are mode `0600` and owned by `ntsniff` when
+  the installed runtime is rootless.
+- **Sniffer CPU Visibility**: Both capture engines emit cumulative
+  `capture.cpu_user_seconds`, `capture.cpu_system_seconds`, and interval
+  `capture.cpu_percent_one_core`. The existing top-level `resources` CPU fields
+  remain shipper-process measurements in split pipelines.
+- **Protocol Documentation**: `AGENT-STATS-PROTOCOL.md` specifies the exact Hub
+  JSON response shape, HMAC canonical bytes, validation limits, and no-command
+  compatibility behavior.
+- **Verification Results**:
+  - Full unit/contract suite: **70/70 PASS** (`pytest -q`).
+  - Dual-engine synthetic suite: **124/124 PASS**.
+  - ASAN/UBSAN edge suite: **ALL PASS**, including the HMAC vector and signed
+    loopback HTTP clean-stop integration fixture.
+  - PCAP suite: PCAP 247 produced 109 events in each engine; PCAP 249 produced
+    6,216 C++ / 6,077 Python events with zero secret leakage. The privileged
+    live-veth fixture skipped because the test environment lacked
+    `CAP_NET_ADMIN`.
+  - Strict C++03 `-Wall -Wextra -Werror`, Python syntax, POSIX `dash -n`, and
+    `git diff --check`: **PASS**.
+  - CentOS 6.8 x86_64 prebuilt sniffer and shipper refreshed with GCC 4.4.7,
+    verified on the stock CentOS 6.8 image, and embedded in the rebuilt
+    `install-firstrun-el68.sh` (**1,133,513 bytes**).
 
-
-
+## OTLP Collector Export State (2026-09-15)
+- Shippers support bounded OTLP/HTTP JSON trace export (`/v1/traces`) via
+  `--export-mode otlp` or `--otlp-traces-endpoint`; Hub mode remains default.
+- Valid W3C context supplies OTLP trace/parent IDs; missing context produces a
+  root trace. `NT_TRUSTED_PROXY_CIDRS` gates IPv4 XFF caller selection.
+- This does not authorize multi-worker capture: TPACKET_V2 remains one worker,
+  no PACKET_FANOUT. Collector mode suppresses Hub stats/control traffic.

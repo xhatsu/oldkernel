@@ -56,6 +56,20 @@ import threading
 import time
 
 try:
+    integer_types = (int, long)
+except NameError:  # Python 3 test runner; Python 2.6 has long.
+    integer_types = (int,)
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
+try:
+    import nt_control
+except ImportError:
+    nt_control = None
+
+try:
     import httplib
     import urlparse
     import Queue
@@ -167,21 +181,97 @@ class Batch(object):
         return self.event_count
 
 
-def build_batch(events, node, batch_id):
-    """Build pre-encoded wire body without double serialization."""
-    node_json = json.dumps(node, separators=(",", ":"))
-    if not events:
-        body = "{\"node\":" + node_json + ",\"events\":[]}"
-    elif isinstance(events[0], dict):
-        body = json.dumps({"node": node, "events": events}, separators=(",", ":"))
+def _otel_attr(key, value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        encoded = {"boolValue": value}
+    elif isinstance(value, integer_types):
+        encoded = {"intValue": str(value)}
     else:
-        body = "{\"node\":" + node_json + ",\"events\":[" + ",".join(events) + "]}"
+        encoded = {"stringValue": str(value)}
+    return {"key": key, "value": encoded}
+
+
+def _otel_span(event):
+    """Convert one bounded capture event to OTLP/HTTP JSON span data."""
+    now_ns = int(time.time() * 1000000000)
+    try:
+        start_ns = int(event.get("start_time_unix_nano") or int(event.get("ts", 0)) * 1000000000)
+    except (TypeError, ValueError):
+        start_ns = now_ns
+    if start_ns <= 0:
+        start_ns = now_ns
+    try:
+        duration = max(0, int(event.get("duration_ms")))
+    except (TypeError, ValueError):
+        duration = 0
+    end_ns = start_ns + duration * 1000000 if duration else max(start_ns, now_ns)
+    trace_id = event.get("trace_id")
+    if not isinstance(trace_id, string_types) or len(trace_id) != 32:
+        # Sniffers normally provide it; this fallback makes malformed external
+        # JSONL a new root instead of corrupting an unrelated trace.
+        import binascii
+        trace_id = binascii.hexlify(os.urandom(16))
+        if not isinstance(trace_id, str): trace_id = trace_id.decode("ascii")
+    span_id = event.get("span_id")
+    if not isinstance(span_id, string_types) or len(span_id) != 16:
+        import binascii
+        span_id = binascii.hexlify(os.urandom(8))
+        if not isinstance(span_id, str): span_id = span_id.decode("ascii")
+    attrs = []
+    pairs = (("http.request.method", event.get("method")),
+             ("url.path", event.get("path")),
+             ("server.address", event.get("host_hdr") or event.get("dst_ip")),
+             ("server.port", event.get("dst_port")),
+             ("client.address", event.get("caller")),
+             ("network.peer.address", event.get("network_peer_address") or event.get("caller")),
+             ("network.peer.port", event.get("caller_port")),
+             ("http.response.status_code", event.get("status")),
+             ("user_agent.original", event.get("user_agent")),
+             ("enduser.id", event.get("user")),
+             ("networktracing.trace_context_source", event.get("trace_context_source") or "generated"))
+    for key, value in pairs:
+        a = _otel_attr(key, value)
+        if a is not None:
+            attrs.append(a)
+    span = {"traceId": trace_id, "spanId": span_id,
+            "name": "%s %s" % (event.get("method") or "HTTP", event.get("path") or "/"),
+            "kind": 2, "startTimeUnixNano": str(start_ns),
+            "endTimeUnixNano": str(end_ns), "attributes": attrs}
+    parent = event.get("parent_span_id")
+    if isinstance(parent, string_types) and len(parent) == 16:
+        span["parentSpanId"] = parent
+    return span
+
+
+def build_batch(events, node, batch_id, export_mode="hub"):
+    """Build a bounded Hub event batch or OTLP/HTTP JSON trace request."""
+    if export_mode == "otlp":
+        decoded = []
+        for event in events:
+            decoded.append(event if isinstance(event, dict) else json.loads(event))
+        resource = {"attributes": [_otel_attr("service.name", "networktracing"),
+                                    _otel_attr("host.name", node)]}
+        scope_spans = {"scope": {"name": "networktracing.oldkernel"},
+                       "spans": [_otel_span(e) for e in decoded]}
+        body = json.dumps({"resourceSpans": [{"resource": resource,
+                                               "scopeSpans": [scope_spans]}]},
+                          separators=(",", ":"))
+    else:
+        node_json = json.dumps(node, separators=(",", ":"))
+        if not events:
+            body = "{\"node\":" + node_json + ",\"events\":[]}"
+        elif isinstance(events[0], dict):
+            body = json.dumps({"node": node, "events": events}, separators=(",", ":"))
+        else:
+            body = "{\"node\":" + node_json + ",\"events\":[" + ",".join(events) + "]}"
     if hasattr(body, "encode"):
         body = body.encode("utf-8")
     return Batch(body=body, event_count=len(events), batch_id=batch_id)
 
 
-def take_bounded_batch(buf, node, on_drop=None):
+def take_bounded_batch(buf, node, on_drop=None, export_mode="hub"):
     """Remove one <=64 KiB batch from buf, dropping impossible giant events.
 
     Supports both collections.deque and list, and elements as raw strings or dicts.
@@ -202,6 +292,10 @@ def take_bounded_batch(buf, node, on_drop=None):
                 ev_str = event
             ev_bytes = ev_str.encode("utf-8") if hasattr(ev_str, "encode") else ev_str
             candidate_size = encoded_size + len(ev_bytes) + (1 if batch else 0)
+            # OTLP has a larger fixed envelope and attributes. Build the
+            # candidate only in that opt-in mode; queues remain bounded.
+            if export_mode == "otlp":
+                candidate_size = len(build_batch(batch + [event], node, "size", "otlp").body)
             if candidate_size > MAX_POST_BYTES:
                 break
             batch.append(event)
@@ -492,6 +586,7 @@ def main():
     enforce_rlimit_as()
 
     endpoint = None
+    export_mode = os.environ.get("NT_EXPORT_MODE", "hub").lower()
     spool = "/var/lib/networktracing/sniff-spool.jsonl"
     argv = sys.argv[1:]
     i = 0
@@ -499,6 +594,10 @@ def main():
         a = argv[i]
         if a == "--endpoint":
             i += 1; endpoint = argv[i].rstrip("/")
+        elif a == "--export-mode":
+            i += 1; export_mode = argv[i].lower()
+        elif a == "--otlp-traces-endpoint":
+            i += 1; endpoint = argv[i].rstrip("/"); export_mode = "otlp"
         elif a == "--spool":
             i += 1; spool = argv[i]
         elif a == "--ship-rate-kbps":
@@ -512,8 +611,12 @@ def main():
         i += 1
     if not endpoint:
         raise SystemExit("--endpoint required")
+    if export_mode not in ("hub", "otlp"):
+        raise SystemExit("--export-mode must be hub or otlp")
 
-    node = socket.gethostname().split(".")[0]
+    node = os.environ.get("NT_NODE_NAME") or socket.gethostname().split(".")[0]
+    control_token = nt_control.load_control_token() if nt_control is not None else ""
+    control_run = os.environ.get("NT_CONTROL_RUN", "/var/lib/networktracing")
     rate_kbps = read_bounded_int("NT_SHIP_RATE_KBPS", DEFAULT_RATE_KBPS,
                                  MIN_RATE_KBPS, MAX_RATE_KBPS)
     limiter = RateLimiter(rate_kbps)
@@ -534,6 +637,7 @@ def main():
         host_header = "%s:%d" % (host, port)
 
     running = [True]
+    remote_stop = [False]
     shutdown_event = threading.Event()
     fatal_poster_error = [False]
 
@@ -571,7 +675,7 @@ def main():
             log("WARN: refusing oversized upload body (%d bytes)" % len(batch.body))
             return conn
 
-        path = base_path + "/api/ingest"
+        path = base_path + ("/v1/traces" if export_mode == "otlp" else "/api/ingest")
 
         while True:
             batch.attempts += 1
@@ -685,7 +789,9 @@ def main():
             conn.request("POST", path, body=body, headers=headers)
             resp = conn.getresponse()
             status = resp.status
-            resp.read(4096)
+            response_body = resp.read(
+                (nt_control.MAX_CONTROL_RESPONSE + 1)
+                if nt_control is not None else 4096)
             resp.close()
 
             will_close = (getattr(resp, "will_close", False) or
@@ -697,6 +803,26 @@ def main():
 
             if not (200 <= status < 300):
                 stats.add("stats_samples_dropped")
+            elif nt_control is not None and len(response_body) <= nt_control.MAX_CONTROL_RESPONSE:
+                reply = {}
+                try:
+                    if not isinstance(response_body, str):
+                        response_body = response_body.decode("utf-8")
+                    reply = json.loads(response_body) if response_body.strip() else {}
+                    command = nt_control.validate_stats_control(
+                        reply, control_token, node)
+                    if command is not None:
+                        if nt_control.record_stats_command(control_run, command):
+                            remote_stop[0] = True
+                            running[0] = False
+                            log("remote stats command accepted: off (%s)" %
+                                command["command_id"])
+                        else:
+                            log("WARN: remote stats command ignored; receipt could not be persisted or was already applied")
+                except (ValueError, TypeError, UnicodeError) as exc:
+                    if isinstance(reply, dict) and "command" in reply:
+                        log("WARN: rejected remote stats command: %s" %
+                            nt_control.safe_message(exc))
             return conn
 
         except (socket.error, httplib.HTTPException, IOError, OSError):
@@ -814,7 +940,10 @@ def main():
                             capture_latest, node, "python", rate_kbps,
                             started_threads, wsse_body_bytes, len(buf),
                             MAX_BUFFER_EVENTS + q.maxsize * MAX_BATCH)
-                        if stats.offer_stats(sample):
+                        # A Collector trace endpoint is not the Hub control
+                        # API. Keep operational stats out of /v1/traces rather
+                        # than leaking them into the event stream.
+                        if export_mode != "otlp" and stats.offer_stats(sample):
                             try:
                                 q.put_nowait(("stats", None))
                             except Queue.Full:
@@ -847,7 +976,7 @@ def main():
         now = time.time()
         while len(buf) >= MAX_BATCH or (buf and now - last_flush >= FLUSH_SEC):
             last_flush = now
-            batch_events = take_bounded_batch(buf, node, stats.dropped)
+            batch_events = take_bounded_batch(buf, node, stats.dropped, export_mode)
             if not batch_events:
                 break
             for item in batch_events:
@@ -858,7 +987,7 @@ def main():
 
             batch_sequence += 1
             batch_id = "%s-%d" % (stats.instance_id, batch_sequence)
-            batch_obj = build_batch(batch_events, node, batch_id)
+            batch_obj = build_batch(batch_events, node, batch_id, export_mode)
 
             if q.qsize() >= MAX_QUEUE_BATCHES or (stats.queued_wire_bytes + len(batch_obj.body) > MAX_QUEUE_WIRE_BYTES):
                 stats.dropped("queue_full", batch_obj.event_count)
@@ -872,7 +1001,7 @@ def main():
                     log("WARN: egress queue full, dropped %d events" % batch_obj.event_count)
 
     while buf:
-        batch_events = take_bounded_batch(buf, node, stats.dropped)
+        batch_events = take_bounded_batch(buf, node, stats.dropped, export_mode)
         if not batch_events:
             break
         for item in batch_events:
@@ -883,7 +1012,7 @@ def main():
 
         batch_sequence += 1
         batch_id = "%s-%d" % (stats.instance_id, batch_sequence)
-        batch_obj = build_batch(batch_events, node, batch_id)
+        batch_obj = build_batch(batch_events, node, batch_id, export_mode)
 
         if q.qsize() >= MAX_QUEUE_BATCHES or (stats.queued_wire_bytes + len(batch_obj.body) > MAX_QUEUE_WIRE_BYTES):
             stats.dropped("queue_full", batch_obj.event_count)
@@ -898,7 +1027,10 @@ def main():
 
     q.join()
     shutdown_event.set()
-    log("stopped (%d events pending on exit)" % len(buf))
+    if remote_stop[0]:
+        log("stopped by authenticated Hub stats command")
+    else:
+        log("stopped (%d events pending on exit)" % len(buf))
 
     if fatal_poster_error[0]:
         sys.exit(72)

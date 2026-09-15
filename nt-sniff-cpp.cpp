@@ -447,6 +447,47 @@ static std::string make_traceparent(std::string *tid) {
   return buf;
 }
 
+/* Generate the local span identifier.  Trace IDs and span IDs deliberately
+ * remain hex strings so the shipper can forward them directly as OTLP JSON. */
+static std::string make_span_id() {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)next_rng());
+  return buf;
+}
+
+/* XFF is an assertion from the immediate peer, never an identity proof.  Only
+ * an IPv4 peer in NT_TRUSTED_PROXY_CIDRS (comma separated a.b.c.d/prefix) may
+ * supply client.address; malformed/IPv6 entries fail closed to packet source. */
+static bool trusted_proxy_ipv4(const std::string &peer) {
+  const char *spec = getenv("NT_TRUSTED_PROXY_CIDRS");
+  struct in_addr paddr;
+  if (!spec || !*spec || inet_aton(peer.c_str(), &paddr) == 0) return false;
+  std::string list(spec); size_t pos = 0;
+  while (pos <= list.size()) {
+    size_t comma = list.find(',', pos); std::string item = list.substr(pos, comma == std::string::npos ? std::string::npos : comma-pos);
+    size_t slash = item.find('/');
+    if (slash != std::string::npos) {
+      std::string ip = item.substr(0, slash); int bits = atoi(item.substr(slash+1).c_str()); struct in_addr base;
+      if (bits >= 0 && bits <= 32 && inet_aton(ip.c_str(), &base)) {
+        uint32_t mask = bits == 0 ? 0U : htonl(0xffffffffU << (32-bits));
+        if ((paddr.s_addr & mask) == (base.s_addr & mask)) return true;
+      }
+    }
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  return false;
+}
+
+static std::string xff_caller(const std::string &peer, const std::string &xff) {
+  if (!trusted_proxy_ipv4(peer) || xff.empty()) return peer;
+  size_t comma = xff.find(','); std::string candidate = xff.substr(0, comma);
+  size_t start = candidate.find_first_not_of(" \t"); size_t end = candidate.find_last_not_of(" \t");
+  if (start == std::string::npos) return peer;
+  candidate = candidate.substr(start, end-start+1);
+  struct in_addr parsed; return inet_aton(candidate.c_str(), &parsed) ? candidate : peer;
+}
+
 /* One captured request/response pair == one JSONL event record.
  * Field groups:
  *   ts/host/src/service      - wall-clock second, node name, "pcap" probe
@@ -464,7 +505,7 @@ static std::string make_traceparent(std::string *tid) {
 struct Event {
   long ts; std::string host, src, service, method, path, user, scheme, probe;
   std::string basic_user, wsse_user;
-  std::string host_hdr, user_agent, xff, caller, dst_ip, traceparent, trace_id;
+  std::string host_hdr, user_agent, xff, caller, network_peer, dst_ip, traceparent, trace_id, span_id, parent_span_id, trace_context_source;
   unsigned caller_port, dst_port, req_bytes, resp_bytes; int status; long duration_ms;
   bool has_status, has_duration, has_resp;
   Event() : ts(0), caller_port(0), dst_port(0), req_bytes(0), resp_bytes(0), status(0), duration_ms(0), has_status(false), has_duration(false), has_resp(false) {}
@@ -1209,6 +1250,8 @@ static bool parse_request(const char *data, size_t len, Event *e, RequestMeta *m
         if (!tid.empty()) {
           e->traceparent = tp;
           e->trace_id = tid;
+          e->parent_span_id = tp.substr(36, 16);
+          e->trace_context_source = "w3c";
         } else {
           e->traceparent.clear();
           e->trace_id.clear();
@@ -1254,7 +1297,15 @@ static bool parse_request(const char *data, size_t len, Event *e, RequestMeta *m
 
   if (e->user.empty()) e->user = "-anonymous-";
   if (e->scheme.empty()) e->scheme = "none";
-  if (e->trace_id.empty()) e->traceparent = make_traceparent(&e->trace_id);
+  if (e->trace_id.empty()) {
+    /* No received W3C context is a new root trace.  Do not serialize the
+     * locally generated context as though it arrived on the wire. */
+    (void)make_traceparent(&e->trace_id);
+    e->trace_context_source = "generated";
+  }
+  e->span_id = make_span_id();
+  e->network_peer = e->caller;
+  e->caller = xff_caller(e->caller, e->xff);
   return true;
 }
 
@@ -2071,6 +2122,9 @@ static std::string agent_stats_body(int fd, size_t flows_active,
       << ",\"kernel_drops_total\":" << ull_string(g_kernel_drops) << ",\"kernel_drops_delta\":" << ull_string(kernel_drop_delta)
       << ",\"kernel_drop_percent\":" << double_string(100.0 * kernel_drop_delta / (packet_delta ? packet_delta : 1))
       << ",\"invalid_frames_total\":" << ull_string(g_invalid_frames)
+      << ",\"cpu_user_seconds\":" << double_string(user_cpu)
+      << ",\"cpu_system_seconds\":" << double_string(sys_cpu)
+      << ",\"cpu_percent_one_core\":" << double_string(cpu_pct)
       << ",\"events_emitted_total\":" << ull_string(g_events_emitted) << ",\"events_emitted_delta\":" << ull_string(emitted_delta)
       << ",\"flows_active\":" << flows_active << ",\"pending_requests\":" << pending_requests
       << ",\"wsse_body_flows_active\":" << wsse_body_flows
@@ -2274,7 +2328,10 @@ static std::string format_event_json(const Event &e) {
      << ",\"source_probe\":\"pcap-http-cpp\",\"host_hdr\":" << jsonq(e.host_hdr)
      << ",\"user_agent\":" << jsonq(e.user_agent) << ",\"x_forwarded_for\":" << jsonq(e.xff)
      << ",\"caller\":" << jsonq(e.caller) << ",\"caller_port\":" << e.caller_port << ",\"dst_ip\":" << jsonq(e.dst_ip)
-     << ",\"dst_port\":" << e.dst_port << ",\"traceparent\":" << jsonq(e.traceparent) << ",\"trace_id\":" << jsonq(e.trace_id)
+     << ",\"dst_port\":" << e.dst_port << ",\"network_peer_address\":" << jsonq(e.network_peer.empty() ? e.caller : e.network_peer)
+     << ",\"traceparent\":" << jsonq(e.traceparent) << ",\"trace_id\":" << jsonq(e.trace_id)
+     << ",\"span_id\":" << jsonq(e.span_id) << ",\"parent_span_id\":" << (e.parent_span_id.empty() ? "null" : jsonq(e.parent_span_id))
+     << ",\"trace_context_source\":" << jsonq(e.trace_context_source.empty() ? "generated" : e.trace_context_source)
      << ",\"service_id\":null,\"module_id\":\"pcap-http-cpp\",\"req_bytes\":" << e.req_bytes;
   if (e.has_status) ss << ",\"status\":" << e.status; else ss << ",\"status\":null";
   if (e.has_duration) ss << ",\"duration_ms\":" << e.duration_ms; else ss << ",\"duration_ms\":null";
@@ -2305,9 +2362,12 @@ static void emit_event(Event e) {
   e.user_agent = sanitize_utf8_truncate(e.user_agent, 256);
   e.xff = sanitize_utf8_truncate(e.xff, 512);
   e.caller = sanitize_utf8_truncate(e.caller, 64);
+  e.network_peer = sanitize_utf8_truncate(e.network_peer, 64);
   e.dst_ip = sanitize_utf8_truncate(e.dst_ip, 64);
   e.traceparent = sanitize_utf8_truncate(e.traceparent, 64);
   e.trace_id = sanitize_utf8_truncate(e.trace_id, 32);
+  e.span_id = sanitize_utf8_truncate(e.span_id, 16);
+  e.parent_span_id = sanitize_utf8_truncate(e.parent_span_id, 16);
 
   std::string line = format_event_json(e);
   if (line.size() + 1 > PIPE_BUF) {

@@ -33,6 +33,23 @@ class IngestHandler(BaseHTTPRequestHandler):
         pass
 
 
+class StatsControlHandler(BaseHTTPRequestHandler):
+    response_body = b"{}"
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.response_body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(self.response_body)
+
+    def log_message(self, format, *args):
+        pass
+
+
 def test_encoded_batches_have_a_hard_64k_body_ceiling():
     buf = [{"value": "x" * 40000}, {"value": "y" * 40000}]
     first = nt_ship.take_bounded_batch(buf, "fixture")
@@ -47,6 +64,25 @@ def test_oversized_single_event_is_dropped_before_upload():
     buf = [{"value": "x" * (nt_ship.MAX_POST_BYTES + 1)}]
     assert nt_ship.take_bounded_batch(buf, "fixture") == []
     assert buf == []
+
+
+def test_otlp_batch_uses_w3c_parent_and_semantic_client_fields():
+    event = {"ts": 1700000000, "duration_ms": 12, "method": "GET",
+             "path": "/orders", "trace_id": "a" * 32,
+             "span_id": "b" * 16, "parent_span_id": "c" * 16,
+             "caller": "198.51.100.7", "network_peer_address": "10.0.0.9",
+             "status": 200, "trace_context_source": "w3c"}
+    batch = nt_ship.build_batch([event], "fixture", "1", "otlp")
+    body = json.loads(batch.body.decode("utf-8"))
+    span = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    assert span["traceId"] == "a" * 32
+    assert span["spanId"] == "b" * 16
+    assert span["parentSpanId"] == "c" * 16
+    assert span["startTimeUnixNano"] == "1700000000000000000"
+    assert span["endTimeUnixNano"] == "1700000000012000000"
+    attributes = dict((a["key"], list(a["value"].values())[0]) for a in span["attributes"])
+    assert attributes["client.address"] == "198.51.100.7"
+    assert attributes["network.peer.address"] == "10.0.0.9"
 
 
 def test_agent_stats_are_coalesced_to_one_latest_sample():
@@ -131,6 +167,51 @@ def test_internal_capture_stats_use_separate_hub_endpoint():
     assert sample["status"] == "degraded"
     assert sample["reasons"] == ["kernel_drop"]
     assert len(json.dumps(sample, separators=(",", ":")).encode("utf-8")) <= 16384
+
+
+def test_signed_stats_response_stops_python_shipper_cleanly(tmp_path):
+    node = "stats-control-node"
+    token = "stats-control-token"
+    now = int(time.time())
+    reply = {"ok": True, "accepted": True, "control_version": 1,
+             "command": "off", "command_id": "hub-off-1",
+             "issued_at": now, "expires_at": now + 300}
+    reply["signature"] = nt_ship.nt_control.sign_stats_control(
+        token, node, reply["command_id"], reply["command"],
+        reply["issued_at"], reply["expires_at"])
+    StatsControlHandler.response_body = json.dumps(
+        reply, separators=(",", ":")).encode("utf-8")
+
+    server = HTTPServer(("127.0.0.1", 0), StatsControlHandler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    token_file = tmp_path / "control.token"
+    token_file.write_text(token)
+    endpoint = "http://127.0.0.1:%d" % server.server_address[1]
+    script = os.path.join(os.path.dirname(__file__), "nt-ship.py")
+    env = dict(os.environ, NT_NODE_NAME=node, NT_SHIP_THREADS="1",
+               NT_SHIP_RATE_KBPS="10000",
+               NT_CONTROL_TOKEN_FILE=str(token_file),
+               NT_CONTROL_RUN=str(tmp_path))
+    process = subprocess.Popen(
+        [sys.executable, script, "--endpoint", endpoint],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, env=env)
+    internal = {"_nt_internal": "capture_stats_v1",
+                "capture": {"packets_total": 1, "packets_delta": 1}}
+    process.stdin.write(json.dumps(internal) + "\n")
+    process.stdin.flush()
+    process.wait(timeout=8)
+    process.stdin.close()
+    stderr = process.stderr.read()
+    server.shutdown()
+    server.server_close()
+
+    assert process.returncode == 0, stderr
+    assert "authenticated Hub stats command" in stderr
+    receipt = json.loads((tmp_path / "stats-control-applied.json").read_text())
+    assert receipt["command_id"] == "hub-off-1"
 
 
 def test_input_line_size_bounding_64k():

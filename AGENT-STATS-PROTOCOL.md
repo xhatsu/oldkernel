@@ -54,6 +54,9 @@ Example body:
     "kernel_drops_delta": 7,
     "kernel_drop_percent": 0.0282,
     "invalid_frames_total": 0,
+    "cpu_user_seconds": 217.31,
+    "cpu_system_seconds": 48.16,
+    "cpu_percent_one_core": 2.9,
     "events_emitted_total": 128440,
     "events_emitted_delta": 412,
     "flows_active": 83,
@@ -138,6 +141,13 @@ cpu_percent_one_core = 100 * process_cpu_seconds_delta / window_seconds
 within that scale because the entire installed process tree is pinned to one
 CPU.
 
+The three CPU fields inside `capture` measure the sniffer process specifically.
+The same names inside `resources` measure the reporting shipper process. In
+single-process native capture mode they may be identical; in a piped Python,
+C++, or hybrid installation, Hub dashboards should use
+`capture.cpu_percent_one_core` for capture CPU and
+`resources.cpu_percent_one_core` for shipper CPU.
+
 `packets_total` counts packets delivered to the AF_PACKET socket.
 `kernel_drops_total` accumulates Linux `PACKET_STATISTICS.tp_drops`. Reading
 `PACKET_STATISTICS` resets the kernel's interval counters, so the agent must
@@ -172,12 +182,14 @@ messages, URLs, usernames, addresses, request paths, or other unbounded data.
 - Samples contain no packet payload, SOAP body, credential, username, trace
   identifier, source/destination address, URL, or request path.
 
-## Server response
+## Server response and authenticated remote stop
 
-The Hub should return HTTP 200 after validating and accepting the sample:
+The Hub should return HTTP 200 after validating and accepting the sample. A
+response without a command remains valid and backward compatible:
 
 ```json
 {
+  "status": 200,
   "ok": true,
   "accepted": true,
   "schema_version": 1,
@@ -189,6 +201,69 @@ Duplicate samples should also return HTTP 200 with `accepted: false` rather
 than creating a second row. Invalid documents should return HTTP 400. HTTP
 429 or 5xx responses are treated as a dropped stats sample; the agent will
 send a fresh cumulative snapshot at the next interval.
+
+Remote control is carried in this existing response instead of through another
+60-second probe. Command latency therefore equals the stats interval (30
+seconds by default), with no extra request or separate egress allowance. To
+stop the complete supervised capture pipeline, return this flat JSON object
+with an HTTP 2xx status:
+
+```json
+{
+  "status": 200,
+  "ok": true,
+  "accepted": true,
+  "control_version": 1,
+  "command": "off",
+  "command_id": "hub-off-20260915-0001",
+  "issued_at": 1789444800,
+  "expires_at": 1789445100,
+  "signature": "64-lowercase-hex-characters"
+}
+```
+
+The response must have `Content-Type: application/json`, an explicit
+`Content-Length`, and an encoded body no larger than 4096 bytes. It may also
+contain the ordinary acknowledgement fields or other fields; the control
+validator reads only the six control fields. `status` in the body is optional,
+while the actual HTTP status must be 2xx. The only v1 command is the exact
+lowercase string `off`.
+
+The Hub signs the exact UTF-8 byte sequence below with HMAC-SHA256, using the
+same per-node control token installed in
+`/var/lib/networktracing/control.token`. The token is never sent in the stats
+request:
+
+```text
+v1\n<node>\n<command_id>\n<command>\n<issued_at>\n<expires_at>\n
+```
+
+For example, Python Hub code can construct the signature as follows:
+
+```python
+canonical = "v1\n%s\n%s\n%s\n%d\n%d\n" % (
+    node, command_id, command, issued_at, expires_at)
+signature = hmac.new(
+    control_token.encode("utf-8"),
+    canonical.encode("utf-8"),
+    hashlib.sha256,
+).hexdigest()
+```
+
+Use the `node` value from the submitted stats document. `command_id` must match
+`[A-Za-z0-9._:-]{1,128}`. `issued_at` and `expires_at` are integer Unix seconds;
+expiry cannot precede issue time, command lifetime cannot exceed 600 seconds,
+and agents allow 300 seconds of clock skew. The signature must be exactly 64
+lowercase hexadecimal characters.
+
+Before acting, the agent validates the signature and time window and atomically
+records the accepted command in
+`/var/lib/networktracing/stats-control-applied.json`. The same command ID is
+ignored after restart. `off` makes the shipper exit successfully; the closed
+pipe stops the sniffer, and `nt-supervise.sh` treats status 0 as an intentional
+stop instead of restarting the pipeline. A missing token, malformed response,
+bad signature, stale command, unsupported command, or receipt-write failure is
+ignored without stopping capture.
 
 The server should retain the submitted rates for diagnosis but derive alerting
 rates from successive cumulative totals whenever possible. That remains
@@ -205,6 +280,7 @@ Useful Prometheus mappings include:
 networktracing_agent_up{node,mode}
 networktracing_agent_capture_packets_total{node,mode}
 networktracing_agent_capture_kernel_drops_total{node,mode}
+networktracing_agent_capture_cpu_percent_one_core{node,mode}
 networktracing_agent_events_pushed_total{node,mode}
 networktracing_agent_events_dropped_total{node,mode}
 networktracing_agent_push_kbps{node,mode}

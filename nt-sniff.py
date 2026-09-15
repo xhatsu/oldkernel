@@ -2382,6 +2382,50 @@ def is_soap_content_type(value):
             media_type.endswith("+xml"))
 
 
+def _trusted_proxy_ipv4(peer, spec):
+    """Return whether peer matches a comma-separated IPv4 CIDR allow-list.
+
+    Kept deliberately small and Python-2.6 compatible: IPv6 or malformed
+    entries never grant trust.  An empty allow-list means XFF is untrusted.
+    """
+    if not spec:
+        return False
+    try:
+        peer_n = struct.unpack("!I", socket.inet_aton(peer))[0]
+    except (socket.error, TypeError):
+        return False
+    for item in spec.split(","):
+        item = item.strip()
+        try:
+            addr, bits_s = item.split("/", 1)
+            bits = int(bits_s)
+            if bits < 0 or bits > 32:
+                continue
+            base = struct.unpack("!I", socket.inet_aton(addr))[0]
+            mask = (0 if bits == 0 else ((0xffffffff << (32 - bits)) & 0xffffffff))
+            if (peer_n & mask) == (base & mask):
+                return True
+        except (ValueError, socket.error, TypeError):
+            continue
+    return False
+
+
+def caller_from_xff(peer, xff):
+    """Use the left-most syntactically valid XFF address only from a trusted peer."""
+    if not xff or not _trusted_proxy_ipv4(peer, os.environ.get("NT_TRUSTED_PROXY_CIDRS", "")):
+        return peer, "peer"
+    # The first address is the original client in the conventional XFF form.
+    # Limit parsing work even if an upstream ignored our header storage bound.
+    for item in xff.split(",")[:16]:
+        candidate = item.strip()
+        try:
+            socket.inet_aton(candidate)
+            return candidate, "xff"
+        except socket.error:
+            pass
+    return peer, "peer"
+
+
 def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     """Build the JSONL event dict for one completed request.
 
@@ -2400,14 +2444,16 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
     # NOTE py2.6: bytes has no .hex() — use binascii.hexlify.
     # Honour a valid incoming traceparent so spans stitch together.
     tp = h.get("traceparent")
-    trace_id = None
+    trace_id = parent_span_id = None
     if tp:
         parts = tp.split("-")
         # Valid form: 00-<32 hex trace-id>-<16 hex span-id>-<2 hex flags>.
         if len(parts) == 4 and len(parts[1]) == 32 and len(parts[2]) == 16 and len(parts[3]) == 2:
             try:
-                int(parts[3], 16)
-                trace_id = parts[1].lower()
+                int(parts[1], 16); int(parts[2], 16); int(parts[3], 16)
+                if int(parts[1], 16) and int(parts[2], 16):
+                    trace_id = parts[1].lower()
+                    parent_span_id = parts[2].lower()
             except ValueError:
                 pass
     # No (valid) incoming trace context: mint a fresh traceparent. The
@@ -2427,8 +2473,18 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
             rnd = "%016x%08x%08x" % (t, pid, g_seq_counter & 0xFFFFFFFF)
             pid8 = "%08x%08x" % (pid, (g_seq_counter + 1) & 0xFFFFFFFF)
         # Assemble the W3C traceparent: version-traceid-spanid-flags.
-        tp = "00-%s-%s-01" % (rnd, pid8)
         trace_id = rnd
+        span_id = pid8
+        trace_source = "generated"
+    else:
+        # The captured request's span is a child of the inbound span.
+        try:
+            span_id = binascii.hexlify(os.urandom(8))
+            span_id = span_id.decode("ascii") if hasattr(span_id, "decode") else span_id
+        except Exception:
+            span_id = "%016x" % ((int(time.time() * 1000000) ^ os.getpid()) & 0xffffffffffffffff)
+        trace_source = "w3c"
+    caller, caller_source = caller_from_xff(src_ip, h.get("x-forwarded-for"))
     # Event schema emitted on stdout (one JSON object per line). status/
     # duration_ms/resp_bytes are filled in later by response correlation.
     ev = {
@@ -2448,7 +2504,9 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
         "host_hdr": h.get("host"),
         "user_agent": h.get("user-agent"),
         "x_forwarded_for": h.get("x-forwarded-for"),
-        "caller": src_ip,
+        "caller": caller,
+        "caller_source": caller_source,
+        "network_peer_address": src_ip,
         "caller_port": sport,
         "dst_ip": dst_ip,
         "dst_port": dport,
@@ -2456,8 +2514,13 @@ def finish_event(flow, key, dst_ip, dport, src_ip, sport, ports, node_host):
         # status/duration_ms/resp_bytes are response-side: passive request-only
         # capture cannot see them; left null for the hub to enrich or leave.
         # traceparent is clamped to 80 chars to match the hub's cap.
-        "traceparent": tp[:80],
+        # This is *only* the received header.  A missing header starts a root
+        # OTLP trace; we never present a locally generated value as inbound.
+        "traceparent": (tp or "")[:80],
         "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": parent_span_id,
+        "trace_context_source": trace_source,
         "service_id": None,          # hub maps port->service via policy later
         "module_id": "pcap-http",
     }
@@ -3771,10 +3834,13 @@ def main():
     running = [True]
     # Capture-stats cadence and the counters behind the stats lines.
     stats_interval = stats_interval_seconds()
+    initial_times = os.times()
     stats_state = {"packets_total": 0, "packet_bytes_total": 0,
                    "events_emitted_total": 0, "kernel_drops_total": 0,
                    "last_packets": 0, "last_packet_bytes": 0,
-                   "last_events": 0, "last_at": time.time()}
+                   "last_events": 0, "last_at": time.time(),
+                   "last_cpu_user": float(initial_times[0]),
+                   "last_cpu_system": float(initial_times[1])}
 
     # Serialize a batch of events to stdout as JSONL (one object per line).
     def write_events(items):
@@ -3817,6 +3883,12 @@ def main():
                        stats_state["last_packet_bytes"])
         events_delta = (stats_state["events_emitted_total"] -
                         stats_state["last_events"])
+        process_times = os.times()
+        cpu_user = float(process_times[0])
+        cpu_system = float(process_times[1])
+        cpu_delta = ((cpu_user - stats_state["last_cpu_user"]) +
+                     (cpu_system - stats_state["last_cpu_system"]))
+        cpu_percent = 100.0 * max(0.0, cpu_delta) / max(0.001, elapsed)
         # Surface current memory/flow pressure: WSSE body flows and pending
         # requests are the two bounded resources operators care about.
         waiting_wsse = g_wsse_active_flows
@@ -3837,6 +3909,9 @@ def main():
             "parser_resync_total": g_parser_resync_total,
             "buffer_bytes_total": g_buffer_budget.total,
             "so_rcvbuf": g_effective_so_rcvbuf,
+            "cpu_user_seconds": round(cpu_user, 3),
+            "cpu_system_seconds": round(cpu_system, 3),
+            "cpu_percent_one_core": round(cpu_percent, 4),
             "events_emitted_total": stats_state["events_emitted_total"],
             "events_emitted_delta": events_delta,
             "flows_active": len(flows) + len(resp_flows),
@@ -3851,6 +3926,8 @@ def main():
         stats_state["last_packets"] = stats_state["packets_total"]
         stats_state["last_packet_bytes"] = stats_state["packet_bytes_total"]
         stats_state["last_events"] = stats_state["events_emitted_total"]
+        stats_state["last_cpu_user"] = cpu_user
+        stats_state["last_cpu_system"] = cpu_system
         stats_state["last_at"] = now
 
     # Signal handler: request a clean shutdown (flushing happens after loop).

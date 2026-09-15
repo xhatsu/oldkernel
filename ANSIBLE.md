@@ -41,6 +41,8 @@ host:
 # group_vars/legacy_capture.yml
 nt_agent_version: "2026-09-09-1"
 nt_hub_url: "https://trace.internal.example:9443"
+nt_export_mode: "hub" # set "otlp" when nt_hub_url is an OTLP/HTTP Collector URL
+nt_trusted_proxy_cidrs: "" # optional IPv4 CIDR allow-list for X-Forwarded-For
 nt_capture_iface: "eth0"
 nt_capture_ports: "80,8001,8003,8080"
 nt_capture_mode: "cpp"
@@ -54,6 +56,11 @@ Do not put secrets in these variables unless Ansible Vault protects them.
 Normally omit `--cpu`; the installer safely chooses the first CPU allowed for
 each host. If an explicit CPU is required, define it in `host_vars` after
 checking that host's `Cpus_allowed_list`.
+
+For Collector export, set `nt_export_mode: "otlp"` and make `nt_hub_url` the
+Collector's OTLP/HTTP base URL (for example `http://collector:4318`). The
+installer appends `/v1/traces`. Set `nt_trusted_proxy_cidrs` only for load
+balancer/proxy ranges whose XFF headers you trust.
 
 ## 3. Rolling, idempotent playbook
 

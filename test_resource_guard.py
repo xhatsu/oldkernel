@@ -166,6 +166,18 @@ def test_installer_enables_bounded_agent_stats_for_both_modes():
     assert "export NT_STATS_INTERVAL_SEC=$STATS_INTERVAL_SEC" in installer
     assert "--stats-interval-sec $STATS_INTERVAL_SEC" in installer
     assert "/api/agent/stats" in installer
+    assert 'chown "$SNIFF_USER" "$CONTROL_TOKEN_FILE"' in installer
+
+
+def test_capture_stats_include_sniffer_cpu_usage():
+    with open(os.path.join(HERE, "nt-sniff.py"), "r") as src:
+        py = src.read()
+    with open(os.path.join(HERE, "nt-sniff-cpp.cpp"), "r") as src:
+        cpp = src.read()
+    for source in (py, cpp):
+        assert "cpu_user_seconds" in source
+        assert "cpu_system_seconds" in source
+        assert "cpu_percent_one_core" in source
 
 
 def test_both_shipping_modes_have_hard_egress_bounds():

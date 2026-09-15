@@ -68,6 +68,9 @@ app02.prod.example ansible_host=10.240.147.202 nt_capture_iface=eth0
 
 Edit `group_vars/legacy_capture.yml` for fleet-wide settings:
 - `nt_hub_url`: Ingest endpoint URL (e.g., `http://129.150.59.233:30102`)
+- `nt_export_mode`: `hub` (default) or `otlp`; with `otlp`, `nt_hub_url` is
+  the Collector OTLP/HTTP base URL and the agent posts to `/v1/traces`
+- `nt_trusted_proxy_cidrs`: optional IPv4 CIDRs allowed to supply XFF
 - `nt_capture_ports`: Monitored TCP ports (e.g., `80,8080,18080`)
 - `nt_capture_mode`: `hybrid` (recommended), `cpp`, or `python`
 
