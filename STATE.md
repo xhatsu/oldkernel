@@ -7,6 +7,13 @@
 - **TraceScope Hub Server & Bootstrap**: Stopped for maintenance via `/home/ubuntu/Viettel/OtelTrace/run_server.sh stop`.
 - **Sessions & Ports**: `tracescope-30102` (port 30102), `tracescope-worker`, and bootstrap server (port 30105) cleanly shut down. Verified connection refused on both ports.
 
+## Ansible Deployment Staged Bundle Build Policy (2026-09-15)
+- **Git Tracking Policy**: `ansible/roles/networktracing_legacy/files/install-firstrun-el68.sh` is excluded from git tracking via `.gitignore` and removed from the git index to avoid committing large base64 binaries by default.
+- **Directory Persistence**: Added `ansible/roles/networktracing_legacy/files/.gitkeep` to maintain the role's `files/` directory structure in version control.
+- **Controller Build & Stage Workflow**: Operators run `sh ansible/stage-bundle.sh` (or `cd ansible && sh stage-bundle.sh`), which runs `build-firstrun.sh`, copies the generated `install-firstrun-el68.sh` into `roles/networktracing_legacy/files/`, sets `chmod 750`, and prints file size and SHA-256 checksum.
+- **Action Plugin Fail-Closed Guard**: Updated `ansible/roles/networktracing_legacy/action_plugins/copy.py` with an actionable message directing operators to run `sh ansible/stage-bundle.sh` if the bundle has not yet been built.
+- **Documentation**: Updated `ansible/README.md`, `ANSIBLE.md`, and root `README.md` with explicit prerequisite build instructions.
+
 ## Production Hardening Round 28 — CentOS 6.8 x86_64 Containerized Build & Embedded Binary Shipping (2026-09-11)
 
 Enabled containerized builds for CentOS 6.8 x86_64 targets and embedded precompiled native binaries in `install-firstrun-el68.sh`:

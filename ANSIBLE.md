@@ -15,16 +15,22 @@ The installer never derives an ingest or kit port.
 
 ## 1. Build and stage one artifact
 
-On the build/controller machine:
+On the build/controller machine, build and stage the self-contained installer
+bundle into the Ansible role. The staged file `ansible/roles/networktracing_legacy/files/install-firstrun-el68.sh`
+is **not** committed to git by default and must be generated before running Ansible:
 
 ```sh
-sh build-firstrun.sh
-sha256sum install-firstrun-el68.sh
+# From the repository root:
+sh ansible/stage-bundle.sh
+
+# Or from inside ansible/:
+cd ansible && sh stage-bundle.sh
 ```
 
-Store `install-firstrun-el68.sh` under the Ansible role's `files/` directory
-and record its checksum in the release process. Do not rebuild the file during
-a rollout.
+This executes `build-firstrun.sh`, copies the generated `install-firstrun-el68.sh`
+into `ansible/roles/networktracing_legacy/files/install-firstrun-el68.sh`, sets
+mode `0750`, and computes the SHA-256 checksum. Record this checksum in the release
+process. Do not rebuild the file in the middle of a rollout.
 
 ## 2. Inventory variables
 

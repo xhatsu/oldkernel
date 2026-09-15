@@ -20,21 +20,42 @@ ansible/
 ├── roles/
 │   └── networktracing_legacy/
 │       ├── files/
-│       │   └── install-firstrun-el68.sh # Self-contained bundle (staged by stage-bundle.sh)
+│       │   ├── .gitkeep                 # Keeps files/ directory in git tracking
+│       │   └── install-firstrun-el68.sh # Generated bundle (git-ignored, staged via stage-bundle.sh)
 │       └── tasks/
 │           └── main.yml                 # Safe, idempotent deployment tasks
 ├── deploy-networktracing.yml            # Main rollout playbook
 ├── verify-networktracing.yml            # Health audit playbook
 ├── uninstall-networktracing.yml         # Clean fleet uninstallation
-└── stage-bundle.sh                      # Helper script to refresh staged bundle
+└── stage-bundle.sh                      # Helper script to build & refresh staged bundle
 ```
+
+> [!IMPORTANT]
+> **Build Artifact Policy**: `ansible/roles/networktracing_legacy/files/install-firstrun-el68.sh` is a **generated build artifact and is NOT tracked in git by default**. You **must** build and stage it on the Ansible control machine before executing any Ansible deployment playbooks.
 
 ## Quick Start Runbook
 
-### Step 1: Stage the Bundle
-Run on the Ansible controller whenever code in the repository is updated:
+### Step 1: Build and Stage the Bundle (Required Prerequisite)
+Before running any Ansible playbook, generate and stage the self-contained installer bundle:
+
 ```sh
+# Option A: From inside the ansible/ directory
+cd ansible
 sh stage-bundle.sh
+
+# Option B: From the repository root
+sh ansible/stage-bundle.sh
+```
+
+**What `stage-bundle.sh` does:**
+1. Runs `build-firstrun.sh` at the repository root to package all agent scripts, C++ sources, and prebuilt EL6 native binaries (from `bin/el68-x86_64/` if present) into `install-firstrun-el68.sh`.
+2. Automatically copies the built artifact to `roles/networktracing_legacy/files/install-firstrun-el68.sh`.
+3. Sets secure permissions (`chmod 750`) and outputs the staged file size and SHA-256 checksum for audit and verification.
+
+Verify the staged bundle:
+```sh
+ls -lh roles/networktracing_legacy/files/install-firstrun-el68.sh
+sha256sum roles/networktracing_legacy/files/install-firstrun-el68.sh
 ```
 
 ### Step 2: Configure Inventory & Variables

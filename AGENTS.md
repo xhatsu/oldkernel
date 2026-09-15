@@ -16,6 +16,9 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   parameters, safety behavior, service lifecycle, verification, and removal.
 - **`ANSIBLE.md`**: Stable mass-deployment pattern using a controller-copied,
   checksum-controlled embedded bundle and `--offline` installation.
+- **`ansible/stage-bundle.sh`**: Controller staging script building and placing
+  `install-firstrun-el68.sh` into `ansible/roles/networktracing_legacy/files/`
+  on demand; the bundle is git-ignored and not shipped with git by default.
 
 ## Operational Rules & User Directives
 1. **Shell Compatibility**: Standard POSIX `sh` (Bourne shell) strictly. No bashisms (`[[ ]]`, `local`, `declare`, `array[i]`, `&>`, etc.).

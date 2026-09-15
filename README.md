@@ -180,6 +180,7 @@ flowchart TD
 | [`install-oldkernel.sh`](install-oldkernel.sh) | Shell Script | Modular SysV installer supporting `--check`, standard install, and `--uninstall`. |
 | [`install-firstrun-el68.sh`](install-firstrun-el68.sh) | Shell Script | Standalone single-file bundle with embedded Base64 payloads for direct curl execution. |
 | [`build-firstrun.sh`](build-firstrun.sh) | Shell Script | Generator script that packs current kit files into `install-firstrun-el68.sh`. |
+| [`ansible/stage-bundle.sh`](ansible/stage-bundle.sh) | Shell Script | Packages and stages `install-firstrun-el68.sh` into the Ansible role `files/` directory. |
 | [`RUNNING.md`](RUNNING.md) | Markdown | Complete installation, parameter, lifecycle, verification, and troubleshooting guide. |
 | [`ANSIBLE.md`](ANSIBLE.md) | Markdown | Checksum-controlled, rolling, offline fleet deployment with Ansible. |
 | [`nt-resource-guard.sh`](nt-resource-guard.sh) | POSIX Shell | Fail-closed CPU affinity, scheduling, memory, process, descriptor, and file limits. |
@@ -332,4 +333,8 @@ sudo sh install-oldkernel.sh --uninstall
 - **Updating the Bundle:** After making changes to any `.py` or `.cpp` source files, rebuild the self-contained installer bundle:
   ```sh
   sh build-firstrun.sh
+  ```
+  For Ansible deployments, build and stage the bundle into the role `files/` directory before running any playbooks (the staged bundle is git-ignored and not shipped by default):
+  ```sh
+  sh ansible/stage-bundle.sh
   ```

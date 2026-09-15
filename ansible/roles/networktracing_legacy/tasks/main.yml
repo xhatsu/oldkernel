@@ -1,8 +1,11 @@
 ---
 - name: Stage self-contained bundle on managed host
-  ansible.builtin.raw: >
-    test -s {{ nt_bundle_dest }} || curl -sSf {{ nt_bundle_url }} -o {{ nt_bundle_dest }} && chmod 750 {{ nt_bundle_dest }}
-  changed_when: false
+  copy:
+    src: "files/install-firstrun-el68.sh"
+    dest: "{{ nt_bundle_dest }}"
+    owner: root
+    group: root
+    mode: "0750"
 
 - name: Write desired configuration manifest
   ansible.builtin.raw: |

@@ -40,3 +40,6 @@ core.*
 scratch/
 .agents/
 .codex/
+
+# Generated Ansible deployment bundles (build on controller via stage-bundle.sh before running playbooks)
+ansible/roles/networktracing_legacy/files/install-firstrun-el68.sh

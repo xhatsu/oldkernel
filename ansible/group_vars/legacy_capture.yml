@@ -1,15 +1,13 @@
 ---
 # Default configuration for legacy capture fleet
 nt_agent_version: "2026-09-11-hybrid-v2"
-nt_hub_url: "http://129.150.59.233:30102"
-nt_bundle_url: "http://129.150.59.233:30105/oldkernel/install-firstrun-el68.sh"
-
+nt_hub_url: "http://129.150.59.233:31561"
 # Capture networking
 nt_capture_iface: "eth0"
 nt_capture_ports: "80,8003,8005,8010"
 
 # Mode: 'python' (compatible with stock el68), 'hybrid', or 'cpp'
-nt_capture_mode: "hybrid"
+nt_capture_mode: "cpp"
 
 # Payload, rate and telemetry bounds
 nt_wsse_bytes: "1024"
