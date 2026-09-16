@@ -17,6 +17,7 @@ htmlcov/
 pcap_test_cpp
 nt-sniff-cpp-debug
 /tmp/
+/bin/otelcol
 
 # Temporary test logs, captures, and process tracking
 *.log
