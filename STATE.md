@@ -7,6 +7,22 @@
 - **TraceScope Hub Server & Bootstrap**: Stopped for maintenance via `/home/ubuntu/Viettel/OtelTrace/run_server.sh stop`.
 - **Sessions & Ports**: `tracescope-30102` (port 30102), `tracescope-worker`, and bootstrap server (port 30105) cleanly shut down. Verified connection refused on both ports.
 
+## Official OpenTelemetry Contrib Collector & Distributed Trace Combination (2026-09-16)
+- **Official Collector Deployment on Host**: Deployed official `otelcol-contrib` (v0.120.1) as a managed systemd user service on the host (`xhatsu`), listening on `0.0.0.0:4318` (OTLP/HTTP) and `0.0.0.0:4317` (OTLP/gRPC).
+- **Trace Combination by `trace_id`**: Configured `groupbytrace` processor (`wait_duration: 2s`, `num_traces: 1000`) in `otel-collector-config.yaml` to aggregate spans sharing the same `trace_id` from multiple nodes before releasing them to exporters.
+- **Trace Output & Export**:
+  - `file` exporter: Writes combined distributed traces in JSON format to `/home/xhatsu/oldkernel/otel-traces.json`.
+  - `otlp/apm` exporter: Forwards combined traces directly to Elastic APM Server 7.17.24 at `129.150.59.233:32765` over gRPC with zero transmission errors.
+- **Ansible Automation & Deployment**:
+  - Configured `ansible/group_vars/legacy_capture.yml` with `nt_hub_url: "http://192.168.122.1:4318"` and `nt_export_mode: "otlp"`.
+  - Deployed across both `testVM1` (192.168.122.236) and `testVM2` (192.168.122.237) via `ansible-playbook -i inventory/hosts.ini deploy-networktracing.yml` (ok=9, changed=2, failed=0 on both nodes).
+- **Live Verification**:
+  - Generated live multi-hop HTTP traffic (`POST /api/order` on `testVM1` proxying to `POST /downstream` on `testVM2`) across multiple traces.
+  - Verified `otel-traces.json` captures and combines 3 spans per trace across both nodes with parent-child linkage preserved:
+    - Root/Client span on `testVM1` (`POST /api/order`)
+    - Egress span on `testVM1` (`POST /downstream`)
+    - Ingress span on `testVM2` (`POST /downstream`) linked to the exact matching parent span ID.
+
 ## Ansible Deployment Staged Bundle Build Policy (2026-09-15)
 - **Git Tracking Policy**: `ansible/roles/networktracing_legacy/files/install-firstrun-el68.sh` is excluded from git tracking via `.gitignore` and removed from the git index to avoid committing large base64 binaries by default.
 - **Directory Persistence**: Added `ansible/roles/networktracing_legacy/files/.gitkeep` to maintain the role's `files/` directory structure in version control.

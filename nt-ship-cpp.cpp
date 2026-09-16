@@ -856,7 +856,7 @@ static Batch *build_event_batch() {
     b->event_count = span_count;
     b->body.swap(body); return b;
   }
-  /* Hub payload: {"node":"<node>","events":[<event>,<event>,...]}. */
+  /* Hub payload: {"node":"<node>","events":[<event>,<event>,...]}.
    * Events are raw pre-validated JSONL, joined with commas (no comma before the
    * first one). The wrapper adds the surrounding braces/array. */
   std::string body = "{\"node\":" + jsonq(g_node) + ",\"events\":[";

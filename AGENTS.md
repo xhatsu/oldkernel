@@ -429,3 +429,8 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   root trace. `NT_TRUSTED_PROXY_CIDRS` gates IPv4 XFF caller selection.
 - This does not authorize multi-worker capture: TPACKET_V2 remains one worker,
   no PACKET_FANOUT. Collector mode suppresses Hub stats/control traffic.
+- **Dual-VM Collector Deployment (`ansible/otel-collector.py`)**:
+  - Tested on `testVM1` (192.168.122.236) and `testVM2` (192.168.122.237) on port 4318.
+  - Groups and links spans by `trace_id`, outputting combined traces to `/var/log/otel-collector-traces.jsonl` and individual spans to `/var/log/otel-collector-spans.jsonl`.
+  - Live capture verified with multi-hop trace parent correlation across nodes.
+  - Forwards traces to Elastic APM Server 7.17.24 at `http://129.150.59.233:32765` via NDJSON transaction intake (`/intake/v2/events`) with 100% acceptance.
