@@ -15,6 +15,7 @@ nt_capture_mode: "cpp"
 
 # Payload, rate and telemetry bounds
 nt_wsse_bytes: "1024"
+nt_soap_error_body_bytes: "0"
 nt_ship_threads: "4"
 nt_ship_rate_kbps: "8000"
 nt_stats_interval_sec: "30"

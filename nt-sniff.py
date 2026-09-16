@@ -10,6 +10,8 @@ emits NetworkTracing event JSONL on stdout.
 TLS is NOT readable (by design — that tier stays on the eBPF agent).
 SOAP WSSE UsernameToken extraction is available only when explicitly enabled
 with NT_WSSE_BODY_BYTES or --wsse-body-bytes. The default remains header-only.
+Sanitized SOAP request/response excerpts can be reported only for HTTP errors
+or SOAP Faults with NT_SOAP_ERROR_BODY_BYTES / --soap-error-body-bytes.
 
 Performance:
   * kernel BPF filter (SO_ATTACH_FILTER): IPv4/TCP requests and responses
@@ -17,6 +19,7 @@ Performance:
   * HEADER-ONLY by default; opt-in WSSE parsing has strict per-flow/global bounds
 Usage:  python nt-sniff.py [-i eth0] [-p 80,8003,...] [-j workers]
                            [--wsse-body-bytes 0..65536]
+                           [--soap-error-body-bytes 0..2048]
 Stdout: one JSON event per line -> pipe into nt-ship.py.
 """
 from __future__ import print_function
@@ -24,7 +27,7 @@ from __future__ import print_function
 # Stdlib-only imports: this file must run on a bare CentOS 6.x node whose
 # Python 2.6 has no third-party packages available. xml.parsers.expat is
 # bundled with CPython (as pyexpat).
-import base64, binascii, errno, json, os, signal, socket, struct, sys, time
+import base64, binascii, errno, json, os, re, signal, socket, struct, sys, time
 import unicodedata
 from collections import deque
 from xml.parsers import expat
@@ -138,6 +141,10 @@ FLOW_TTL = FLOW_IDLE_TTL      # alias for backward compatibility
 MAX_WSSE_BODY_BYTES = 65536   # hard ceiling even if configuration is larger
 MAX_WSSE_BODY_FLOWS = 256     # at most 16 MiB of opt-in body buffers globally
 MAX_WSSE_USERNAME = 200
+MAX_SOAP_ERROR_BODY_BYTES = 2048
+MAX_SOAP_ERROR_BODY_FLOWS = 256
+MAX_SOAP_ERROR_EVENT_TEXT = 768
+g_soap_error_body_bytes = 0
 
 # Accepted WS-Security SOAP namespaces (OASIS 2004 plus the three legacy
 # drafts). A UsernameToken declared in any other namespace is ignored as
@@ -426,6 +433,18 @@ def parse_wsse_body_bytes(value):
     return size
 
 
+def parse_soap_error_body_bytes(value):
+    """Validate the opt-in SOAP error request/response inspection window."""
+    try:
+        size = int(value or 0)
+    except (TypeError, ValueError):
+        raise SystemExit("soap error body bytes must be an integer")
+    if size < 0 or size > MAX_SOAP_ERROR_BODY_BYTES:
+        raise SystemExit("soap error body bytes must be in range 0..%d" %
+                         MAX_SOAP_ERROR_BODY_BYTES)
+    return size
+
+
 def parse_args(argv):
     """Parse the command-line arguments.
 
@@ -441,8 +460,11 @@ def parse_args(argv):
     workers = 1
     # Seed the WSSE window from the environment so the installer can enable it
     # without changing the CLI (defaults to 0 = disabled).
+    global g_soap_error_body_bytes
     wsse_body_bytes = parse_wsse_body_bytes(
         os.environ.get("NT_WSSE_BODY_BYTES", "0"))
+    g_soap_error_body_bytes = parse_soap_error_body_bytes(
+        os.environ.get("NT_SOAP_ERROR_BODY_BYTES", "0"))
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -489,6 +511,11 @@ def parse_args(argv):
                 raise SystemExit("--wsse-body-bytes requires a byte count")
             i += 1
             wsse_body_bytes = parse_wsse_body_bytes(argv[i])
+        elif a == "--soap-error-body-bytes":
+            if i + 1 >= len(argv):
+                raise SystemExit("--soap-error-body-bytes requires a byte count")
+            i += 1
+            g_soap_error_body_bytes = parse_soap_error_body_bytes(argv[i])
         # -h/--help prints the module docstring and exits cleanly.
         elif a in ("-h", "--help"):
             print(__doc__); raise SystemExit(0)
@@ -620,6 +647,16 @@ def clear_all_flow_buffers(fl, budget=None):
     clear_ooo(fl, budget)
     if hasattr(fl, "wsse_cancel"):
         fl.wsse_cancel(budget)
+    if hasattr(fl, "soap_response_buf"):
+        fl.soap_req_id = 0
+        fl.soap_rk = None
+        fl.soap_content_type = ""
+        fl.soap_pending = None
+        fl.soap_response_buf = bytearray()
+        fl.soap_response_content_type = ""
+        fl.soap_response_http_error = False
+        fl.soap_response_truncated = False
+        fl.soap_multipart_tail = bytearray()
 
 
 def seq_diff(a, b):
@@ -775,7 +812,10 @@ class Flow(object):
                  "wsse_goal", "wsse_req_id", "wsse_rk", "event", "hdrs", "head_bytes",
                  "_body_goal", "generation", "syn_seen", "corr_eligible",
                  "fin_seen", "fin_seq", "wsse_last_parsed_len", "client_isn",
-                 "ooo_bytes", "correlation_allowed")
+                 "ooo_bytes", "correlation_allowed", "soap_req_id", "soap_rk",
+                 "soap_content_type", "soap_pending", "soap_response_buf",
+                 "soap_response_content_type", "soap_response_http_error",
+                 "soap_response_truncated", "soap_multipart_tail")
 
     def __init__(self):
         """Allocate a fresh flow with default header-only framing state."""
@@ -818,6 +858,15 @@ class Flow(object):
         self.fin_seen = False
         self.fin_seq = 0
         self.wsse_last_parsed_len = 0
+        self.soap_req_id = 0
+        self.soap_rk = None
+        self.soap_content_type = ""
+        self.soap_pending = None
+        self.soap_response_buf = bytearray()
+        self.soap_response_content_type = ""
+        self.soap_response_http_error = False
+        self.soap_response_truncated = False
+        self.soap_multipart_tail = bytearray()
 
     @property
     def awaiting_wsse(self):
@@ -920,6 +969,15 @@ class Flow(object):
         self.fin_seen = False
         self.fin_seq = 0
         self.wsse_last_parsed_len = 0
+        self.soap_req_id = 0
+        self.soap_rk = None
+        self.soap_content_type = ""
+        self.soap_pending = None
+        self.soap_response_buf = bytearray()
+        self.soap_response_content_type = ""
+        self.soap_response_http_error = False
+        self.soap_response_truncated = False
+        self.soap_multipart_tail = bytearray()
 
     def wsse_cancel(self, budget=None):
         """Atomically cancel WSSE inspection and decrement the global counter."""
@@ -1159,7 +1217,9 @@ def is_correlation_disabled(rk, syn_seen):
 
 class PendingRequest(object):
     """Track an in-flight HTTP request awaiting response correlation."""
-    __slots__ = ("event", "started", "tombstone", "tomb_ts", "generation", "req_id")
+    __slots__ = ("event", "started", "tombstone", "tomb_ts", "generation", "req_id",
+                 "soap_request_raw", "soap_content_type", "soap_request_truncated",
+                 "uploaded_files")
 
     def __init__(self, event, started, generation=0, req_id=0):
         self.event = event
@@ -1168,6 +1228,10 @@ class PendingRequest(object):
         self.tomb_ts = 0.0
         self.generation = generation
         self.req_id = req_id
+        self.soap_request_raw = bytearray()
+        self.soap_content_type = ""
+        self.soap_request_truncated = False
+        self.uploaded_files = []
 
     def __getitem__(self, idx):
         if idx == 0: return self.event
@@ -1267,6 +1331,89 @@ def pending_take_all(pending_tbl, rk):
         pending_repair_count(pending_tbl)
 
     return lst
+
+
+def _pending_by_req_id(pending_tbl, rk, req_id):
+    if pending_tbl is None or not req_id:
+        return None
+    for item in pending_tbl.get(rk, []):
+        if item.req_id == req_id:
+            return item
+    return None
+
+
+_MULTIPART_FILENAME_RE = re.compile(
+    br"content-disposition:[^\r\n]{0,512}?filename\*?\s*=\s*(?:\"([^\"]*)\"|([^;\r\n]*))",
+    re.I)
+
+
+def _scan_multipart_filenames(fl, item, data):
+    if "multipart/related" not in (item.soap_content_type or "").lower() or not data:
+        return
+    combined = bytes(fl.soap_multipart_tail) + bytes(data)
+    for match in _MULTIPART_FILENAME_RE.finditer(combined):
+        raw_name = (match.group(1) or match.group(2) or b"").strip()
+        if b"''" in raw_name:
+            raw_name = raw_name.split(b"''", 1)[1]
+        name = raw_name.decode("utf-8", "replace").replace("\\", "/").split("/")[-1]
+        name = u"".join(ch if ord(ch) >= 32 else u"?" for ch in name).strip()[:128]
+        if name and name not in item.uploaded_files and len(item.uploaded_files) < 8:
+            item.uploaded_files.append(name)
+    fl.soap_multipart_tail = bytearray(combined[-640:])
+
+
+def _capture_soap_request(fl, data, pending_tbl, final=False):
+    """Copy a bounded SOAP request prefix into its exact pending request."""
+    item = _pending_by_req_id(pending_tbl, fl.soap_rk, fl.soap_req_id)
+    if item is None:
+        return
+    _scan_multipart_filenames(fl, item, data)
+    remaining = g_soap_error_body_bytes - len(item.soap_request_raw)
+    if remaining > 0 and data:
+        item.soap_request_raw.extend(bytearray(data[:remaining]))
+    if data and len(data) > remaining:
+        item.soap_request_truncated = True
+    if final and fl.body_remaining > len(data or b""):
+        item.soap_request_truncated = True
+
+
+def _finish_soap_response(rfl, pending_tbl, rk, out, truncated=False):
+    """Emit a deferred response, enriching only HTTP errors or SOAP Faults."""
+    item = rfl.soap_pending
+    if item is None:
+        return
+    fault = soap_fault_fields(rfl.soap_response_buf)
+    if rfl.soap_response_http_error or fault is not None:
+        req_excerpt = soap_body_excerpt(item.soap_request_raw)
+        resp_excerpt = soap_body_excerpt(rfl.soap_response_buf)
+        if req_excerpt is not None:
+            item.event["soap_request"] = req_excerpt
+        if resp_excerpt is not None:
+            item.event["soap_response"] = resp_excerpt
+        if fault:
+            item.event.update(fault)
+        if item.uploaded_files:
+            item.event["uploaded_files"] = list(item.uploaded_files)
+        item.event["soap_request_truncated"] = bool(item.soap_request_truncated)
+        item.event["soap_response_truncated"] = bool(
+            truncated or rfl.soap_response_truncated)
+    entries = pending_tbl.get(rk, []) if pending_tbl is not None else []
+    for index, candidate in enumerate(entries):
+        if candidate is item:
+            pending_take(pending_tbl, rk, index)
+            break
+    if out is not None:
+        if isinstance(out, list):
+            out.append(item.event)
+        elif hasattr(out, "write"):
+            out.write(json.dumps(item.event) + "\n")
+            if hasattr(out, "flush"):
+                out.flush()
+    rfl.soap_pending = None
+    rfl.soap_response_buf = bytearray()
+    rfl.soap_response_content_type = ""
+    rfl.soap_response_http_error = False
+    rfl.soap_response_truncated = False
 
 
 def drain_pending_requests_unresolved(pending_tbl, rk, out=None, reason="unknown"):
@@ -1863,6 +2010,8 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                     quarantine_connection(flows, resp_flows, pending_tbl, response_key=rk, out=out, reason="malformed_resp_head")
                 break
 
+            resp_ct = response_content_type(rfl.buf[:head_len])
+
             # Interim 1xx informational responses (except 101) are skipped;
             # the final response follows in the same stream.
             if 100 <= st <= 199 and st != 101:
@@ -1962,18 +2111,28 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                     else:
                         # Attach status/duration_ms/resp_bytes to the match.
                         started = item[1]
-                        titem = pending_take(pending_tbl, rk, 0)
-                        if titem is not None:
-                            ev = titem[0]
-                            ev["status"] = st
-                            ev["duration_ms"] = max(0, int((now - started) * 1000))
-                            if clen is not None:
-                                ev["resp_bytes"] = clen
-                            if out is not None:
+                        ev["status"] = st
+                        ev["duration_ms"] = max(0, int((now - started) * 1000))
+                        if clen is not None:
+                            ev["resp_bytes"] = clen
+                        soap_defer = (
+                            g_soap_error_body_bytes > 0 and
+                            bool(item.soap_content_type) and
+                            ((400 <= st <= 599) or
+                             is_soap_or_multipart_content_type(resp_ct)))
+                        if soap_defer:
+                            rfl.soap_pending = item
+                            rfl.soap_response_buf = bytearray()
+                            rfl.soap_response_content_type = resp_ct
+                            rfl.soap_response_http_error = (400 <= st <= 599)
+                            rfl.soap_response_truncated = False
+                        else:
+                            titem = pending_take(pending_tbl, rk, 0)
+                            if titem is not None and out is not None:
                                 if isinstance(out, list):
-                                    out.append(ev)
+                                    out.append(titem[0])
                                 elif hasattr(out, "write"):
-                                    out.write(json.dumps(ev) + "\n")
+                                    out.write(json.dumps(titem[0]) + "\n")
                                     if hasattr(out, "flush"):
                                         out.flush()
 
@@ -2000,6 +2159,8 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             # No length information: body runs until connection close.
             else:
                 rfl.state = HTTP_STATE_CLOSE_BODY
+            if rfl.soap_pending is not None and rfl.state == HTTP_STATE_HEADER:
+                _finish_soap_response(rfl, pending_tbl, rk, out)
             continue
 
         # --- BODY: discard Content-Length bytes (only the head matters) ---
@@ -2007,9 +2168,22 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             if not rfl.buf:
                 break
             to_consume = min(len(rfl.buf), rfl.body_remaining)
+            if rfl.soap_pending is not None:
+                remaining = g_soap_error_body_bytes - len(rfl.soap_response_buf)
+                if remaining > 0:
+                    rfl.soap_response_buf.extend(rfl.buf[:min(to_consume, remaining)])
+                if to_consume > remaining:
+                    rfl.soap_response_truncated = True
             consume_flow_buf(rfl, to_consume, g_buffer_budget)
             rfl.body_remaining -= to_consume
+            if (rfl.soap_pending is not None and
+                    len(rfl.soap_response_buf) >= g_soap_error_body_bytes):
+                rfl.soap_response_truncated = (rfl.body_remaining > 0)
+                _finish_soap_response(rfl, pending_tbl, rk, out,
+                                      truncated=rfl.body_remaining > 0)
             if rfl.body_remaining == 0:
+                if rfl.soap_pending is not None:
+                    _finish_soap_response(rfl, pending_tbl, rk, out)
                 rfl.state = HTTP_STATE_HEADER
             continue
 
@@ -2055,6 +2229,8 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
                     break
                 consume_flow_buf(rfl, crlf + 2, g_buffer_budget)
                 if chunk_len == 0:
+                    if rfl.soap_pending is not None:
+                        _finish_soap_response(rfl, pending_tbl, rk, out)
                     rfl.chunk_reading_trailer = True
                     rfl.chunk_reading_len = False
                     continue
@@ -2075,14 +2251,31 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             # Consume chunk payload bytes (contents are discarded).
             else:
                 to_consume = min(len(rfl.buf), rfl.chunk_payload_remaining)
+                if rfl.soap_pending is not None:
+                    remaining = g_soap_error_body_bytes - len(rfl.soap_response_buf)
+                    if remaining > 0:
+                        rfl.soap_response_buf.extend(rfl.buf[:min(to_consume, remaining)])
+                    if to_consume > remaining:
+                        rfl.soap_response_truncated = True
                 consume_flow_buf(rfl, to_consume, g_buffer_budget)
                 rfl.chunk_payload_remaining -= to_consume
+                if (rfl.soap_pending is not None and
+                        len(rfl.soap_response_buf) >= g_soap_error_body_bytes):
+                    _finish_soap_response(rfl, pending_tbl, rk, out, truncated=True)
                 if rfl.chunk_payload_remaining == 0:
                     rfl.chunk_reading_crlf = True
             continue
 
         # CLOSE_BODY: everything until FIN is body; drop it and stop.
         if rfl.state == HTTP_STATE_CLOSE_BODY:
+            if rfl.soap_pending is not None and rfl.buf:
+                remaining = g_soap_error_body_bytes - len(rfl.soap_response_buf)
+                if remaining > 0:
+                    rfl.soap_response_buf.extend(rfl.buf[:remaining])
+                if len(rfl.buf) > remaining:
+                    rfl.soap_response_truncated = True
+                if len(rfl.soap_response_buf) >= g_soap_error_body_bytes:
+                    _finish_soap_response(rfl, pending_tbl, rk, out, truncated=True)
             clear_main_buffer(rfl, g_buffer_budget)
             break
 
@@ -2095,6 +2288,8 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
 
     # RST -> reap. FIN -> reap once the stream is fully drained.
     if flags & 0x04:
+        if rfl.soap_pending is not None:
+            _finish_soap_response(rfl, pending_tbl, rk, out, truncated=True)
         terminate_connection(flows, resp_flows, pending_tbl, g_flow_fifo, g_resp_flow_fifo,
                              g_buffer_budget, response_key=rk, out=out, reason="rst")
     elif flags & 0x01:
@@ -2102,6 +2297,8 @@ def handle_response(resp_flows, rk, payload, now, out, pending_tbl, seq=None, fl
             rfl.fin_seen = True
             rfl.fin_seq = (seq + plen) & 0xFFFFFFFF
         if not rfl.has_seq or seq_diff(rfl.fin_seq, rfl.next_seq) <= 0:
+            if rfl.soap_pending is not None:
+                _finish_soap_response(rfl, pending_tbl, rk, out)
             if rfl.state in (HTTP_STATE_HEADER, HTTP_STATE_CLOSE_BODY) and not rfl.buf and not rfl.ooo:
                 terminate_connection(flows, resp_flows, pending_tbl, g_flow_fifo, g_resp_flow_fifo,
                                      g_buffer_budget, response_key=rk, out=out, reason="fin")
@@ -2380,6 +2577,105 @@ def is_soap_content_type(value):
     return (media_type in ("text/xml", "application/xml",
                            "application/soap+xml") or
             media_type.endswith("+xml"))
+
+
+def is_soap_or_multipart_content_type(value):
+    if is_soap_content_type(value):
+        return True
+    low = (value or "").lower()
+    return (low.split(";", 1)[0].strip() == "multipart/related" and
+            ("application/xop+xml" in low or "text/xml" in low or
+             "application/soap+xml" in low))
+
+
+_SOAP_BODY_START_RE = re.compile(r"<(?:(?:[A-Za-z_][\w.-]*):)?Body\b[^>]*>", re.I)
+_SOAP_BODY_END_RE = re.compile(r"</(?:(?:[A-Za-z_][\w.-]*):)?Body\s*>", re.I)
+_SOAP_FAULT_START_RE = re.compile(r"<(?:(?:[A-Za-z_][\w.-]*):)?Fault\b", re.I)
+_SOAP_ATTR_RE = re.compile(r"(<\/?[A-Za-z_][\w.:-]*)\s+[^>]*(/?>)", re.S)
+_SOAP_SENSITIVE_RE = re.compile(
+    r"(<(?:(?:[A-Za-z_][\w.-]*):)?(?:Password|PasswordDigest|Nonce|"
+    r"BinarySecurityToken|SignatureValue|DigestValue|CipherValue|Token|Secret|"
+    r"Credential|Authorization)\b[^>]*>).*?(</(?:(?:[A-Za-z_][\w.-]*):)?"
+    r"(?:Password|PasswordDigest|Nonce|BinarySecurityToken|SignatureValue|"
+    r"DigestValue|CipherValue|Token|Secret|Credential|Authorization)\s*>)",
+    re.I | re.S)
+_SOAP_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{128,}={0,2}")
+
+
+def _soap_text(raw):
+    """Decode a bounded XML prefix and reject active XML declarations."""
+    if raw is None:
+        return None
+    data = bytes(raw)
+    low = data.lower()
+    if b"\x00" in data or b"<!doctype" in low or b"<!entity" in low:
+        return None
+    try:
+        return data.decode("utf-8", "replace")
+    except (AttributeError, UnicodeError):
+        return unicode(data, "utf-8", "replace") if PY2 else None
+
+
+def soap_body_excerpt(raw):
+    """Return a bounded, credential-scrubbed SOAP Body excerpt.
+
+    The SOAP Header is deliberately excluded, which keeps WS-Security tokens,
+    signatures and nonces out of error events. Attributes are removed from the
+    retained body tags and large Base64 runs are replaced as binary content.
+    """
+    text = _soap_text(raw)
+    if not text:
+        return None
+    match = _SOAP_BODY_START_RE.search(text)
+    if not match:
+        return None
+    body = text[match.end():]
+    body_end = _SOAP_BODY_END_RE.search(body)
+    if body_end:
+        body = body[:body_end.start()]
+    body = _SOAP_ATTR_RE.sub(r"\1\2", body)
+    body = _SOAP_SENSITIVE_RE.sub(r"\1[REDACTED]\2", body)
+    body = _SOAP_BASE64_RE.sub("[BINARY OMITTED]", body)
+    body = u"".join(ch if (ch in u"\r\n\t" or ord(ch) >= 32) else u"?"
+                    for ch in body)
+    body = body.strip()
+    if not body:
+        return None
+    return body[:MAX_SOAP_ERROR_EVENT_TEXT]
+
+
+def _soap_first_text(text, local_names):
+    for name in local_names:
+        pat = re.compile(r"<(?:(?:[A-Za-z_][\w.-]*):)?%s\b[^>]*>(.*?)</(?:(?:[A-Za-z_][\w.-]*):)?%s\s*>" %
+                         (name, name), re.I | re.S)
+        found = pat.search(text)
+        if found:
+            value = re.sub(r"<[^>]+>", "", found.group(1)).strip()
+            if value:
+                return value[:256]
+    return None
+
+
+def soap_fault_fields(raw):
+    """Extract bounded SOAP 1.1/1.2 Fault metadata, or None if no Fault."""
+    text = _soap_text(raw)
+    fault_start = _SOAP_FAULT_START_RE.search(text) if text else None
+    if not fault_start:
+        return None
+    fault_text = text[fault_start.start():]
+    return {
+        "soap_fault_code": _soap_first_text(fault_text, ("faultcode", "Value")),
+        "soap_fault_reason": _soap_first_text(fault_text, ("faultstring", "Text")),
+    }
+
+
+def response_content_type(head):
+    """Extract a bounded response Content-Type without retaining other headers."""
+    raw = bytes(head)
+    for line in raw.split(b"\r\n")[1:]:
+        if line[:13].lower() == b"content-type:":
+            return line[13:].strip().decode("ascii", "replace")[:256]
+    return ""
 
 
 def _trusted_proxy_ipv4(peer, spec):
@@ -3133,6 +3429,11 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
                              content_length > 0 and
                              not is_chunked and
                              g_wsse_active_flows < MAX_WSSE_BODY_FLOWS)
+            soap_error_eligible = (
+                g_soap_error_body_bytes > 0 and
+                is_soap_or_multipart_content_type(hdrs.get("content-type")) and
+                (content_length > 0 or is_chunked) and
+                g_pending_events_total < MAX_SOAP_ERROR_BODY_FLOWS)
 
             # Buffer up to min(content_length, wsse_body_bytes) bytes of the
             # SOAP prefix; queue the header-only event first so it can be
@@ -3163,9 +3464,23 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             # Not WSSE-eligible: emit the header-only event directly.
             else:
                 fl.awaiting_wsse = False
-                _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
-                                         generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
-                                         flows=flows, resp_flows=resp_flows)
+                req_id = _emit_request_to_pending(fl.event, fl.head_bytes, fl.first_byte_ts, meta, out, pending_tbl, now,
+                                                  generation=fl.generation, syn_seen=fl.syn_seen, corr_eligible=fl.corr_eligible,
+                                                  flows=flows, resp_flows=resp_flows)
+                fl.wsse_req_id = req_id
+                fl.wsse_rk = (dst_ip, dport, src_ip, sport) if req_id else None
+            if soap_error_eligible and fl.wsse_req_id:
+                fl.soap_req_id = fl.wsse_req_id
+                fl.soap_rk = fl.wsse_rk
+                fl.soap_content_type = hdrs.get("content-type") or ""
+                fl.soap_multipart_tail = bytearray()
+                soap_item = _pending_by_req_id(pending_tbl, fl.soap_rk, fl.soap_req_id)
+                if soap_item is not None:
+                    soap_item.soap_content_type = fl.soap_content_type
+            else:
+                fl.soap_req_id = 0
+                fl.soap_rk = None
+                fl.soap_content_type = ""
             # The event has been handed off; drop the flow's reference.
             fl.event = None
 
@@ -3191,6 +3506,9 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             if not fl.buf:
                 break
             to_consume = min(len(fl.buf), fl.body_remaining)
+            if fl.soap_req_id:
+                _capture_soap_request(fl, fl.buf[:to_consume], pending_tbl,
+                                      final=(fl.body_remaining <= to_consume))
             # Copy a bounded slice of the body into the WSSE buffer.
             if fl.awaiting_wsse:
                 wsse_need = fl.wsse_goal - len(fl.wsse_buf)
@@ -3318,6 +3636,8 @@ def handle_payload(flows, key, rev_key, payload, meta, ports, node_host, out,
             # Discard chunk payload bytes.
             else:
                 to_consume = min(len(fl.buf), fl.chunk_payload_remaining)
+                if fl.soap_req_id:
+                    _capture_soap_request(fl, fl.buf[:to_consume], pending_tbl)
                 consume_flow_buf(fl, to_consume, g_buffer_budget)
                 fl.chunk_payload_remaining -= to_consume
                 if fl.chunk_payload_remaining == 0:

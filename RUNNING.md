@@ -284,7 +284,27 @@ unsupported namespaces, invalid usernames, and requests exceeding concurrency
 bounds remain anonymous. Only the username is emitted; SOAP bodies, passwords,
 digests, nonces, and timestamps are discarded.
 
-### 4.4 Custom interface, ports, CPU, and ship threads
+### 4.4 SOAP error body reporting
+
+SOAP request and response details remain disabled by default. To report
+sanitized SOAP body excerpts only for HTTP 4xx/5xx responses or SOAP 1.1/1.2
+Fault responses (including a Fault returned with HTTP 200), set:
+
+```sh
+sudo NT_SOAP_ERROR_BODY_BYTES=2048 sh install-oldkernel.sh \
+  --server http://10.0.0.10:42000
+```
+
+The equivalent installer option is `--soap-error-body-bytes 2048`; accepted
+values are `0..2048`. Successful non-Fault calls remain header-only. SOAP
+headers are excluded, credential/token elements are redacted, long inline
+Base64 values are replaced, and DTD/entity input is omitted. For MTOM/XOP or
+SwA-style `multipart/related` traffic, attachment bytes are never emitted;
+only up to eight sanitized filenames are retained when part headers provide
+them. The feature holds at most 256 bounded candidates and preserves the
+atomic `PIPE_BUF` event limit.
+
+### 4.5 Custom interface, ports, CPU, and ship threads
 
 ```sh
 sudo NT_CAPTURE_MODE=python \
@@ -307,7 +327,7 @@ Important details:
 - `NT_SHIP_RATE_KBPS` affects both modes and is validated in `64..10000`.
 - `NT_WORKERS` is always overridden to `1` by the host safety boundary.
 
-### 4.5 Explicit bootstrap source
+### 4.6 Explicit bootstrap source
 
 The installer never derives a bootstrap URL from the ingest URL. Normally the
 saved first-run file uses its embedded payload. If a plain installer has no
@@ -319,7 +339,7 @@ sudo sh install-oldkernel.sh \
   --server http://10.0.0.10:42000
 ```
 
-### 4.6 Remote control token
+### 4.7 Remote control token
 
 All shipping modes can accept an authenticated `off` command in the response
 to their existing `POST /api/agent/stats` report. Python capture can also poll

@@ -434,3 +434,25 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   - Groups and links spans by `trace_id`, outputting combined traces to `/var/log/otel-collector-traces.jsonl` and individual spans to `/var/log/otel-collector-spans.jsonl`.
   - Live capture verified with multi-hop trace parent correlation across nodes.
   - Forwards traces to Elastic APM Server 7.17.24 at `http://129.150.59.233:32765` via NDJSON transaction intake (`/intake/v2/events`) with 100% acceptance.
+
+## SOAP Error-Only Body Reporting (2026-09-16) — Round 30
+- Python and C++ capture accept `NT_SOAP_ERROR_BODY_BYTES` /
+  `--soap-error-body-bytes 0..2048`; default `0` preserves header-only capture.
+- Bounded SOAP request candidates are discarded for successful non-Fault
+  responses. Sanitized `soap_request` / `soap_response` fields are emitted only
+  for HTTP 4xx/5xx or SOAP 1.1/1.2 Faults, including Faults returned with HTTP
+  200. SOAP headers are excluded and credential/token elements, long Base64
+  values, DTDs and entities are suppressed.
+- MTOM/XOP and SwA-style `multipart/related` payloads retain at most eight
+  sanitized filenames from part headers; attachment content is never emitted.
+- Response emission remains correlated by request ID/generation and is deferred
+  only until the bounded response window or framed body end. At most 256
+  candidates are admitted and native output remains within `PIPE_BUF`.
+- Both shippers map SOAP error fields into bounded Hub events and OTLP custom
+  attributes. Installer, Ansible configuration, EL6 prebuilts and the embedded
+  first-run bundle carry the option.
+- Verification: `pytest` **76/76 PASS**; dual-engine synthetic suite **124/124
+  PASS**; ASAN/UBSAN edge suite **ALL PASS**; PCAP 247/249 counts unchanged with
+  zero secret leaks; strict C++03 `-Werror`, Python compile, POSIX shell syntax
+  and diff whitespace checks pass. CentOS 6.8 prebuilts were rebuilt and
+  verified; bundle size is **1,246,914 bytes**.

@@ -13,7 +13,7 @@ def checked_env(tmp_path):
     env = os.environ.copy()
     env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
     for name in ("NT_IFACE", "NT_PORTS", "NT_CAPTURE_MODE",
-                 "NT_WSSE_BODY_BYTES", "NT_CPU_CORE", "NT_SHIP_THREADS",
+                 "NT_WSSE_BODY_BYTES", "NT_SOAP_ERROR_BODY_BYTES", "NT_CPU_CORE", "NT_SHIP_THREADS",
                  "NT_SHIP_RATE_KBPS", "NT_STATS_INTERVAL_SEC", "NT_HUB",
                  "NT_CONTROL_TOKEN"):
         env.pop(name, None)
@@ -24,7 +24,8 @@ def test_server_url_and_friendly_flags_reach_preflight(tmp_path):
     proc = subprocess.run([
         "sh", INSTALLER, "--server", "http://hub.local:43123", "--iface", "eth0",
         "--ports", "80,8001,8080", "--mode", "python",
-        "--wsse-bytes", "16384", "--ship-threads", "4", "--offline",
+        "--wsse-bytes", "16384", "--soap-error-body-bytes", "2048",
+        "--ship-threads", "4", "--offline",
         "--ship-rate-kbps", "512",
         "--stats-interval-sec", "60",
         "--check"],
@@ -52,6 +53,7 @@ def test_invalid_friendly_values_fail_before_preflight(tmp_path):
         ("--server", "http://hub:43123", "--ports", "65536"),
         ("--server", "http://hub:43123", "--mode", "fast"),
         ("--server", "http://hub:43123", "--wsse-bytes", "65537"),
+        ("--server", "http://hub:43123", "--soap-error-body-bytes", "2049"),
         ("--server", "http://hub:43123", "--ship-threads", "0"),
         ("--server", "http://hub:43123", "--ship-threads", "9"),
         ("--server", "http://hub:43123", "--ship-rate-kbps", "63"),

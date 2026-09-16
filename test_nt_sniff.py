@@ -99,6 +99,92 @@ def test_wsse_configuration_bounds():
         nt_sniff.parse_wsse_body_bytes(nt_sniff.MAX_WSSE_BODY_BYTES + 1)
 
 
+def _soap_error_exchange(status, response_body):
+    nt_sniff.g_soap_error_body_bytes = 2048
+    nt_sniff.g_pending_events_total = 0
+    nt_sniff.pending.clear()
+    flows, resp_flows, out = {}, {}, []
+    client, server = "10.10.0.1", "10.10.0.2"
+    sport, dport = 41000, 18080
+    request_body = (
+        b'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+        b'<s:Header><Password>HEADER_SECRET</Password></s:Header>'
+        b'<s:Body><CreateOrder><orderId>42</orderId>'
+        b'<Password>BODY_SECRET</Password></CreateOrder></s:Body></s:Envelope>')
+    request_head = (b"POST /soap HTTP/1.1\r\nHost: fixture\r\n"
+                    b"Content-Type: application/soap+xml\r\n"
+                    b"Content-Length: %d\r\n\r\n" % len(request_body))
+    response_head = (b"HTTP/1.1 %d Test\r\nContent-Type: application/soap+xml\r\n"
+                     b"Content-Length: %d\r\n\r\n" %
+                     (status, len(response_body)))
+    packets = [
+        _make_tcp_pkt(client, sport, server, dport, 1000, 0, 0x02, b""),
+        _make_tcp_pkt(server, dport, client, sport, 5000, 1001, 0x12, b""),
+        _make_tcp_pkt(client, sport, server, dport, 1001, 5001, 0x18,
+                      request_head + request_body),
+        _make_tcp_pkt(server, dport, client, sport, 5001,
+                      1001 + len(request_head) + len(request_body), 0x18,
+                      response_head + response_body),
+    ]
+    for index, packet in enumerate(packets):
+        nt_sniff.process_packet(packet, {dport}, "fixture", flows, resp_flows,
+                                nt_sniff.pending, out, now=100.0 + index)
+    nt_sniff.g_soap_error_body_bytes = 0
+    return out
+
+
+def test_soap_http_error_reports_sanitized_request_and_fault_response():
+    fault = (b'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+             b'<s:Body><s:Fault><faultcode>s:Server</faultcode>'
+             b'<faultstring>Database unavailable</faultstring>'
+             b'<detail><Password>FAULT_SECRET</Password></detail>'
+             b'</s:Fault></s:Body></s:Envelope>')
+    out = _soap_error_exchange(500, fault)
+    assert len(out) == 1
+    assert out[0]["status"] == 500
+    assert "CreateOrder" in out[0]["soap_request"]
+    assert out[0]["soap_fault_reason"] == "Database unavailable"
+    serialized = json.dumps(out[0])
+    assert "BODY_SECRET" not in serialized
+    assert "HEADER_SECRET" not in serialized
+    assert "FAULT_SECRET" not in serialized
+
+
+def test_soap_fault_with_http_200_is_still_reported():
+    fault = (b'<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">'
+             b'<env:Body><env:Fault><env:Code><env:Value>env:Receiver</env:Value>'
+             b'</env:Code><env:Reason><env:Text>Backend failed</env:Text>'
+             b'</env:Reason></env:Fault></env:Body></env:Envelope>')
+    out = _soap_error_exchange(200, fault)
+    assert len(out) == 1
+    assert out[0]["status"] == 200
+    assert out[0]["soap_fault_reason"] == "Backend failed"
+
+
+def test_successful_soap_response_stays_header_only():
+    ok = (b'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+          b'<s:Body><CreateOrderResponse><ok>true</ok>'
+          b'</CreateOrderResponse></s:Body></s:Envelope>')
+    out = _soap_error_exchange(200, ok)
+    assert len(out) == 1
+    assert out[0]["status"] == 200
+    assert "soap_request" not in out[0]
+    assert "soap_response" not in out[0]
+
+
+def test_mtom_filename_is_kept_but_attachment_content_is_not():
+    fl = nt_sniff.Flow()
+    item = nt_sniff.PendingRequest({}, 1.0, 1, 1)
+    item.soap_content_type = "multipart/related; type=application/xop+xml"
+    nt_sniff._scan_multipart_filenames(
+        fl, item, b"\r\nContent-Disposition: attachment; file")
+    nt_sniff._scan_multipart_filenames(
+        fl, item,
+        b'name="C:\\uploads\\invoice.pdf"\r\nContent-Type: application/pdf\r\n\r\nFILE_SECRET')
+    assert item.uploaded_files == ["invoice.pdf"]
+    assert "FILE_SECRET" not in repr(item.uploaded_files)
+
+
 def test_xff_is_used_only_for_configured_trusted_proxy(monkeypatch):
     monkeypatch.setenv("NT_TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
     assert nt_sniff.caller_from_xff("10.0.0.9", "198.51.100.8, 10.0.0.2") == ("198.51.100.8", "xff")
@@ -675,5 +761,3 @@ def test_pending_accounting_lifecycle_and_overflow_failsafe():
     assert nt_sniff.g_pending_events_total == 0
     assert len(pending) == 0
     nt_sniff.assert_internal_invariants(flows, resp_flows, pending)
-
-

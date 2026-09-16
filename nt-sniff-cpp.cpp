@@ -148,6 +148,9 @@ static const size_t MAX_WSSE_BODY_BYTES = 65536;
  * username is limited to 200 code points (MAX_WSSE_USERNAME * 4 bytes). */
 static const size_t MAX_WSSE_BODY_FLOWS = 256;
 static const size_t MAX_WSSE_USERNAME = 200;
+static const size_t MAX_SOAP_ERROR_BODY_BYTES = 2048;
+static const size_t MAX_SOAP_ERROR_BODY_FLOWS = 256;
+static const size_t MAX_SOAP_ERROR_EVENT_TEXT = 768;
 /* Shipper bounds: events per HTTP batch, bounded in-memory queue depth, and
  * the maximum encoded body sizes for /api/ingest and /api/agent/stats. */
 static const size_t MAX_BATCH = 400;
@@ -506,9 +509,12 @@ struct Event {
   long ts; std::string host, src, service, method, path, user, scheme, probe;
   std::string basic_user, wsse_user;
   std::string host_hdr, user_agent, xff, caller, network_peer, dst_ip, traceparent, trace_id, span_id, parent_span_id, trace_context_source;
+  std::string soap_request, soap_response, soap_fault_code, soap_fault_reason;
+  std::vector<std::string> uploaded_files;
+  bool soap_request_truncated, soap_response_truncated;
   unsigned caller_port, dst_port, req_bytes, resp_bytes; int status; long duration_ms;
   bool has_status, has_duration, has_resp;
-  Event() : ts(0), caller_port(0), dst_port(0), req_bytes(0), resp_bytes(0), status(0), duration_ms(0), has_status(false), has_duration(false), has_resp(false) {}
+  Event() : ts(0), soap_request_truncated(false), soap_response_truncated(false), caller_port(0), dst_port(0), req_bytes(0), resp_bytes(0), status(0), duration_ms(0), has_status(false), has_duration(false), has_resp(false) {}
 };
 /* Framing metadata gathered while parsing a request's header block. It decides
  * the request-body state (no body / Content-Length / chunked) and whether the
@@ -680,6 +686,14 @@ struct Flow {
   size_t wsse_last_parsed_len;
   uint64_t wsse_req_id;
   PacketKey wsse_rk;
+  uint64_t soap_req_id;
+  std::string soap_content_type;
+  std::string soap_multipart_tail;
+  bool has_soap_pending;
+  uint64_t soap_pending_req_id;
+  std::string soap_response_buf;
+  bool soap_response_http_error;
+  bool soap_response_truncated;
   bool fin_seen;
   uint32_t fin_seq;
 
@@ -688,6 +702,8 @@ struct Flow {
            state(HTTP_STATE_HEADER), body_remaining(0), chunk_payload_remaining(0),
            chunk_reading_len(true), chunk_reading_crlf(false), chunk_reading_trailer(false),
            awaiting_wsse(false), wsse_goal(0), wsse_last_parsed_len(0), wsse_req_id(0),
+           soap_req_id(0), has_soap_pending(false), soap_pending_req_id(0),
+           soap_response_http_error(false), soap_response_truncated(false),
            fin_seen(false), fin_seq(0) {}
 
   /* Reset this direction for a new connection lifetime on a reused 4-tuple:
@@ -717,6 +733,14 @@ struct Flow {
     wsse_goal = 0;
     wsse_last_parsed_len = 0;
     wsse_req_id = 0;
+    soap_req_id = 0;
+    soap_content_type.clear();
+    release_string(soap_multipart_tail);
+    has_soap_pending = false;
+    soap_pending_req_id = 0;
+    release_string(soap_response_buf);
+    soap_response_http_error = false;
+    soap_response_truncated = false;
     fin_seen = false;
     fin_seq = 0;
   }
@@ -752,6 +776,12 @@ struct Flow {
     release_string(buf);
 
     wsse_cancel();
+    release_string(soap_response_buf);
+    has_soap_pending = false;
+    soap_pending_req_id = 0;
+    soap_req_id = 0;
+    soap_content_type.clear();
+    release_string(soap_multipart_tail);
 
     for (size_t i = 0; i < ooo.size(); ++i) {
       flow_bytes_sub(ooo[i].data.size());
@@ -917,16 +947,20 @@ struct Pending {
   uint64_t req_id;
   uint32_t generation;
   Event ev;
+  std::string soap_request_raw;
+  std::string soap_content_type;
+  std::vector<std::string> uploaded_files;
+  bool soap_request_truncated;
   long long started_wall_ms;
   long long started_mono_ms;
   bool is_tombstone;
   long long tombstone_mono_ms;
   std::list<PendingQueueRef>::iterator fifo_it;
   bool in_fifo;
-  Pending() : req_id(0), generation(0), started_wall_ms(0), started_mono_ms(0),
+  Pending() : req_id(0), generation(0), soap_request_truncated(false), started_wall_ms(0), started_mono_ms(0),
               is_tombstone(false), tombstone_mono_ms(0), in_fifo(false) {}
   Pending(uint64_t id, uint32_t gen, const Event &e, long long wall_t, long long mono_t)
-    : req_id(id), generation(gen), ev(e), started_wall_ms(wall_t), started_mono_ms(mono_t),
+    : req_id(id), generation(gen), ev(e), soap_request_truncated(false), started_wall_ms(wall_t), started_mono_ms(mono_t),
       is_tombstone(false), tombstone_mono_ms(0), in_fifo(false) {}
 };
 
@@ -1329,6 +1363,127 @@ static bool is_soap_content_type(const std::string &ct) {
   return x.find("text/xml") != std::string::npos ||
          x.find("application/soap+xml") != std::string::npos ||
          x.find("+xml") != std::string::npos;
+}
+
+static bool is_soap_or_multipart_content_type(const std::string &ct) {
+  if (is_soap_content_type(ct)) return true;
+  std::string x = lower(ct);
+  return x.find("multipart/related") != std::string::npos &&
+         (x.find("application/xop+xml") != std::string::npos ||
+          x.find("text/xml") != std::string::npos ||
+          x.find("application/soap+xml") != std::string::npos);
+}
+
+static bool xml_tag_at(const std::string &s, size_t lt, bool *closing,
+                       std::string *qname, std::string *local, size_t *gt) {
+  if (lt >= s.size() || s[lt] != '<') return false;
+  size_t p = lt + 1;
+  *closing = false;
+  if (p < s.size() && s[p] == '/') { *closing = true; ++p; }
+  size_t start = p;
+  while (p < s.size() && (isalnum((unsigned char)s[p]) || s[p]=='_' || s[p]=='-' || s[p]=='.' || s[p]==':')) ++p;
+  if (p == start) return false;
+  *qname = s.substr(start, p - start);
+  size_t colon = qname->rfind(':');
+  *local = lower(colon == std::string::npos ? *qname : qname->substr(colon + 1));
+  *gt = s.find('>', p);
+  return *gt != std::string::npos;
+}
+
+static bool soap_sensitive_local(const std::string &local) {
+  return local == "password" || local == "passworddigest" || local == "nonce" ||
+         local == "binarysecuritytoken" || local == "signaturevalue" ||
+         local == "digestvalue" || local == "ciphervalue" || local == "token" ||
+         local == "secret" || local == "credential" || local == "authorization";
+}
+
+static std::string omit_long_base64(const std::string &in) {
+  std::string out;
+  for (size_t i = 0; i < in.size();) {
+    size_t j = i;
+    while (j < in.size() && (isalnum((unsigned char)in[j]) || in[j]=='+' || in[j]=='/' || in[j]=='=')) ++j;
+    if (j - i >= 128) out += "[BINARY OMITTED]";
+    else out.append(in, i, j - i);
+    if (j == i) { out += in[i]; ++i; }
+    else i = j;
+  }
+  return out;
+}
+
+static std::string soap_body_excerpt(const std::string &raw) {
+  if (raw.empty() || raw.find('\0') != std::string::npos) return "";
+  std::string low = lower(raw);
+  if (low.find("<!doctype") != std::string::npos || low.find("<!entity") != std::string::npos) return "";
+  size_t pos = 0, body_gt = std::string::npos;
+  while ((pos = raw.find('<', pos)) != std::string::npos) {
+    bool closing; std::string qname, local; size_t gt;
+    if (xml_tag_at(raw, pos, &closing, &qname, &local, &gt) && !closing && local == "body") { body_gt = gt; break; }
+    ++pos;
+  }
+  if (body_gt == std::string::npos) return "";
+  pos = body_gt + 1;
+  std::string out, redacting;
+  while (pos < raw.size() && out.size() < MAX_SOAP_ERROR_EVENT_TEXT * 2) {
+    size_t lt = raw.find('<', pos);
+    if (lt == std::string::npos) lt = raw.size();
+    if (redacting.empty()) out.append(raw, pos, lt - pos);
+    if (lt == raw.size()) break;
+    bool closing; std::string qname, local; size_t gt;
+    if (!xml_tag_at(raw, lt, &closing, &qname, &local, &gt)) { pos = lt + 1; continue; }
+    if (closing && local == "body" && redacting.empty()) break;
+    if (redacting.empty()) {
+      out += closing ? "</" : "<"; out += qname; out += ">";
+      if (!closing && soap_sensitive_local(local)) { out += "[REDACTED]"; redacting = local; }
+    } else if (closing && local == redacting) {
+      out += "</" + qname + ">"; redacting.clear();
+    }
+    pos = gt + 1;
+  }
+  out = trim(omit_long_base64(out));
+  if (out.size() > MAX_SOAP_ERROR_EVENT_TEXT) out.resize(MAX_SOAP_ERROR_EVENT_TEXT);
+  return out;
+}
+
+static std::string soap_first_text(const std::string &raw, const char *a, const char *b) {
+  size_t fault = lower(raw).find("fault");
+  if (fault == std::string::npos) return "";
+  size_t pos = raw.rfind('<', fault);
+  if (pos == std::string::npos) pos = 0;
+  while ((pos = raw.find('<', pos)) != std::string::npos) {
+    bool closing; std::string qname, local; size_t gt;
+    if (!xml_tag_at(raw, pos, &closing, &qname, &local, &gt)) { ++pos; continue; }
+    if (!closing && (local == lower(a) || local == lower(b))) {
+      size_t next = raw.find('<', gt + 1);
+      if (next != std::string::npos) {
+        std::string value = trim(raw.substr(gt + 1, next - gt - 1));
+        if (value.size() > 256) value.resize(256);
+        return value;
+      }
+    }
+    pos = gt + 1;
+  }
+  return "";
+}
+
+static bool soap_has_fault(const std::string &raw) {
+  size_t pos = 0;
+  while ((pos = raw.find('<', pos)) != std::string::npos) {
+    bool closing; std::string qname, local; size_t gt;
+    if (xml_tag_at(raw, pos, &closing, &qname, &local, &gt) && !closing && local == "fault") return true;
+    ++pos;
+  }
+  return false;
+}
+
+static std::string response_content_type(const char *data, size_t len) {
+  std::string head(data, len), low = lower(head);
+  size_t p = low.find("\r\ncontent-type:");
+  if (p == std::string::npos) return "";
+  p += 15;
+  size_t e = head.find("\r\n", p);
+  std::string value = trim(head.substr(p, e == std::string::npos ? std::string::npos : e - p));
+  if (value.size() > 256) value.resize(256);
+  return value;
 }
 
 /* Split an XML qualified name "prefix:local" into its two halves. A name with
@@ -1742,6 +1897,7 @@ static std::string g_ship_node;
 static unsigned g_ship_rate_kbps = DEFAULT_SHIP_RATE_KBPS;
 static unsigned g_stats_interval_sec = 30;
 static size_t g_wsse_body_bytes = 0;
+static size_t g_soap_error_body_bytes = 0;
 /* Runtime counters, all monotonic. Grouped by concern: capture (packets/bytes,
  * kernel drops, truncated/invalid frames), event production, and shipping
  * (pushed/dropped/batches/bytes). g_prev_* hold the previous stats snapshot for
@@ -2336,6 +2492,22 @@ static std::string format_event_json(const Event &e) {
   if (e.has_status) ss << ",\"status\":" << e.status; else ss << ",\"status\":null";
   if (e.has_duration) ss << ",\"duration_ms\":" << e.duration_ms; else ss << ",\"duration_ms\":null";
   if (e.has_resp) ss << ",\"resp_bytes\":" << e.resp_bytes; else ss << ",\"resp_bytes\":null";
+  if (!e.soap_request.empty()) ss << ",\"soap_request\":" << jsonq(e.soap_request);
+  if (!e.soap_response.empty()) ss << ",\"soap_response\":" << jsonq(e.soap_response);
+  if (!e.soap_fault_code.empty()) ss << ",\"soap_fault_code\":" << jsonq(e.soap_fault_code);
+  if (!e.soap_fault_reason.empty()) ss << ",\"soap_fault_reason\":" << jsonq(e.soap_fault_reason);
+  if (!e.uploaded_files.empty()) {
+    ss << ",\"uploaded_files\":[";
+    for (size_t i = 0; i < e.uploaded_files.size(); ++i) {
+      if (i) ss << ',';
+      ss << jsonq(e.uploaded_files[i]);
+    }
+    ss << ']';
+  }
+  if (!e.soap_request.empty() || !e.soap_response.empty()) {
+    ss << ",\"soap_request_truncated\":" << (e.soap_request_truncated ? "true" : "false")
+       << ",\"soap_response_truncated\":" << (e.soap_response_truncated ? "true" : "false");
+  }
   ss << "}";
   return ss.str();
 }
@@ -2368,6 +2540,12 @@ static void emit_event(Event e) {
   e.trace_id = sanitize_utf8_truncate(e.trace_id, 32);
   e.span_id = sanitize_utf8_truncate(e.span_id, 16);
   e.parent_span_id = sanitize_utf8_truncate(e.parent_span_id, 16);
+  e.soap_request = sanitize_utf8_truncate(e.soap_request, MAX_SOAP_ERROR_EVENT_TEXT);
+  e.soap_response = sanitize_utf8_truncate(e.soap_response, MAX_SOAP_ERROR_EVENT_TEXT);
+  e.soap_fault_code = sanitize_utf8_truncate(e.soap_fault_code, 256);
+  e.soap_fault_reason = sanitize_utf8_truncate(e.soap_fault_reason, 256);
+  for (size_t i = 0; i < e.uploaded_files.size(); ++i)
+    e.uploaded_files[i] = sanitize_utf8_truncate(e.uploaded_files[i], 128);
 
   std::string line = format_event_json(e);
   if (line.size() + 1 > PIPE_BUF) {
@@ -2389,6 +2567,22 @@ static void emit_event(Event e) {
     }
     if (line.size() + 1 > PIPE_BUF && e.path.size() > 32) {
       e.path = sanitize_utf8_truncate(e.path, 32);
+      line = format_event_json(e);
+    }
+    if (line.size() + 1 > PIPE_BUF && !e.soap_request.empty()) {
+      e.soap_request = sanitize_utf8_truncate(e.soap_request, 256);
+      line = format_event_json(e);
+    }
+    if (line.size() + 1 > PIPE_BUF && !e.soap_response.empty()) {
+      e.soap_response = sanitize_utf8_truncate(e.soap_response, 256);
+      line = format_event_json(e);
+    }
+    if (line.size() + 1 > PIPE_BUF) {
+      e.soap_request.clear(); e.soap_response.clear();
+      line = format_event_json(e);
+    }
+    if (line.size() + 1 > PIPE_BUF && !e.uploaded_files.empty()) {
+      release_vector(e.uploaded_files);
       line = format_event_json(e);
     }
   }
@@ -2859,6 +3053,91 @@ static uint64_t queue_request(Connection &conn, const Event &e, long long first_
   return req_id;
 }
 
+static Pending *pending_by_req_id(Connection &conn, uint64_t req_id) {
+  if (!req_id) return NULL;
+  for (size_t i = 0; i < conn.pending.size(); ++i)
+    if (conn.pending[i].req_id == req_id) return &conn.pending[i];
+  return NULL;
+}
+
+static void scan_multipart_filenames(Flow &fl, Pending &p, const char *data, size_t len) {
+  if (lower(p.soap_content_type).find("multipart/related") == std::string::npos || !len) return;
+  std::string scan = fl.soap_multipart_tail;
+  scan.append(data, len);
+  std::string low = lower(scan);
+  size_t pos = 0;
+  while (p.uploaded_files.size() < 8 && (pos = low.find("content-disposition:", pos)) != std::string::npos) {
+    size_t end = low.find("\r\n", pos);
+    if (end == std::string::npos || end - pos > 512) { ++pos; continue; }
+    size_t fn = low.find("filename", pos);
+    if (fn == std::string::npos || fn >= end) { pos = end + 2; continue; }
+    fn += 8;
+    if (fn < end && scan[fn] == '*') ++fn;
+    while (fn < end && isspace((unsigned char)scan[fn])) ++fn;
+    if (fn >= end || scan[fn] != '=') { pos = end + 2; continue; }
+    ++fn; while (fn < end && isspace((unsigned char)scan[fn])) ++fn;
+    size_t stop = end;
+    if (fn < end && scan[fn] == '"') { ++fn; stop = scan.find('"', fn); if (stop == std::string::npos || stop > end) stop = end; }
+    else { size_t semi = scan.find(';', fn); if (semi != std::string::npos && semi < end) stop = semi; }
+    std::string name = trim(scan.substr(fn, stop - fn));
+    size_t enc = name.find("''"); if (enc != std::string::npos) name.erase(0, enc + 2);
+    size_t slash = name.find_last_of("/\\"); if (slash != std::string::npos) name.erase(0, slash + 1);
+    name = sanitize_utf8_truncate(name, 128);
+    bool duplicate = false;
+    for (size_t i = 0; i < p.uploaded_files.size(); ++i) if (p.uploaded_files[i] == name) duplicate = true;
+    if (!name.empty() && !duplicate) p.uploaded_files.push_back(name);
+    pos = end + 2;
+  }
+  if (scan.size() > 640) fl.soap_multipart_tail.assign(scan, scan.size() - 640, 640);
+  else fl.soap_multipart_tail.swap(scan);
+}
+
+static void capture_soap_request(Connection &conn, Flow &fl, const char *data,
+                                 size_t len, bool final) {
+  Pending *p = pending_by_req_id(conn, fl.soap_req_id);
+  if (!p || !g_soap_error_body_bytes) return;
+  scan_multipart_filenames(fl, *p, data, len);
+  size_t remaining = p->soap_request_raw.size() < g_soap_error_body_bytes ?
+                     g_soap_error_body_bytes - p->soap_request_raw.size() : 0;
+  size_t copy_len = len < remaining ? len : remaining;
+  if (copy_len) p->soap_request_raw.append(data, copy_len);
+  if (len > remaining || (final && fl.body_remaining > len)) p->soap_request_truncated = true;
+}
+
+static void finish_soap_response(Connection &conn, Flow &rfl) {
+  if (!rfl.has_soap_pending) return;
+  Pending *p = pending_by_req_id(conn, rfl.soap_pending_req_id);
+  if (!p) {
+    rfl.has_soap_pending = false; release_string(rfl.soap_response_buf); return;
+  }
+  bool fault = soap_has_fault(rfl.soap_response_buf);
+  if (rfl.soap_response_http_error || fault) {
+    p->ev.soap_request = soap_body_excerpt(p->soap_request_raw);
+    p->ev.soap_response = soap_body_excerpt(rfl.soap_response_buf);
+    if (fault) {
+      p->ev.soap_fault_code = soap_first_text(rfl.soap_response_buf, "faultcode", "value");
+      p->ev.soap_fault_reason = soap_first_text(rfl.soap_response_buf, "faultstring", "text");
+    }
+    p->ev.soap_request_truncated = p->soap_request_truncated;
+    p->ev.soap_response_truncated = rfl.soap_response_truncated;
+    p->ev.uploaded_files = p->uploaded_files;
+  }
+  emit_event(p->ev);
+  for (size_t i = 0; i < conn.pending.size(); ++i) {
+    if (conn.pending[i].req_id == rfl.soap_pending_req_id) {
+      remove_pending_from_fifo(conn.pending[i]);
+      if (!conn.pending[i].is_tombstone && g_total_pending_count > 0) --g_total_pending_count;
+      conn.pending.erase(conn.pending.begin() + i);
+      break;
+    }
+  }
+  rfl.has_soap_pending = false;
+  rfl.soap_pending_req_id = 0;
+  release_string(rfl.soap_response_buf);
+  rfl.soap_response_http_error = false;
+  rfl.soap_response_truncated = false;
+}
+
 /* True when a direction is at a safe idle point: header state, nothing
  * buffered, nothing out of order, no WSSE body pending, and no partial message
  * length counters outstanding. Only such flows may be silently dropped by the
@@ -3167,8 +3446,22 @@ static void process_request_payload(Connection &conn,
                             meta.content_length > 0 &&
                             !has_chunked &&
                             g_wsse_body_flows_active < MAX_WSSE_BODY_FLOWS);
+      bool soap_error_eligible = (g_soap_error_body_bytes > 0 &&
+                                  is_soap_or_multipart_content_type(meta.content_type) &&
+                                  ((meta.has_content_length && meta.content_length > 0) || has_chunked) &&
+                                  g_total_pending_count < MAX_SOAP_ERROR_BODY_FLOWS);
 
       uint64_t req_id = queue_request(conn, e, fl.first_byte_mono_ms, connections, conn_lru, wsse_eligible);
+      if (soap_error_eligible && req_id != 0) {
+        fl.soap_req_id = req_id;
+        fl.soap_content_type = meta.content_type;
+        release_string(fl.soap_multipart_tail);
+        Pending *soap_p = pending_by_req_id(conn, req_id);
+        if (soap_p) soap_p->soap_content_type = meta.content_type;
+      } else {
+        fl.soap_req_id = 0;
+        fl.soap_content_type.clear();
+      }
 
       if (wsse_eligible && req_id != 0) {
         fl.awaiting_wsse = true;
@@ -3201,6 +3494,8 @@ static void process_request_payload(Connection &conn,
     if (fl.state == Flow::HTTP_STATE_BODY) {
       if (fl.buf.empty()) break;
       size_t to_consume = (fl.buf.size() < fl.body_remaining) ? fl.buf.size() : fl.body_remaining;
+      if (fl.soap_req_id)
+        capture_soap_request(conn, fl, fl.buf.data(), to_consume, fl.body_remaining <= to_consume);
 
       if (fl.awaiting_wsse) {
         size_t wsse_need = fl.wsse_goal > fl.wsse_buf.size() ? fl.wsse_goal - fl.wsse_buf.size() : 0;
@@ -3341,6 +3636,7 @@ static void process_request_payload(Connection &conn,
         fl.chunk_reading_len = true;
       } else {
         size_t to_consume = (fl.buf.size() < fl.chunk_payload_remaining) ? fl.buf.size() : fl.chunk_payload_remaining;
+        if (fl.soap_req_id) capture_soap_request(conn, fl, fl.buf.data(), to_consume, false);
         fl.buf_erase(0, to_consume);
         fl.chunk_payload_remaining -= to_consume;
         if (fl.chunk_payload_remaining == 0) {
@@ -3504,6 +3800,7 @@ static void process_response_payload(Connection &conn,
         rfl.buf_erase(0, end + 4);
         continue;
       }
+      std::string resp_content_type = response_content_type(rfl.buf.data(), end + 2);
 
       if (st == 101) {
         if (conn.has_deferred_wsse) {
@@ -3583,20 +3880,31 @@ static void process_response_payload(Connection &conn,
             remove_pending_from_fifo(front);
             conn.pending.erase(conn.pending.begin());
           } else {
-            Event e = front.ev;
-            e.status = st;
-            e.has_status = true;
-            e.duration_ms = (long)(mono_now - front.started_mono_ms);
-            if (e.duration_ms < 0) e.duration_ms = 0;
-            e.has_duration = true;
+            front.ev.status = st;
+            front.ev.has_status = true;
+            front.ev.duration_ms = (long)(mono_now - front.started_mono_ms);
+            if (front.ev.duration_ms < 0) front.ev.duration_ms = 0;
+            front.ev.has_duration = true;
             if (has_cl) {
-              e.resp_bytes = (unsigned)cl;
-              e.has_resp = true;
+              front.ev.resp_bytes = (unsigned)cl;
+              front.ev.has_resp = true;
             }
-            emit_event(e);
-            if (g_total_pending_count > 0) --g_total_pending_count;
-            remove_pending_from_fifo(front);
-            conn.pending.erase(conn.pending.begin());
+            bool soap_defer = (g_soap_error_body_bytes > 0 &&
+                               !front.soap_content_type.empty() &&
+                               ((st >= 400 && st <= 599) ||
+                                is_soap_or_multipart_content_type(resp_content_type)));
+            if (soap_defer) {
+              rfl.has_soap_pending = true;
+              rfl.soap_pending_req_id = front.req_id;
+              release_string(rfl.soap_response_buf);
+              rfl.soap_response_http_error = (st >= 400 && st <= 599);
+              rfl.soap_response_truncated = false;
+            } else {
+              emit_event(front.ev);
+              if (g_total_pending_count > 0) --g_total_pending_count;
+              remove_pending_from_fifo(front);
+              conn.pending.erase(conn.pending.begin());
+            }
           }
         }
       }
@@ -3623,15 +3931,29 @@ static void process_response_payload(Connection &conn,
       } else {
         rfl.state = Flow::HTTP_STATE_CLOSE_BODY;
       }
+      if (rfl.has_soap_pending && rfl.state == Flow::HTTP_STATE_HEADER)
+        finish_soap_response(conn, rfl);
       continue;
     }
 
     if (rfl.state == Flow::HTTP_STATE_BODY) {
       if (rfl.buf.empty()) break;
       size_t to_consume = (rfl.buf.size() < rfl.body_remaining) ? rfl.buf.size() : rfl.body_remaining;
+      if (rfl.has_soap_pending) {
+        size_t remaining = rfl.soap_response_buf.size() < g_soap_error_body_bytes ?
+                           g_soap_error_body_bytes - rfl.soap_response_buf.size() : 0;
+        size_t copy_len = to_consume < remaining ? to_consume : remaining;
+        if (copy_len) rfl.soap_response_buf.append(rfl.buf.data(), copy_len);
+        if (to_consume > remaining) rfl.soap_response_truncated = true;
+      }
       rfl.buf_erase(0, to_consume);
       rfl.body_remaining -= to_consume;
+      if (rfl.has_soap_pending && rfl.soap_response_buf.size() >= g_soap_error_body_bytes) {
+        if (rfl.body_remaining > 0) rfl.soap_response_truncated = true;
+        finish_soap_response(conn, rfl);
+      }
       if (rfl.body_remaining == 0) {
+        if (rfl.has_soap_pending) finish_soap_response(conn, rfl);
         rfl.state = Flow::HTTP_STATE_HEADER;
       }
       continue;
@@ -3694,6 +4016,7 @@ static void process_response_payload(Connection &conn,
         }
         rfl.buf_erase(0, crlf + 2);
         if (parsed_len == 0) {
+          if (rfl.has_soap_pending) finish_soap_response(conn, rfl);
           rfl.chunk_reading_trailer = true;
           rfl.chunk_reading_len = false;
           continue;
@@ -3713,8 +4036,19 @@ static void process_response_payload(Connection &conn,
         rfl.chunk_reading_len = true;
       } else {
         size_t to_consume = (rfl.buf.size() < rfl.chunk_payload_remaining) ? rfl.buf.size() : rfl.chunk_payload_remaining;
+        if (rfl.has_soap_pending) {
+          size_t remaining = rfl.soap_response_buf.size() < g_soap_error_body_bytes ?
+                             g_soap_error_body_bytes - rfl.soap_response_buf.size() : 0;
+          size_t copy_len = to_consume < remaining ? to_consume : remaining;
+          if (copy_len) rfl.soap_response_buf.append(rfl.buf.data(), copy_len);
+          if (to_consume > remaining) rfl.soap_response_truncated = true;
+        }
         rfl.buf_erase(0, to_consume);
         rfl.chunk_payload_remaining -= to_consume;
+        if (rfl.has_soap_pending && rfl.soap_response_buf.size() >= g_soap_error_body_bytes) {
+          rfl.soap_response_truncated = true;
+          finish_soap_response(conn, rfl);
+        }
         if (rfl.chunk_payload_remaining == 0) {
           rfl.chunk_reading_crlf = true;
         }
@@ -3723,6 +4057,15 @@ static void process_response_payload(Connection &conn,
     }
 
     if (rfl.state == Flow::HTTP_STATE_CLOSE_BODY) {
+      if (rfl.has_soap_pending && !rfl.buf.empty()) {
+        size_t remaining = rfl.soap_response_buf.size() < g_soap_error_body_bytes ?
+                           g_soap_error_body_bytes - rfl.soap_response_buf.size() : 0;
+        size_t copy_len = rfl.buf.size() < remaining ? rfl.buf.size() : remaining;
+        if (copy_len) rfl.soap_response_buf.append(rfl.buf.data(), copy_len);
+        if (rfl.buf.size() > remaining) rfl.soap_response_truncated = true;
+        if (rfl.soap_response_buf.size() >= g_soap_error_body_bytes)
+          finish_soap_response(conn, rfl);
+      }
       rfl.buf_erase(0, rfl.buf.size());
       break;
     }
@@ -3756,6 +4099,10 @@ static bool handle_connection_flags(Connection &conn,
                                     std::map<ConnectionKey, Connection> &connections,
                                     std::list<ConnectionKey> &conn_lru) {
   if (tcp_flags & 0x04) {
+    if (conn.resp_flow.has_soap_pending) {
+      conn.resp_flow.soap_response_truncated = true;
+      finish_soap_response(conn, conn.resp_flow);
+    }
     invalidate_stream(conn, "rst_received");
     if (conn.in_lru) {
       conn_lru.erase(conn.lru_it);
@@ -3785,6 +4132,8 @@ static bool handle_connection_flags(Connection &conn,
       conn.resp_flow.fin_seq = seq;
       int32_t fdiff = conn.resp_flow.has_seq ? seq_diff(conn.resp_flow.next_seq, seq) : 0;
       if ((!conn.resp_flow.has_seq || fdiff >= 0) && conn.resp_flow.buf.empty() && conn.resp_flow.ooo.empty()) {
+        if (conn.resp_flow.has_soap_pending)
+          finish_soap_response(conn, conn.resp_flow);
         conn.resp_flow.state = Flow::HTTP_STATE_CLOSE_BODY;
       }
     }
@@ -4359,6 +4708,48 @@ static int run_wsse_fixture() {
   return 0;
 }
 
+static int run_soap_error_fixture() {
+  g_soap_error_body_bytes = MAX_SOAP_ERROR_BODY_BYTES;
+  init_rng();
+  Flow multipart_flow;
+  Pending multipart_pending;
+  multipart_pending.soap_content_type = "multipart/related; type=application/xop+xml";
+  std::string part_a = "\r\nContent-Disposition: attachment; file";
+  std::string part_b = "name=\"../invoice.pdf\"\r\nContent-Type: application/pdf\r\n\r\nBINARY_SECRET";
+  scan_multipart_filenames(multipart_flow, multipart_pending, part_a.data(), part_a.size());
+  scan_multipart_filenames(multipart_flow, multipart_pending, part_b.data(), part_b.size());
+  if (multipart_pending.uploaded_files.size() != 1 || multipart_pending.uploaded_files[0] != "invoice.pdf") return 59;
+  Connection conn;
+  conn.key = ConnectionKey(htonl(0x0a000001U), 41000, htonl(0x0a000002U), 8080);
+  conn.client = Endpoint(htonl(0x0a000001U), 41000);
+  conn.server = Endpoint(htonl(0x0a000002U), 8080);
+  conn.roles_established = true; conn.generation = 1; conn.syn_seen = true;
+  conn.req_flow.generation = 1; conn.resp_flow.generation = 1;
+  std::map<ConnectionKey, Connection> connections;
+  std::list<ConnectionKey> lru;
+  Event e; e.ts = 1700000000; e.host = "fixture"; e.service = "port:8080";
+  e.method = "POST"; e.path = "/soap"; e.user = "-anonymous-"; e.scheme = "none";
+  e.caller = "10.0.0.1"; e.dst_ip = "10.0.0.2"; e.caller_port = 41000; e.dst_port = 8080;
+  e.trace_id = std::string(32, 'a'); e.span_id = std::string(16, 'b');
+  uint64_t id = queue_request(conn, e, 1000, connections, lru, false);
+  if (!id || conn.pending.empty()) return 60;
+  conn.pending[0].soap_content_type = "application/soap+xml";
+  conn.pending[0].soap_request_raw =
+    "<s:Envelope><s:Header><Password>HEADER_SECRET</Password></s:Header>"
+    "<s:Body><Create><Password>BODY_SECRET</Password></Create></s:Body></s:Envelope>";
+  std::string body =
+    "<s:Envelope><s:Body><s:Fault><faultcode>s:Server</faultcode>"
+    "<faultstring>Database unavailable</faultstring><detail><Password>FAULT_SECRET</Password>"
+    "</detail></s:Fault></s:Body></s:Envelope>";
+  std::ostringstream response;
+  response << "HTTP/1.1 500 Error\r\nContent-Type: application/soap+xml\r\nContent-Length: "
+           << body.size() << "\r\n\r\n" << body;
+  std::string wire = response.str();
+  process_response_payload(conn, wire.data(), wire.size(), 5000, 1700000001, 1100);
+  if (!conn.pending.empty()) return 61;
+  return 0;
+}
+
 /* End-to-end fixture: synthesise a real Ethernet+IPv4+TCP frame carrying a SOAP
  * POST with BOTH Basic and WSSE credentials, run it through handle_packet(),
  * and require exactly one pending request (dual-auth reports both usernames).
@@ -4448,6 +4839,14 @@ static bool parse_wsse_size(const char *value, size_t *result) {
   if (!value || !*value) return false;
   size_t n = 0;
   if (!parse_decimal_size(value, strlen(value), &n) || n > MAX_WSSE_BODY_BYTES) return false;
+  *result = n;
+  return true;
+}
+
+static bool parse_soap_error_size(const char *value, size_t *result) {
+  if (!value || !*value) return false;
+  size_t n = 0;
+  if (!parse_decimal_size(value, strlen(value), &n) || n > MAX_SOAP_ERROR_BODY_BYTES) return false;
   *result = n;
   return true;
 }
@@ -5034,6 +5433,7 @@ int main(int argc, char **argv) {
    * exit code (0 = pass; failures print to stderr). */
   if (argc > 1 && !strcmp(argv[1], "--fixture")) return run_fixture();
   if (argc > 1 && !strcmp(argv[1], "--wsse-fixture")) return run_wsse_fixture();
+  if (argc > 1 && !strcmp(argv[1], "--soap-error-fixture")) return run_soap_error_fixture();
   if (argc > 1 && !strcmp(argv[1], "--dual-auth-fixture")) return run_dual_auth_fixture();
   if (argc > 1 && !strcmp(argv[1], "--ring-fixture")) return run_ring_fixture();
   if (argc > 1 && !strcmp(argv[1], "--ship-rate-fixture")) return run_ship_rate_fixture();
@@ -5049,6 +5449,10 @@ int main(int argc, char **argv) {
   const char *wsse_env = getenv("NT_WSSE_BODY_BYTES");
   if (wsse_env && !parse_wsse_size(wsse_env, &g_wsse_body_bytes)) {
     fprintf(stderr, "wsse body bytes must be in range 0..65536\n"); return 2;
+  }
+  const char *soap_error_env = getenv("NT_SOAP_ERROR_BODY_BYTES");
+  if (soap_error_env && !parse_soap_error_size(soap_error_env, &g_soap_error_body_bytes)) {
+    fprintf(stderr, "soap error body bytes must be in range 0..2048\n"); return 2;
   }
   const char *rate_env = getenv("NT_SHIP_RATE_KBPS");
   if (rate_env && *rate_env) g_ship_rate_kbps = (unsigned)atoi(rate_env);
@@ -5088,8 +5492,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "wsse body bytes must be in range 0..65536\n"); return 2;
       }
     }
+    else if (!strcmp(argv[i], "--soap-error-body-bytes") && i + 1 < argc) {
+      if (!parse_soap_error_size(argv[++i], &g_soap_error_body_bytes)) {
+        fprintf(stderr, "soap error body bytes must be in range 0..2048\n"); return 2;
+      }
+    }
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..300] [--pending-ttl-sec 1..300] [-j workers] [--wsse-body-bytes 0..65536]\n");
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..300] [--pending-ttl-sec 1..300] [-j workers] [--wsse-body-bytes 0..65536] [--soap-error-body-bytes 0..2048]\n");
       return 0;
     }
     else { fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
@@ -5182,6 +5591,9 @@ int main(int argc, char **argv) {
   logmsg("PACKET_MMAP (TPACKET_V2) strict RX ring enabled (4MB total, 256 frames of 16KB)");
   if (g_wsse_body_bytes) {
     logmsg("WSSE UsernameToken inspection enabled (bounded to " + number_string(g_wsse_body_bytes) + " bytes/request)");
+  }
+  if (g_soap_error_body_bytes) {
+    logmsg("SOAP error body reporting enabled (bounded to " + number_string(g_soap_error_body_bytes) + " bytes/direction)");
   }
   if (!g_endpoint.empty()) {
     logmsg("single-binary mode: non-blocking thread shipping directly to " + g_endpoint + " (0 disk I/O)");

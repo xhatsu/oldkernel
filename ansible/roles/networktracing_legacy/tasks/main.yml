@@ -18,6 +18,7 @@
     export_mode={{ nt_export_mode }}
     trusted_proxy_cidrs={{ nt_trusted_proxy_cidrs }}
     wsse_bytes={{ nt_wsse_bytes }}
+    soap_error_body_bytes={{ nt_soap_error_body_bytes }}
     ship_threads={{ nt_ship_threads }}
     ship_rate_kbps={{ nt_ship_rate_kbps }}
     stats_interval_sec={{ nt_stats_interval_sec }}
@@ -65,6 +66,7 @@
     --export-mode {{ nt_export_mode }}
     --trusted-proxy-cidrs {{ nt_trusted_proxy_cidrs | quote }}
     --wsse-bytes {{ nt_wsse_bytes }}
+    --soap-error-body-bytes {{ nt_soap_error_body_bytes }}
     --ship-threads {{ nt_ship_threads }}
     --ship-rate-kbps {{ nt_ship_rate_kbps }}
     --stats-interval-sec {{ nt_stats_interval_sec }}

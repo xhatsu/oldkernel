@@ -1306,3 +1306,21 @@ Seven additional reproducible bugs fixed in both `nt-sniff-cpp.cpp` and `nt-snif
   control when XFF may replace the packet peer as caller.
 - Collector mode deliberately suppresses Hub stats/control posts. Body capture
   remains header-only by default; existing WSSE bounded scanning is unchanged.
+
+## Round 30 — SOAP Error-Only Body Reporting (2026-09-16)
+- Added opt-in `NT_SOAP_ERROR_BODY_BYTES` / `--soap-error-body-bytes 0..2048`
+  with identical Python and C++ behavior. Default remains disabled.
+- Only HTTP 4xx/5xx and SOAP Fault transactions receive bounded sanitized SOAP
+  request/response fields. HTTP 200 SOAP Faults are detected; successful
+  non-Fault calls remain header-only.
+- SOAP Header material is excluded. Password/token/nonce/signature/digest/
+  cipher fields and long inline Base64 are redacted; DTD/entity input is
+  omitted. MTOM/XOP multipart attachments contribute sanitized filenames only,
+  never file content.
+- Error body fields are exported in Hub events and OTLP custom attributes.
+  Event serialization still enforces native atomic `PIPE_BUF` output and the
+  existing 64 KiB shipping-body ceiling.
+- Validation: 76 pytest cases, 124 dual-engine synthetic cases, ASAN/UBSAN edge
+  fixtures, offline PCAP 247/249 and CentOS 6.8 binary execution all pass. The
+  live veth PCAP test skipped after the environment rejected `CAP_NET_ADMIN`.
+  Rebuilt `install-firstrun-el68.sh` is 1,246,914 bytes.

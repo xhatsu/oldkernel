@@ -105,6 +105,7 @@ def test_installer_passes_wsse_window_to_native_capture():
     native = native.split('\nelse\n    if [ "$SNIFF_AS"', 1)[0]
     assert "nt-sniff-cpp" in native
     assert "--wsse-body-bytes $WSSE_BODY_BYTES" in native
+    assert "--soap-error-body-bytes $SOAP_ERROR_BODY_BYTES" in native
     assert "C++03 remains header-only" not in installer
 
 

@@ -230,6 +230,12 @@ def _otel_span(event):
              ("http.response.status_code", event.get("status")),
              ("user_agent.original", event.get("user_agent")),
              ("enduser.id", event.get("user")),
+             ("networktracing.soap.request", event.get("soap_request")),
+             ("networktracing.soap.response", event.get("soap_response")),
+             ("networktracing.soap.fault.code", event.get("soap_fault_code")),
+             ("networktracing.soap.fault.reason", event.get("soap_fault_reason")),
+             ("networktracing.soap.request.truncated", event.get("soap_request_truncated")),
+             ("networktracing.soap.response.truncated", event.get("soap_response_truncated")),
              ("networktracing.trace_context_source", event.get("trace_context_source") or "generated"))
     for key, value in pairs:
         a = _otel_attr(key, value)

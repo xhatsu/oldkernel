@@ -71,7 +71,9 @@ def test_otlp_batch_uses_w3c_parent_and_semantic_client_fields():
              "path": "/orders", "trace_id": "a" * 32,
              "span_id": "b" * 16, "parent_span_id": "c" * 16,
              "caller": "198.51.100.7", "network_peer_address": "10.0.0.9",
-             "status": 200, "trace_context_source": "w3c"}
+             "status": 500, "trace_context_source": "w3c",
+             "soap_request": "<Create/>", "soap_response": "<Fault/>",
+             "soap_fault_reason": "backend failed"}
     batch = nt_ship.build_batch([event], "fixture", "1", "otlp")
     body = json.loads(batch.body.decode("utf-8"))
     span = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
@@ -83,6 +85,9 @@ def test_otlp_batch_uses_w3c_parent_and_semantic_client_fields():
     attributes = dict((a["key"], list(a["value"].values())[0]) for a in span["attributes"])
     assert attributes["client.address"] == "198.51.100.7"
     assert attributes["network.peer.address"] == "10.0.0.9"
+    assert attributes["networktracing.soap.request"] == "<Create/>"
+    assert attributes["networktracing.soap.response"] == "<Fault/>"
+    assert attributes["networktracing.soap.fault.reason"] == "backend failed"
 
 
 def test_agent_stats_are_coalesced_to_one_latest_sample():

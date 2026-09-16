@@ -20,8 +20,8 @@ assert e['path'] == '/api/items'
 assert e['status'] == 200 and e['resp_bytes'] == 42
 assert e['trace_id'] == '0123456789abcdef0123456789abcdef'
 assert e['source_probe'] == 'pcap-http-cpp'
-assert len(e) == 26
-print('Sniffer ASAN fixture: PASS (contract fields: 26)')
+assert len(e) == 30
+print('Sniffer ASAN fixture: PASS (contract fields: 30)')
 
 wsse_raw = subprocess.check_output([str(out_sniff), '--wsse-fixture'], text=True)
 assert wsse_raw.splitlines() == ['native.fixture'] * 4
@@ -33,6 +33,19 @@ bad_rate = subprocess.run([str(out_sniff), '--ship-rate-kbps', '63'],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 assert bad_rate.returncode == 2
 print('Sniffer bounded WSSE fixture: PASS (4 namespaces, DTD rejection, bounds)')
+
+soap_error_raw = subprocess.check_output([str(out_sniff), '--soap-error-fixture'], text=True)
+soap_error = json.loads(soap_error_raw)
+assert soap_error['status'] == 500
+assert soap_error['soap_fault_reason'] == 'Database unavailable'
+assert 'Create' in soap_error['soap_request'] and 'Fault' in soap_error['soap_response']
+assert 'BODY_SECRET' not in soap_error_raw
+assert 'HEADER_SECRET' not in soap_error_raw
+assert 'FAULT_SECRET' not in soap_error_raw
+bad_soap_error = subprocess.run([str(out_sniff), '--soap-error-body-bytes', '2049'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+assert bad_soap_error.returncode == 2
+print('Sniffer SOAP error-only body fixture: PASS (Fault, redaction, bounds)')
 
 dual_raw = subprocess.check_output([str(out_sniff), '--dual-auth-fixture'], text=True)
 dual = json.loads(dual_raw)
