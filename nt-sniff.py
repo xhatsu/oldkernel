@@ -18,6 +18,7 @@ Performance:
     for monitored ports are copied up; unrelated traffic stays in kernel
   * HEADER-ONLY by default; opt-in WSSE parsing has strict per-flow/global bounds
 Usage:  python nt-sniff.py [-i eth0] [-p 80,8003,...] [-j workers]
+                           [--skip-pure-acks]
                            [--wsse-body-bytes 0..65536]
                            [--soap-error-body-bytes 0..2048]
 Stdout: one JSON event per line -> pipe into nt-ship.py.
@@ -268,8 +269,12 @@ def drop_capture_capabilities():
 # setsockopt option id that attaches a classic BPF program (linux/socket.h).
 SO_ATTACH_FILTER = 26
 
-def build_bpf(ports):
-    """Classic BPF: ethertype==IP && proto==TCP && dport in ports.
+def build_bpf(ports, skip_pure_acks=False):
+    """Classic BPF: accept monitored IPv4/TCP traffic.
+
+    When ``skip_pure_acks`` is true, ACK-only packets whose IPv4 total length
+    is exactly IHL + TCP data-offset are rejected in the kernel.  Payload ACKs
+    and every packet carrying SYN, FIN, RST, ECN, PSH, or URG remain visible.
     Returns (fprog_struct, filter_array) for the libc setsockopt call,
     or None on failure. NOTE: sock_fprog carries a POINTER to the filter
     array, so it must stay alive until the syscall — python's
@@ -289,6 +294,15 @@ def build_bpf(ports):
     JEQ_K = 0x15     # jeq k
     LDX_MSH = 0xB1   # x = 4*([k]&0xf)  (ihl bytes)
     LDH_IND = 0x48   # ld [x+k]:h
+    LDB_IND = 0x50   # ld [x+k]:b
+    ST = 0x02        # M[k] = A
+    LD_MEM = 0x60    # A = M[k]
+    ALU_AND_K = 0x54
+    ALU_RSH_K = 0x74
+    ALU_ADD_X = 0x0C
+    MISC_TAX = 0x07  # X = A
+    JEQ_X = 0x1D
+    JSET_K = 0x45
     RET_K = 0x06
 
     # PROVEN dport block + sport block at X+14 (calibrated EMPIRICALLY on
@@ -309,7 +323,9 @@ def build_bpf(ports):
     # Program layout: 4 fixed prologue instructions, then 2 per dport, then
     # 2 per sport (when enabled), then 2 RETs. ret_rej / ret_acc are the
     # indices of the reject and accept terminators.
-    ret_rej = 5 + (4 if sk else 2) * n
+    gate_len = 15 if skip_pure_acks else 2
+    gate_start = 5 + (4 if sk else 2) * n
+    ret_rej = gate_start + gate_len - 2
     ret_acc = ret_rej + 1
     prog = []
     # 1) Ethertype at byte offset 12 must be 0x0800 (IPv4).
@@ -325,7 +341,7 @@ def build_bpf(ports):
     #    port and jump to the accept instruction on a hit.
     for i, p in enumerate(ps):                       # A: dport @ X+16
         prog.append((LDH_IND, 0, 0, 16))
-        jt = ret_acc - (len(prog) + 1)
+        jt = (gate_start if skip_pure_acks else ret_acc) - (len(prog) + 1)
         jf = 0 if (i < n - 1 or sk) else (ret_rej - (len(prog) + 1))
         prog.append((JEQ_K, jt, jf, p))
     # 5) Source-port block (only when NT_SNIFF_SPORT_K is non-zero): compare
@@ -333,9 +349,26 @@ def build_bpf(ports):
     if sk:                                           # B: sport @ X+sk
         for i, p in enumerate(ps):
             prog.append((LDH_IND, 0, 0, sk))
-            jt = ret_acc - (len(prog) + 1)
+            jt = (gate_start if skip_pure_acks else ret_acc) - (len(prog) + 1)
             jf = 0 if i < n - 1 else (ret_rej - (len(prog) + 1))
             prog.append((JEQ_K, jt, jf, p))
+    if skip_pure_acks:
+        # X still contains the IPv4 header length.  Exact ACK-only flags are
+        # eligible for the zero-payload test; every other flag combination
+        # jumps directly to accept.
+        prog.append((LDB_IND, 0, 0, 27))             # TCP flags @ X+14+13
+        prog.append((JEQ_K, 0, 12, 0x10))           # exact ACK, else accept
+        prog.append((LDB_IND, 0, 0, 26))            # data offset + NS/reserved
+        prog.append((JSET_K, 10, 0, 0x0F))          # preserve NS/reserved
+        prog.append((LDH_ABS, 0, 0, 16))            # IPv4 total length
+        prog.append((ST, 0, 0, 0))                  # M[0] = total length
+        prog.append((LDB_IND, 0, 0, 26))            # TCP data-offset byte
+        prog.append((ALU_AND_K, 0, 0, 0xF0))
+        prog.append((ALU_RSH_K, 0, 0, 2))            # TCP header length
+        prog.append((ALU_ADD_X, 0, 0, 0))            # + IPv4 header length
+        prog.append((MISC_TAX, 0, 0, 0))             # X = header total
+        prog.append((LD_MEM, 0, 0, 0))               # A = IP total length
+        prog.append((JEQ_X, 0, 1, 0))                # equal => no payload
     # Terminators: reject (drop) then accept (snapshot up to 0x40000 bytes).
     prog.append((RET_K, 0, 0, 0))                    # reject
     prog.append((RET_K, 0, 0, 0x40000))              # accept
@@ -372,9 +405,9 @@ def build_bpf(ports):
         return None
 
 
-def apply_perf_opts(sock, ports):
+def apply_perf_opts(sock, ports, skip_pure_acks=False):
     """Attach the mandatory kernel port filter and tune the receive buffer."""
-    built = build_bpf(ports)
+    built = build_bpf(ports, skip_pure_acks)
     # Tracks whether the kernel actually accepted the program.
     filter_ok = False
     if built is not None:
@@ -394,8 +427,8 @@ def apply_perf_opts(sock, ports):
                                   ctypes.sizeof(fprog))
             # ret == 0 means the kernel installed the filter.
             if ret == 0:
-                log("kernel BPF filter attached (%d monitored ports)"
-                    % len(ports))
+                log("kernel BPF filter attached (%d monitored ports, pure ACK skip=%s)"
+                    % (len(ports), "on" if skip_pure_acks else "off"))
                 filter_ok = True
             else:
                 log("BPF attach rejected by kernel (ret=%d)" % ret)
@@ -448,7 +481,8 @@ def parse_soap_error_body_bytes(value):
 def parse_args(argv):
     """Parse the command-line arguments.
 
-    Returns (iface, set(ports), verbose, workers, wsse_body_bytes). This is a
+    Returns (iface, set(ports), verbose, workers, wsse_body_bytes,
+    skip_pure_acks). This is a
     hand-rolled parser to stay py2.6-compatible; it validates every bound
     before capture starts.
     """
@@ -458,6 +492,10 @@ def parse_args(argv):
     ports = [80, 8003, 8005, 8007, 8009, 8010, 8011]
     verbose = False
     workers = 1
+    skip_ack_env = os.environ.get("NT_SKIP_PURE_ACKS", "0")
+    if skip_ack_env not in ("0", "1"):
+        raise SystemExit("NT_SKIP_PURE_ACKS must be 0 or 1")
+    skip_pure_acks = skip_ack_env == "1"
     # Seed the WSSE window from the environment so the installer can enable it
     # without changing the CLI (defaults to 0 = disabled).
     global g_soap_error_body_bytes
@@ -505,6 +543,9 @@ def parse_args(argv):
         # -v enables extra debug logging on stderr.
         elif a == "-v":
             verbose = True
+        # Opt-in kernel filtering of exact ACK-only, zero-payload packets.
+        elif a == "--skip-pure-acks":
+            skip_pure_acks = True
         # --wsse-body-bytes N: opt in to scanning up to N bytes of SOAP body.
         elif a == "--wsse-body-bytes":
             if i + 1 >= len(argv):
@@ -523,7 +564,7 @@ def parse_args(argv):
         # Fail closed on anything unrecognized rather than silently ignoring.
             raise SystemExit("unknown arg: %s" % a)
         i += 1
-    return iface, set(ports), verbose, workers, wsse_body_bytes
+    return iface, set(ports), verbose, workers, wsse_body_bytes, skip_pure_acks
 
 
 # ------------------------------------------------------ HTTP parser states --
@@ -4043,7 +4084,8 @@ def _run_control_tick(ports, iface, run_dir, client):
     return ports, iface, control_action, applied
 
 
-def _restart_args(script, iface, ports, verbose, workers, wsse_body_bytes=0):
+def _restart_args(script, iface, ports, verbose, workers, wsse_body_bytes=0,
+                  skip_pure_acks=False):
     """Build a fresh argv for an in-place re-exec after a control update."""
     # Preserve unbuffered JSONL delivery; the installer starts Python with -u.
     # Rebuild argv for os.execv: -u keeps stdout unbuffered so JSONL is emitted
@@ -4056,6 +4098,8 @@ def _restart_args(script, iface, ports, verbose, workers, wsse_body_bytes=0):
     args.extend(["-j", "1"])
     if wsse_body_bytes:
         args.extend(["--wsse-body-bytes", str(wsse_body_bytes)])
+    if skip_pure_acks:
+        args.append("--skip-pure-acks")
     if verbose:
         args.append("-v")
     return args
@@ -4069,7 +4113,7 @@ def main():
     packets until SIGTERM/SIGINT, flushing pending events at shutdown.
     """
     # Parse CLI/env configuration.
-    iface, ports, verbose, workers, wsse_body_bytes = parse_args(sys.argv[1:])
+    iface, ports, verbose, workers, wsse_body_bytes, skip_pure_acks = parse_args(sys.argv[1:])
     # Short hostname is stamped into every event.
     node_host = socket.gethostname().split(".")[0]
     control_client = None
@@ -4119,7 +4163,7 @@ def main():
     # Initial 1s timeout (re-applied below) so idle periods let sweeps run.
     s.settimeout(1.0)
     # Mandatory kernel BPF filter: refuse to run unfiltered.
-    if not apply_perf_opts(s, ports):
+    if not apply_perf_opts(s, ports, skip_pure_acks):
         s.close()
         raise SystemExit("kernel BPF safety filter unavailable; refusing unfiltered capture")
     # Bind to the chosen interface ("" = all interfaces) and ETH_P_ALL.
@@ -4264,6 +4308,8 @@ def main():
     if wsse_body_bytes:
         log("WSSE UsernameToken inspection enabled (bounded to %d bytes/request)" %
             wsse_body_bytes)
+    if skip_pure_acks:
+        log("pure ACK kernel filtering enabled")
 
     # 1s recv timeout: (a) lets the pending/flow sweeps actually fire —
     # without it `except socket.timeout` never runs; (b) empirically REQUIRED
@@ -4295,7 +4341,8 @@ def main():
                     # Re-exec in place with the updated configuration.
                     if control_action == "restart":
                         args = _restart_args(sys.argv[0], iface, ports,
-                                             verbose, workers, wsse_body_bytes)
+                                             verbose, workers, wsse_body_bytes,
+                                             skip_pure_acks)
                         log("remote control: re-executing capture with updated configuration")
                         s.close()
                         os.execv(sys.executable, args)
@@ -4332,7 +4379,8 @@ def main():
                     log("remote control: %s" % control_status)
                     if control_action == "restart":
                         args = _restart_args(sys.argv[0], iface, ports,
-                                             verbose, workers, wsse_body_bytes)
+                                             verbose, workers, wsse_body_bytes,
+                                             skip_pure_acks)
                         log("remote control: re-executing capture with updated configuration")
                         s.close()
                         os.execv(sys.executable, args)

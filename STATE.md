@@ -3,6 +3,22 @@
 
 # STATE.md — Current Project State & Memory
 
+## Optional Pure-ACK Kernel Filtering (2026-09-17)
+- Added opt-in `--skip-pure-acks` to both Python and C++ capture engines, plus
+  installer/Ansible support through `NT_SKIP_PURE_ACKS=1`.
+- Filtering occurs in classic BPF before userspace delivery (before `recv()` in
+  Python and before the TPACKET_V2 RX ring in native mode). The filter rejects
+  only exact ACK-only IPv4/TCP packets with zero TCP payload; data ACKs and
+  SYN/FIN/RST/ECN/control combinations are retained.
+- Default remains disabled so existing connection activity/TTL behavior is
+  unchanged unless an operator explicitly opts in.
+- Verification: cBPF bytecode regression covers pure ACK, payload ACK,
+  FIN-ACK, and ECN-ACK behavior; full pytest **78/78 PASS**; dual-engine
+  synthetic suite **124/124 PASS**; ASAN/UBSAN edge suite **ALL PASS**; offline
+  PCAP counts remain 109/109 for PCAP 247 and 6,077 Python / 6,216 C++ for
+  PCAP 249 with no secret leakage. Rebuilt and stock-CentOS-6.8-verified native
+  binaries are embedded in `install-firstrun-el68.sh` (1,260,762 bytes).
+
 ## Maintenance State Notice (2026-09-11)
 - **TraceScope Hub Server & Bootstrap**: Stopped for maintenance via `/home/ubuntu/Viettel/OtelTrace/run_server.sh stop`.
 - **Sessions & Ports**: `tracescope-30102` (port 30102), `tracescope-worker`, and bootstrap server (port 30105) cleanly shut down. Verified connection refused on both ports.

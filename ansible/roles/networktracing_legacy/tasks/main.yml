@@ -19,6 +19,7 @@
     trusted_proxy_cidrs={{ nt_trusted_proxy_cidrs }}
     wsse_bytes={{ nt_wsse_bytes }}
     soap_error_body_bytes={{ nt_soap_error_body_bytes }}
+    skip_pure_acks={{ nt_skip_pure_acks }}
     ship_threads={{ nt_ship_threads }}
     ship_rate_kbps={{ nt_ship_rate_kbps }}
     stats_interval_sec={{ nt_stats_interval_sec }}
@@ -46,7 +47,7 @@
 
 - name: Preflight check before modifying host
   ansible.builtin.raw: >
-    sh {{ nt_bundle_dest }} --check
+    NT_SKIP_PURE_ACKS={{ nt_skip_pure_acks }} sh {{ nt_bundle_dest }} --check
     --mode {{ nt_capture_mode }}
     --server {{ nt_hub_url }}
     --iface {{ nt_capture_iface }}
@@ -58,7 +59,7 @@
 
 - name: Install NetworkTracing agent with fail-closed safeguards
   ansible.builtin.raw: >
-    sh {{ nt_bundle_dest }} --offline
+    NT_SKIP_PURE_ACKS={{ nt_skip_pure_acks }} sh {{ nt_bundle_dest }} --offline
     --mode {{ nt_capture_mode }}
     --server {{ nt_hub_url }}
     --iface {{ nt_capture_iface }}

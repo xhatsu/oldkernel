@@ -140,7 +140,7 @@ def test_native_setup_order_is_filter_bind_ring_then_capability_drop():
         native = src.read()
     setup = native.split("static int open_capture_socket", 1)[1]
     setup = setup.split("static int run_capability_probe", 1)[0]
-    assert setup.index("attach_bpf(fd, ports)") < setup.index("bind(fd,")
+    assert setup.index("attach_bpf(fd, ports, skip_pure_acks)") < setup.index("bind(fd,")
     assert setup.index("bind(fd,") < setup.index("setup_mmap_ring(fd, ring)")
     assert setup.index("setup_mmap_ring(fd, ring)") < setup.index("drop_all_capabilities()")
 

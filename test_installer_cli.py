@@ -14,7 +14,7 @@ def checked_env(tmp_path):
     env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
     for name in ("NT_IFACE", "NT_PORTS", "NT_CAPTURE_MODE",
                  "NT_WSSE_BODY_BYTES", "NT_SOAP_ERROR_BODY_BYTES", "NT_CPU_CORE", "NT_SHIP_THREADS",
-                 "NT_SHIP_RATE_KBPS", "NT_STATS_INTERVAL_SEC", "NT_HUB",
+                 "NT_SHIP_RATE_KBPS", "NT_STATS_INTERVAL_SEC", "NT_SKIP_PURE_ACKS", "NT_HUB",
                  "NT_CONTROL_TOKEN"):
         env.pop(name, None)
     return env
@@ -24,7 +24,7 @@ def test_server_url_and_friendly_flags_reach_preflight(tmp_path):
     proc = subprocess.run([
         "sh", INSTALLER, "--server", "http://hub.local:43123", "--iface", "eth0",
         "--ports", "80,8001,8080", "--mode", "python",
-        "--wsse-bytes", "16384", "--soap-error-body-bytes", "2048",
+        "--wsse-bytes", "16384", "--soap-error-body-bytes", "2048", "--skip-pure-acks",
         "--ship-threads", "4", "--offline",
         "--ship-rate-kbps", "512",
         "--stats-interval-sec", "60",
@@ -80,3 +80,4 @@ def test_missing_option_value_and_help():
     assert "--offline" in help_result.stdout
     assert "--ship-rate-kbps" in help_result.stdout
     assert "--stats-interval-sec" in help_result.stdout
+    assert "--skip-pure-acks" in help_result.stdout

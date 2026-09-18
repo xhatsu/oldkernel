@@ -4395,8 +4395,8 @@ static bool handle_packet(const unsigned char *buf, size_t n,
  * addressed to (or from) the monitored ports, and RETURNs ACCEPT (12288) as the
  * snaplen; everything else returns 0 (drop).
  *
- * Program layout -- two independent ingress paths that both converge on a
- * shared "accept" instruction, with a shared "reject" RET 0:
+ * Program layout -- two independent ingress paths, each ending in a local
+ * accept/reject gate:
  *   Path A (standard Ethernet): EtherType@12 == 0x0800 -> IP proto@23 == TCP
  *     -> BPF_LDX|BPF_MSH loads the IP header length into X
  *     -> compare src port at [X+14] and dst port at [X+16] against each port.
@@ -4413,17 +4413,12 @@ static bool handle_packet(const unsigned char *buf, size_t n,
  * Fails closed: returns false (caller closes the socket) if anything is wrong,
  * and there is no unfiltered-capture fallback.
  */
-static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
+static bool attach_bpf(int fd, const std::vector<unsigned> &ports,
+                       bool skip_pure_acks) {
   if (ports.empty()) return false;
-  std::vector<struct sock_filter> f; size_t i;
-  unsigned N = (unsigned)ports.size();
-  /* Instruction index of the trailing RET 0 (reject): 4 path-local setup
-   * instructions for path B + 2*(2 loads + 2 jumps) for path B's port tests +
-   * 2 setup for path A + 2*(2+2) for path A's tests ... collapsed here into the
-   * closed form 11 + 8*N (N ports; 8 instructions per port across both
-   * directions). `accept` is simply the next instruction after it. */
-  unsigned reject = 11 + N * 8;
-  unsigned accept = reject + 1;
+  std::vector<struct sock_filter> f;
+  std::vector<size_t> vlan_hits, vlan_rejects, plain_hits, plain_rejects;
+  size_t i;
   struct sock_filter x;
 /* Append one instruction to the program, refusing to build a filter whose
  * jt/jf branch offsets do not fit in the 8-bit cBPF jump fields (that is the
@@ -4434,59 +4429,130 @@ static bool attach_bpf(int fd, const std::vector<unsigned> &ports) {
   x.code=(C); x.jt=(unsigned char)_jt; x.jf=(unsigned char)_jf; x.k=(K); \
   f.push_back(x); \
 } while(0)
-  /* A[0:2] = EtherType of the outer Ethernet header (offset 12). */
+  /* Each Ethernet layout gets its own forward-only terminal gate.  A port
+   * match enters that gate; malformed/nonmatching traffic enters its RET 0.
+   * Keeping separate VLAN/plain gates makes every variable-header offset
+   * explicit and keeps all classic-BPF 8-bit branches representable. */
   ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 12);
-  /* If this is plain IPv4, jump 6+4N instructions ahead to path A's
-   * IP-protocol test, skipping path B's VLAN instructions entirely; otherwise
-   * fall through into path B. */
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, (unsigned)(6 + 4 * N), 0, ETH_P_IP_HOST);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, ETH_P_IP_HOST);
+  size_t outer_ipv4_jump = 1;
 
   // Path B: 802.1Q VLAN
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), ETH_P_8021Q_HOST);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, ETH_P_8021Q_HOST);
+  vlan_rejects.push_back(f.size() - 1);
   /* Path B: A[0:2] = the inner EtherType, 4 bytes into a single VLAN tag. */
   ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 16);
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), ETH_P_IP_HOST);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, ETH_P_IP_HOST);
+  vlan_rejects.push_back(f.size() - 1);
   /* Path B: A = IP protocol byte at 14 + 4 (VLAN) + 9 = offset 27. */
   ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 27);
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), IPPROTO_TCP);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, IPPROTO_TCP);
+  vlan_rejects.push_back(f.size() - 1);
   /* Path B: X = 4 * (IP header length) -- BPF_MSH loads the low nibble at
    * offset 18 (start of the inner IP header) and multiplies by 4, i.e. the IP
    * header byte length, so L4 ports can be addressed as [X + const]. */
   ADD(BPF_LDX|BPF_B|BPF_MSH, 0, 0, 18);
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 20);
-    unsigned jt = accept - (unsigned)f.size() - 1;
-    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, 0, ports[i]);
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, ports[i]);
+    vlan_hits.push_back(f.size() - 1);
   }
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 18);
-    unsigned jt = accept - (unsigned)f.size() - 1;
-    unsigned jf = (i < ports.size() - 1) ? 0 : (reject - (unsigned)f.size() - 1);
-    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, ports[i]);
+    vlan_hits.push_back(f.size() - 1);
+    if (i == ports.size() - 1) vlan_rejects.push_back(f.size() - 1);
+  }
+
+  size_t vlan_gate = f.size();
+  size_t vlan_reject;
+  size_t vlan_accept;
+  if (skip_pure_acks) {
+    ADD(BPF_LD|BPF_B|BPF_IND, 0, 0, 31);       /* flags: 18+IHL+13 */
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 12, 0x10);  /* exact ACK else accept */
+    ADD(BPF_LD|BPF_B|BPF_IND, 0, 0, 30);      /* data offset + NS/reserved */
+    ADD(BPF_JMP|BPF_JSET|BPF_K, 10, 0, 0x0f); /* preserve NS/reserved */
+    ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 20);      /* IPv4 total length */
+    ADD(BPF_ST, 0, 0, 0);                     /* M[0] = total length */
+    ADD(BPF_LD|BPF_B|BPF_IND, 0, 0, 30);      /* TCP data offset byte */
+    ADD(BPF_ALU|BPF_AND|BPF_K, 0, 0, 0xf0);
+    ADD(BPF_ALU|BPF_RSH|BPF_K, 0, 0, 2);      /* TCP header length */
+    ADD(BPF_ALU|BPF_ADD|BPF_X, 0, 0, 0);      /* + IPv4 header length */
+    ADD(BPF_MISC|BPF_TAX, 0, 0, 0);
+    ADD(BPF_LD|BPF_MEM, 0, 0, 0);
+    ADD(BPF_JMP|BPF_JEQ|BPF_X, 0, 1, 0);      /* equal => zero payload */
+    vlan_reject = f.size(); ADD(BPF_RET|BPF_K, 0, 0, 0);
+    vlan_accept = f.size(); ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
+  } else {
+    vlan_reject = f.size(); ADD(BPF_RET|BPF_K, 0, 0, 0);
+    vlan_accept = f.size(); ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
+  }
+  for (i = 0; i < vlan_hits.size(); ++i) {
+    size_t delta = (skip_pure_acks ? vlan_gate : vlan_accept) - vlan_hits[i] - 1;
+    if (delta > UCHAR_MAX) return false;
+    f[vlan_hits[i]].jt = (unsigned char)delta;
+  }
+  for (i = 0; i < vlan_rejects.size(); ++i) {
+    size_t delta = vlan_reject - vlan_rejects[i] - 1;
+    if (delta > UCHAR_MAX) return false;
+    f[vlan_rejects[i]].jf = (unsigned char)delta;
   }
 
   // Path A: Standard IPv4
+  size_t plain_start = f.size();
+  if (plain_start - outer_ipv4_jump - 1 > UCHAR_MAX) return false;
+  f[outer_ipv4_jump].jt = (unsigned char)(plain_start - outer_ipv4_jump - 1);
   /* Path A: A = IP protocol byte at 14 + 9 = offset 23. */
   ADD(BPF_LD|BPF_B|BPF_ABS, 0, 0, 23);
-  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, (unsigned)(reject - (unsigned)f.size() - 1), IPPROTO_TCP);
+  ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, IPPROTO_TCP);
+  plain_rejects.push_back(f.size() - 1);
   /* Path A: X = 4 * IP header length (low nibble at offset 14). */
   ADD(BPF_LDX|BPF_B|BPF_MSH, 0, 0, 14);
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 16);
-    unsigned jt = accept - (unsigned)f.size() - 1;
-    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, 0, ports[i]);
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, ports[i]);
+    plain_hits.push_back(f.size() - 1);
   }
   for (i = 0; i < ports.size(); ++i) {
     ADD(BPF_LD|BPF_H|BPF_IND, 0, 0, 14);
-    unsigned jt = accept - (unsigned)f.size() - 1;
-    unsigned jf = (i < ports.size() - 1) ? 0 : (reject - (unsigned)f.size() - 1);
-    ADD(BPF_JMP|BPF_JEQ|BPF_K, jt, jf, ports[i]);
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 0, ports[i]);
+    plain_hits.push_back(f.size() - 1);
+    if (i == ports.size() - 1) plain_rejects.push_back(f.size() - 1);
   }
 
-  /* Reject target: return 0 => the kernel drops the packet. */
-  ADD(BPF_RET|BPF_K, 0, 0, 0);
-  /* Accept target: return ACCEPT as the captured snaplen. */
-  ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
+  size_t plain_gate = f.size();
+  size_t plain_reject;
+  size_t plain_accept;
+  if (skip_pure_acks) {
+    ADD(BPF_LD|BPF_B|BPF_IND, 0, 0, 27);       /* flags: 14+IHL+13 */
+    ADD(BPF_JMP|BPF_JEQ|BPF_K, 0, 12, 0x10);
+    ADD(BPF_LD|BPF_B|BPF_IND, 0, 0, 26);
+    ADD(BPF_JMP|BPF_JSET|BPF_K, 10, 0, 0x0f);
+    ADD(BPF_LD|BPF_H|BPF_ABS, 0, 0, 16);
+    ADD(BPF_ST, 0, 0, 0);
+    ADD(BPF_LD|BPF_B|BPF_IND, 0, 0, 26);
+    ADD(BPF_ALU|BPF_AND|BPF_K, 0, 0, 0xf0);
+    ADD(BPF_ALU|BPF_RSH|BPF_K, 0, 0, 2);
+    ADD(BPF_ALU|BPF_ADD|BPF_X, 0, 0, 0);
+    ADD(BPF_MISC|BPF_TAX, 0, 0, 0);
+    ADD(BPF_LD|BPF_MEM, 0, 0, 0);
+    ADD(BPF_JMP|BPF_JEQ|BPF_X, 0, 1, 0);
+    plain_reject = f.size(); ADD(BPF_RET|BPF_K, 0, 0, 0);
+    plain_accept = f.size(); ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
+  } else {
+    plain_reject = f.size(); ADD(BPF_RET|BPF_K, 0, 0, 0);
+    plain_accept = f.size(); ADD(BPF_RET|BPF_K, 0, 0, ACCEPT);
+  }
+  for (i = 0; i < plain_hits.size(); ++i) {
+    size_t delta = (skip_pure_acks ? plain_gate : plain_accept) - plain_hits[i] - 1;
+    if (delta > UCHAR_MAX) return false;
+    f[plain_hits[i]].jt = (unsigned char)delta;
+  }
+  for (i = 0; i < plain_rejects.size(); ++i) {
+    size_t delta = plain_reject - plain_rejects[i] - 1;
+    if (delta > UCHAR_MAX) return false;
+    f[plain_rejects[i]].jf = (unsigned char)delta;
+  }
 #undef ADD
   if (f.size() > 4096) return false;
   struct sock_fprog prog; prog.len = (unsigned short)f.size(); prog.filter = &f[0];
@@ -4919,7 +4985,8 @@ static bool drop_all_capabilities() {
  */
 static int open_capture_socket(const std::string &iface,
                                const std::vector<unsigned> &ports,
-                               MmapRing &ring) {
+                               MmapRing &ring,
+                               bool skip_pure_acks = false) {
   int fd = socket(AF_PACKET, SOCK_RAW, 0);
   if (fd < 0 && errno == EINVAL) {
     fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -4928,7 +4995,7 @@ static int open_capture_socket(const std::string &iface,
   fcntl(fd, F_SETFD, FD_CLOEXEC);
   int rb = 8 * 1024 * 1024;
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
-  if (!attach_bpf(fd, ports)) {
+  if (!attach_bpf(fd, ports, skip_pure_acks)) {
     logmsg("BPF attach failed; refusing unfiltered capture");
     close(fd);
     return -1;
@@ -4970,9 +5037,10 @@ static int open_capture_socket(const std::string &iface,
  * capability, without ever capturing. Returns 0 on a clean setup+teardown,
  * 2 otherwise. Used by the installer's post-install verification. */
 static int run_capability_probe(const std::string &iface,
-                                const std::vector<unsigned> &ports) {
+                                const std::vector<unsigned> &ports,
+                                bool skip_pure_acks) {
   MmapRing ring;
-  int fd = open_capture_socket(iface, ports, ring);
+  int fd = open_capture_socket(iface, ports, ring, skip_pure_acks);
   if (fd < 0) return 2;
 
   bool released = release_mmap_ring(fd, ring);
@@ -5446,6 +5514,12 @@ int main(int argc, char **argv) {
   std::string iface; std::vector<unsigned> ports; int i; int workers = 1;
   std::string endpoint;
   bool capability_probe = false;
+  bool skip_pure_acks = false;
+  const char *skip_ack_env = getenv("NT_SKIP_PURE_ACKS");
+  if (skip_ack_env && strcmp(skip_ack_env, "0") && strcmp(skip_ack_env, "1")) {
+    fprintf(stderr, "NT_SKIP_PURE_ACKS must be 0 or 1\n"); return 2;
+  }
+  if (skip_ack_env && !strcmp(skip_ack_env, "1")) skip_pure_acks = true;
   const char *wsse_env = getenv("NT_WSSE_BODY_BYTES");
   if (wsse_env && !parse_wsse_size(wsse_env, &g_wsse_body_bytes)) {
     fprintf(stderr, "wsse body bytes must be in range 0..65536\n"); return 2;
@@ -5485,6 +5559,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--stats-interval-sec") && i + 1 < argc) g_stats_interval_sec = (unsigned)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--pending-ttl-sec") && i + 1 < argc) g_pending_ttl_sec = (unsigned)atoi(argv[++i]);
     else if (!strcmp(argv[i], "--capability-probe")) capability_probe = true;
+    else if (!strcmp(argv[i], "--skip-pure-acks")) skip_pure_acks = true;
     else if (!strcmp(argv[i], "--spool") && i + 1 < argc) ++i;
     else if (!strcmp(argv[i], "-j") && i + 1 < argc) workers = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--wsse-body-bytes") && i + 1 < argc) {
@@ -5498,7 +5573,7 @@ int main(int argc, char **argv) {
       }
     }
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..300] [--pending-ttl-sec 1..300] [-j workers] [--wsse-body-bytes 0..65536] [--soap-error-body-bytes 0..2048]\n");
+      fprintf(stderr, "usage: nt-sniff-cpp [-i iface] [-p ports] [--skip-pure-acks] [--endpoint URL] [--ship-rate-kbps 64..10000] [--stats-interval-sec 10..300] [--pending-ttl-sec 1..300] [-j workers] [--wsse-body-bytes 0..65536] [--soap-error-body-bytes 0..2048]\n");
       return 0;
     }
     else { fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
@@ -5532,7 +5607,7 @@ int main(int argc, char **argv) {
   }
   (void)workers;
 
-  if (capability_probe) return run_capability_probe(iface, ports);
+  if (capability_probe) return run_capability_probe(iface, ports, skip_pure_acks);
 
   init_rng();
   memset(g_monitored_ports, 0, sizeof(g_monitored_ports));
@@ -5551,7 +5626,7 @@ int main(int argc, char **argv) {
   /* Sockets, BPF, bind, ring, and privilege drop all happen inside
    * open_capture_socket(); from here on the process is unprivileged. */
   MmapRing ring;
-  int fd = open_capture_socket(iface, ports, ring);
+  int fd = open_capture_socket(iface, ports, ring, skip_pure_acks);
   if (fd < 0) return 2;
 
   /* stdout may be a closed pipe at shutdown; writing must not kill us with

@@ -380,6 +380,7 @@ where both forms exist.
 | `--mode python` | No | Select Python capture. This is the default. |
 | `--mode cpp` | No | Select native C++03 capture and direct native shipping. |
 | `--wsse-bytes N`, `--wsse-body-bytes N` | No | Set the SOAP prefix window to `0..65536`; overrides `NT_WSSE_BODY_BYTES`. |
+| `--skip-pure-acks` | No | Drop exact ACK-only zero-payload packets in the kernel cBPF filter. Disabled by default. |
 | `--cpu N` | No | Select one allowed logical CPU; overrides `NT_CPU_CORE`. |
 | `--ship-threads N` | No | Set Python poster threads to `1..8`; default 4. |
 | `--ship-rate-kbps N` | No | Hard application-payload egress ceiling for both modes, `64..10000` kbit/s; default 1024. |
@@ -404,6 +405,7 @@ For fleet deployment, use the checksum-controlled offline procedure in
 | `NT_PORTS` | `80,8003,8005,8007,8009,8010,8011` | Destination/service ports admitted by the kernel BPF filter. Use at most 30 comma-separated integers in `1..65535`. |
 | `NT_CAPTURE_MODE` | `python` | Set to `cpp` for native mode. Any production configuration should use exactly `python` or `cpp`. |
 | `NT_WSSE_BODY_BYTES` | `0` | SOAP body prefix window in bytes, from `0` through `65536`. |
+| `NT_SKIP_PURE_ACKS` | `0` | Set to `1` to enable kernel filtering of exact ACK-only zero-payload packets. |
 | `NT_CPU_CORE` | First allowed CPU | Logical CPU number used by the complete supervisor/agent tree. |
 | `NT_WORKERS` | `1` | Accepted for compatibility but forcibly reset to `1` by the safety boundary. |
 | `NT_SHIP_THREADS` | `4` | Python Hub poster threads, internally clamped to `1..8`. |
@@ -630,6 +632,7 @@ changed during normal operation.
 
 ```text
 nt-sniff-cpp [-i IFACE] [-p PORTS] [--endpoint URL]
+             [--skip-pure-acks]
              [--wsse-body-bytes 0..65536]
 ```
 
@@ -638,6 +641,7 @@ nt-sniff-cpp [-i IFACE] [-p PORTS] [--endpoint URL]
 | `-i IFACE` | Bind capture to one interface. |
 | `-p PORTS` | Accept comma-separated ports or multiple port arguments. |
 | `--endpoint URL` | Enable native in-memory batching to `URL/api/ingest` and health reports to `URL/api/agent/stats`. Without it, events are written as JSONL to stdout. |
+| `--skip-pure-acks` | Opt in to dropping exact ACK-only zero-payload packets in cBPF before they enter the RX ring. SYN, FIN, RST, ECN/control flags, and payload-bearing ACKs are retained. |
 | `--stats-interval-sec N` | Native agent-statistics interval, `10..300` seconds. |
 | `--wsse-body-bytes N` | Bounded native SOAP prefix window. |
 | `-j WORKERS` | Compatibility option; only `1` is accepted. |

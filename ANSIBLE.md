@@ -47,6 +47,7 @@ nt_capture_iface: "eth0"
 nt_capture_ports: "80,8001,8003,8080"
 nt_capture_mode: "cpp"
 nt_wsse_bytes: "16384"
+nt_skip_pure_acks: "0" # set to "1" to drop exact zero-payload ACK-only packets in cBPF
 nt_ship_threads: "4"
 nt_ship_rate_kbps: "1024"
 nt_stats_interval_sec: "30"
@@ -105,6 +106,7 @@ not healthy, and rolls through ten percent of the fleet at a time:
           ports={{ nt_capture_ports }}
           mode={{ nt_capture_mode }}
           wsse_bytes={{ nt_wsse_bytes }}
+          skip_pure_acks={{ nt_skip_pure_acks }}
           ship_threads={{ nt_ship_threads }}
           ship_rate_kbps={{ nt_ship_rate_kbps }}
           stats_interval_sec={{ nt_stats_interval_sec }}

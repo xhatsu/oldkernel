@@ -195,6 +195,7 @@ All parameters can be passed as CLI arguments or configured through environment 
 | `--mode MODE` | `NT_CAPTURE_MODE` | `python` | `python` or `cpp` | Capture engine: `cpp` (native zero-copy, recommended) or `python` (standard Python 2.6). |
 | `--wsse-bytes N`<br>`--wsse-body-bytes N` | `NT_WSSE_BODY_BYTES` | `0` (disabled) | `0..65536` | Prefix window into HTTP request body to inspect for SOAP/WSSE XML credentials. |
 | `--soap-error-body-bytes N` | `NT_SOAP_ERROR_BODY_BYTES` | `0` (disabled) | `0..2048` | Sanitized SOAP request/response excerpts only for HTTP errors or SOAP Faults; attachment content is omitted. |
+| `--skip-pure-acks` | `NT_SKIP_PURE_ACKS` | `0` (disabled) | Flag / `0` or `1` | Drop exact ACK-only packets with zero TCP payload in the kernel cBPF filter. Payload ACKs and TCP control packets remain captured. |
 | `--cpu N` | `NT_CPU_CORE` | Installer CPU | Integer logical core | Pins supervisor and sniffer processes to a single logical CPU core using `taskset -c N`. |
 | `--ship-threads N` | `NT_SHIP_THREADS` | `4` | `1..8` | Bounded concurrent shipping threads for Python mode (`nt-ship.py`). |
 | `--ship-rate-kbps N` | `NT_SHIP_RATE_KBPS` | `1024` | `64..10000` | Aggregate application-payload upload ceiling for either capture mode. Each HTTP body is also capped at 64 KiB. |

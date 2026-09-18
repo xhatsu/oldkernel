@@ -631,6 +631,83 @@ def _make_tcp_pkt(src_ip_str, sport, dst_ip_str, dport, seq, ack, flags, payload
     return eth + ip_hdr + tcp_hdr + payload
 
 
+def _run_cbpf(arr, packet):
+    """Small interpreter for the instruction subset emitted by build_bpf."""
+    import struct
+    a, x, pc = 0, 0, 0
+    mem = [0] * 16
+    while pc < len(arr):
+        ins = arr[pc]
+        code, k = ins.code, ins.k
+        if code == 0x28:       # LDH ABS
+            a = struct.unpack_from("!H", packet, k)[0]
+        elif code == 0x30:     # LDB ABS
+            a = packet[k] if isinstance(packet[k], int) else ord(packet[k])
+        elif code == 0xB1:     # LDX MSH
+            value = packet[k] if isinstance(packet[k], int) else ord(packet[k])
+            x = (value & 0x0f) * 4
+        elif code == 0x48:     # LDH IND
+            a = struct.unpack_from("!H", packet, x + k)[0]
+        elif code == 0x50:     # LDB IND
+            value = packet[x + k]
+            a = value if isinstance(value, int) else ord(value)
+        elif code == 0x02:     # ST
+            mem[k] = a
+        elif code == 0x60:     # LD MEM
+            a = mem[k]
+        elif code == 0x54:     # AND K
+            a &= k
+        elif code == 0x74:     # RSH K
+            a >>= k
+        elif code == 0x0C:     # ADD X
+            a = (a + x) & 0xffffffff
+        elif code == 0x07:     # TAX
+            x = a
+        elif code == 0x15:     # JEQ K
+            pc += ins.jt if a == k else ins.jf
+        elif code == 0x1D:     # JEQ X
+            pc += ins.jt if a == x else ins.jf
+        elif code == 0x45:     # JSET K
+            pc += ins.jt if a & k else ins.jf
+        elif code == 0x06:     # RET K
+            return k
+        else:
+            raise AssertionError("unsupported cBPF opcode 0x%x" % code)
+        pc += 1
+    raise AssertionError("cBPF program fell off the end")
+
+
+def test_skip_pure_acks_cbpf_is_opt_in_and_preserves_control_and_data():
+    pure_ack = _make_tcp_pkt("10.0.0.1", 41000, "10.0.0.2", 80,
+                             1001, 5001, 0x10, b"")
+    payload_ack = _make_tcp_pkt("10.0.0.1", 41000, "10.0.0.2", 80,
+                                1001, 5001, 0x10, b"GET / HTTP/1.0\r\n\r\n")
+    fin_ack = _make_tcp_pkt("10.0.0.1", 41000, "10.0.0.2", 80,
+                            1001, 5001, 0x11, b"")
+    ecn_ack = _make_tcp_pkt("10.0.0.1", 41000, "10.0.0.2", 80,
+                            1001, 5001, 0x50, b"")
+    ns_ack = bytearray(pure_ack)
+    ns_ack[14 + 20 + 12] |= 0x01
+
+    default_arr = nt_sniff.build_bpf({80}, False)[1]
+    filtered_arr = nt_sniff.build_bpf({80}, True)[1]
+    assert _run_cbpf(default_arr, pure_ack) != 0
+    assert _run_cbpf(filtered_arr, pure_ack) == 0
+    assert _run_cbpf(filtered_arr, payload_ack) != 0
+    assert _run_cbpf(filtered_arr, fin_ack) != 0
+    assert _run_cbpf(filtered_arr, ecn_ack) != 0
+    assert _run_cbpf(filtered_arr, ns_ack) != 0
+
+
+def test_skip_pure_acks_cli_and_restart_preservation(monkeypatch):
+    monkeypatch.delenv("NT_SKIP_PURE_ACKS", raising=False)
+    assert nt_sniff.parse_args([])[5] is False
+    assert nt_sniff.parse_args(["--skip-pure-acks"])[5] is True
+    args = nt_sniff._restart_args("nt-sniff.py", "eth0", {80}, False, 1,
+                                  skip_pure_acks=True)
+    assert "--skip-pure-acks" in args
+
+
 def test_pending_accounting_lifecycle_and_overflow_failsafe():
     """Verify pending accounting never leaks across lifecycles and overflow protection is failsafe."""
     flows = {}

@@ -20,6 +20,7 @@
 #
 # Env overrides: NT_IFACE=eth1 NT_PORTS=80,... NT_HUB=http://KIT:PORT/oldkernel
 #                NT_WSSE_BODY_BYTES=0..65536 (Python/C++ modes; default 0)
+#                NT_SKIP_PURE_ACKS=0|1 (default 0)
 #                NT_CPU_CORE=N (default: first CPU allowed for the installer)
 #                NT_SHIP_THREADS=1..8 NT_SHIP_RATE_KBPS=64..10000
 #                NT_STATS_INTERVAL_SEC=10..300 (default: 30)
@@ -43,6 +44,7 @@ CONTROL_TOKEN_FILE=/var/lib/networktracing/control.token
 CAPTURE_MODE="${NT_CAPTURE_MODE:-python}"
 WSSE_BODY_BYTES="${NT_WSSE_BODY_BYTES:-0}"
 SOAP_ERROR_BODY_BYTES="${NT_SOAP_ERROR_BODY_BYTES:-0}"
+SKIP_PURE_ACKS="${NT_SKIP_PURE_ACKS:-0}"
 EXPORT_MODE="${NT_EXPORT_MODE:-hub}"
 TRUSTED_PROXY_CIDRS="${NT_TRUSTED_PROXY_CIDRS:-}"
 CPU_CORE="${NT_CPU_CORE:-}"
@@ -65,6 +67,7 @@ Usage: install-firstrun-el68.sh --server URL [options]
   --mode python|cpp         Capture engine (default: python)
   --wsse-bytes N            SOAP prefix window, 0..65536 (default: 0)
   --soap-error-body-bytes N Report sanitized SOAP bodies only on errors, 0..2048
+  --skip-pure-acks         Drop exact ACK-only zero-payload packets in cBPF
   --cpu N                   One allowed logical CPU number
   --ship-threads N          Python poster threads, 1..8 (default: 4)
   --ship-rate-kbps N        Egress ceiling, 64..10000 kbit/s (default: 1024)
@@ -90,6 +93,7 @@ while [ $# -gt 0 ]; do
         --mode)     need_value "$@"; CAPTURE_MODE="$2"; shift 2 ;;
         --wsse-body-bytes|--wsse-bytes) need_value "$@"; WSSE_BODY_BYTES="$2"; shift 2 ;;
         --soap-error-body-bytes) need_value "$@"; SOAP_ERROR_BODY_BYTES="$2"; shift 2 ;;
+        --skip-pure-acks) SKIP_PURE_ACKS=1; shift ;;
         --cpu)      need_value "$@"; CPU_CORE="$2"; shift 2 ;;
         --ship-threads) need_value "$@"; SHIPPERS="$2"; shift 2 ;;
         --ship-rate-kbps) need_value "$@"; SHIP_RATE_KBPS="$2"; shift 2 ;;
@@ -151,6 +155,7 @@ case "$SOAP_ERROR_BODY_BYTES" in
 esac
 [ "$SOAP_ERROR_BODY_BYTES" -le 2048 ] \
     || die "SOAP error body byte window must be in range 0..2048"
+case "$SKIP_PURE_ACKS" in 0) ACK_OPT="" ;; 1) ACK_OPT="--skip-pure-acks" ;; *) die "NT_SKIP_PURE_ACKS must be 0 or 1" ;; esac
 if [ -n "$TOKEN_INPUT_FILE" ]; then
     [ -f "$TOKEN_INPUT_FILE" ] && [ -r "$TOKEN_INPUT_FILE" ] \
         || die "control token file is not readable"
@@ -532,7 +537,7 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
         chown "$SNIFF_USER" "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         chmod 750 "$PREFIX/nt-sniff-cpp" 2>/dev/null || true
         if setcap cap_net_raw+ep "$PREFIX/nt-sniff-cpp" 2>/dev/null \
-           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp --capability-probe -i $IFACE -p $PORTS" >/dev/null 2>&1; then
+           && su -s /bin/sh "$SNIFF_USER" -c "$PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp --capability-probe -i $IFACE -p $PORTS $ACK_OPT" >/dev/null 2>&1; then
             SNIFF_AS="$SNIFF_USER"
             log "rootless mode: cap_net_raw on native C++ binary, user=$SNIFF_USER"
         else
@@ -542,7 +547,7 @@ if [ "$CAPTURE_MODE" = "cpp" ]; then
     fi
     [ "$SNIFF_AS" != root ] \
         || die "safe rootless C++ capture unavailable; refusing to run the agent as root"
-    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --stats-interval-sec $STATS_INTERVAL_SEC --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES'"
+    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-sniff-cpp -i $IFACE -p $PORTS --stats-interval-sec $STATS_INTERVAL_SEC --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES $ACK_OPT'"
     SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --export-mode $EXPORT_MODE --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
     EXPECTED_SHIP=nt-ship-cpp
@@ -560,16 +565,16 @@ elif [ "$CAPTURE_MODE" = "hybrid" ] || [ "$CAPTURE_MODE" = "py-cpp" ]; then
     fi
     [ "$SNIFF_AS" != root ] \
         || die "safe rootless Python capture unavailable; refusing to run the agent as root"
-    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES'"
+    SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES $ACK_OPT'"
     SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/nt-ship-cpp --endpoint $ENDPOINT --export-mode $EXPORT_MODE --ship-rate-kbps $SHIP_RATE_KBPS --stats-interval-sec $STATS_INTERVAL_SEC'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
     EXPECTED_SHIP=nt-ship-cpp
     log "hybrid mode (Python capture + native bounded C++ shipper) selected"
 else
     if [ "$SNIFF_AS" != root ]; then
-        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES'"
+        SNIFF_CMD="su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE $PREFIX/python-capnetraw -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES $ACK_OPT'"
     else
-        SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES"
+        SNIFF_CMD="exec python -u $PREFIX/nt-sniff.py -j $WORKERS -i $IFACE -p $PORTS --wsse-body-bytes $WSSE_BODY_BYTES --soap-error-body-bytes $SOAP_ERROR_BODY_BYTES $ACK_OPT"
     fi
     SHIP_CMD="exec su -s /bin/sh $SNIFF_AS -c 'exec $PREFIX/nt-resource-guard.sh $CPU_CORE python -u $PREFIX/nt-ship.py --endpoint $ENDPOINT --export-mode $EXPORT_MODE'"
     RUN_CMD="$SNIFF_CMD 2>>\$PREFIX/sniff.log | $SHIP_CMD >>\$PREFIX/ship.log 2>&1"
@@ -598,6 +603,7 @@ export NT_SHIP_RATE_KBPS=$SHIP_RATE_KBPS
 export NT_STATS_INTERVAL_SEC=$STATS_INTERVAL_SEC
 export NT_WSSE_BODY_BYTES=$WSSE_BODY_BYTES
 export NT_SOAP_ERROR_BODY_BYTES=$SOAP_ERROR_BODY_BYTES
+export NT_SKIP_PURE_ACKS=$SKIP_PURE_ACKS
 export NT_EXPORT_MODE=$EXPORT_MODE
 export NT_TRUSTED_PROXY_CIDRS=$TRUSTED_PROXY_CIDRS
 CPU_CORE=$CPU_CORE

@@ -246,6 +246,17 @@ This repository contains the **NetworkTracing legacy capture kit** for CentOS 6.
   - `nt-sniff-cpp.cpp`: updated `MAX_QUEUE = 10000;`. Internal queue limit and telemetry export 10,000 events.
   - `nt-ship-cpp.cpp`: updated `MAX_QUEUE = 10000;`, `MAX_QUEUE_EVENTS = 10000;`, and scaled `MAX_QUEUE_BYTES = 20U * 1024U * 1024U;` (20 MiB payload ceiling).
   - Preserves strict host safety and zero allocation leaks within the 256 MiB `RLIMIT_AS` bounds.
+- **Optional Pure-ACK Kernel Filtering (2026-09-17)**:
+  - Python and C++ capture accept `--skip-pure-acks`; installed services expose
+    the same opt-in through `NT_SKIP_PURE_ACKS=1` or the installer flag.
+  - The cBPF predicate drops only exact ACK-only packets whose IPv4 total
+    length equals IPv4 IHL plus TCP data offset. Payload-bearing ACKs and all
+    other flag combinations, including SYN/FIN/RST and ECN, remain visible.
+  - The option defaults off to preserve historical flow activity semantics.
+  - Verification: full pytest **78/78 PASS**, dual-engine synthetic suite
+    **124/124 PASS**, ASAN/UBSAN edge suite **ALL PASS**, and offline PCAP
+    counts unchanged (247: 109/109; 249: 6,077 Python / 6,216 C++). CentOS
+    6.8 binaries and the 1,260,762-byte embedded installer were rebuilt.
 - **Verification Results**:
   - Dual-engine test suite: **124/124 PASS** (`test_synthetic_harness.py`).
   - Unit tests: **26/26 PASS** (`pytest test_nt_sniff.py`).

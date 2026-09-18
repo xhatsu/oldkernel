@@ -41,7 +41,9 @@ The two ports above are examples. Supply the deployment's actual independent
 artifact-server and Hub-ingest URLs.
 
 Optional settings remain flags on that command, for example
-`--mode cpp --iface eth0 --ports 80,8001 --wsse-bytes 16384 --cpu 2`.
+`--mode cpp --iface eth0 --ports 80,8001 --wsse-bytes 16384 --skip-pure-acks --cpu 2`.
+Pure-ACK filtering is opt-in and occurs in cBPF before userspace delivery;
+payload-bearing ACKs and TCP control packets remain captured.
 
 ---
 
