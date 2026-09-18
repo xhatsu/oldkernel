@@ -72,6 +72,7 @@ def test_otlp_batch_uses_w3c_parent_and_semantic_client_fields():
              "span_id": "b" * 16, "parent_span_id": "c" * 16,
              "caller": "198.51.100.7", "network_peer_address": "10.0.0.9",
              "status": 500, "trace_context_source": "w3c",
+             "user": "alice", "wsse_user": "alice",
              "soap_request": "<Create/>", "soap_response": "<Fault/>",
              "soap_fault_reason": "backend failed"}
     batch = nt_ship.build_batch([event], "fixture", "1", "otlp")
@@ -85,6 +86,8 @@ def test_otlp_batch_uses_w3c_parent_and_semantic_client_fields():
     attributes = dict((a["key"], list(a["value"].values())[0]) for a in span["attributes"])
     assert attributes["client.address"] == "198.51.100.7"
     assert attributes["network.peer.address"] == "10.0.0.9"
+    assert attributes["enduser.id"] == "alice"
+    assert attributes["networktracing.wsse.user"] == "alice"
     assert attributes["networktracing.soap.request"] == "<Create/>"
     assert attributes["networktracing.soap.response"] == "<Fault/>"
     assert attributes["networktracing.soap.fault.reason"] == "backend failed"

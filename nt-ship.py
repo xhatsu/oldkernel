@@ -230,6 +230,8 @@ def _otel_span(event):
              ("http.response.status_code", event.get("status")),
              ("user_agent.original", event.get("user_agent")),
              ("enduser.id", event.get("user")),
+             ("networktracing.wsse.user", event.get("wsse_user")),
+             ("networktracing.basic.user", event.get("basic_user")),
              ("networktracing.soap.request", event.get("soap_request")),
              ("networktracing.soap.response", event.get("soap_response")),
              ("networktracing.soap.fault.code", event.get("soap_fault_code")),

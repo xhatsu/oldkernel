@@ -1,0 +1,41 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  groupbytrace:
+    wait_duration: 2s
+    num_traces: 1000
+  batch:
+    timeout: 1s
+    send_batch_size: 100
+
+exporters:
+  file:
+    path: /home/xhatsu/oldkernel/otel-traces.json
+    flush_interval: 1s
+  debug:
+    verbosity: detailed
+  otlp/apm:
+    endpoint: 129.150.59.233:30820
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 100
+    retry_on_failure:
+      enabled: false
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [groupbytrace, batch]
+      exporters: [file, debug, otlp/apm]

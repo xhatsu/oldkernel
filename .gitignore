@@ -44,3 +44,11 @@ scratch/
 
 # Generated Ansible deployment bundles (build on controller via stage-bundle.sh before running playbooks)
 ansible/roles/networktracing_legacy/files/install-firstrun-el68.sh
+
+# Temporary test scripts, benchmark harnesses, and trace logs
+ansible/run_benchmark_suite.py
+ansible/run_comparison_benchmark.py
+ansible/test_5_concurrent_100mb.py
+ansible/k6-*.js
+otel-traces.json
+

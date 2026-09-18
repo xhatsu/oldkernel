@@ -3,6 +3,11 @@
 
 # STATE.md — Current Project State & Memory
 
+## OTLP Enduser Identity Mapping (2026-09-18)
+- Added OpenTelemetry semantic convention attribute `enduser.id` and `networktracing.wsse.user` / `networktracing.basic.user` mapping in OTLP export mode for both native C++ (`nt-ship-cpp.cpp`) and Python (`nt-ship.py`).
+- Extracted WSSE UsernameToken identity (or Basic Auth user) is now attached directly to emitted OTLP span attributes, enabling user identity visibility in OpenTelemetry Collectors and Elastic APM while preserving full credential masking (passwords scrubbed).
+- Deployed across the fleet (`testVM1` and `testVM2`) via Ansible (`nt_agent_version: "2026-09-18-enduser-id"`). Verified live WSSE SOAP capture: span attributes contain `enduser.id: "wsse_finance_admin"` and `networktracing.wsse.user: "wsse_finance_admin"` across multi-hop traces.
+
 ## Optional Pure-ACK Kernel Filtering (2026-09-17)
 - Added opt-in `--skip-pure-acks` to both Python and C++ capture engines, plus
   installer/Ansible support through `NT_SKIP_PURE_ACKS=1`.
@@ -28,7 +33,7 @@
 - **Trace Combination by `trace_id`**: Configured `groupbytrace` processor (`wait_duration: 2s`, `num_traces: 1000`) in `otel-collector-config.yaml` to aggregate spans sharing the same `trace_id` from multiple nodes before releasing them to exporters.
 - **Trace Output & Export**:
   - `file` exporter: Writes combined distributed traces in JSON format to `/home/xhatsu/oldkernel/otel-traces.json`.
-  - `otlp/apm` exporter: Forwards combined traces directly to Elastic APM Server 7.17.24 at `129.150.59.233:32765` over gRPC with zero transmission errors.
+  - `otlp/apm` exporter: Forwards combined traces directly to Elastic APM Server 7.17.24 at `129.150.59.233:30820` over gRPC with zero transmission errors.
 - **Ansible Automation & Deployment**:
   - Configured `ansible/group_vars/legacy_capture.yml` with `nt_hub_url: "http://192.168.122.1:4318"` and `nt_export_mode: "otlp"`.
   - Deployed across both `testVM1` (192.168.122.236) and `testVM2` (192.168.122.237) via `ansible-playbook -i inventory/hosts.ini deploy-networktracing.yml` (ok=9, changed=2, failed=0 on both nodes).

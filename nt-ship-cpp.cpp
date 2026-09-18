@@ -832,11 +832,14 @@ static Batch *build_event_batch() {
     std::string body = "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"networktracing\"}},{\"key\":\"host.name\",\"value\":{\"stringValue\":" + jsonq(g_node) + "}}]},\"scopeSpans\":[{\"scope\":{\"name\":\"networktracing.oldkernel\"},\"spans\":[";
     size_t span_count = 0;
     for (size_t i = 0; i < events.size(); ++i) {
-      std::string tid, sid, parent, method, path, caller, peer, soap_req, soap_resp, fault_code, fault_reason; unsigned long long ts = 0, duration = 0, status = 0;
+      std::string tid, sid, parent, method, path, caller, peer, user, wsse_user, basic_user, soap_req, soap_resp, fault_code, fault_reason; unsigned long long ts = 0, duration = 0, status = 0;
       unique_json_string(events[i], "trace_id", &tid); unique_json_string(events[i], "span_id", &sid);
       unique_json_string(events[i], "parent_span_id", &parent); unique_json_string(events[i], "method", &method);
       unique_json_string(events[i], "path", &path); unique_json_string(events[i], "caller", &caller);
       unique_json_string(events[i], "network_peer_address", &peer);
+      unique_json_string(events[i], "user", &user);
+      unique_json_string(events[i], "wsse_user", &wsse_user);
+      unique_json_string(events[i], "basic_user", &basic_user);
       unique_json_string(events[i], "soap_request", &soap_req); unique_json_string(events[i], "soap_response", &soap_resp);
       unique_json_string(events[i], "soap_fault_code", &fault_code); unique_json_string(events[i], "soap_fault_reason", &fault_reason);
       unique_json_uint(events[i], "ts", &ts); unique_json_uint(events[i], "duration_ms", &duration); unique_json_uint(events[i], "status", &status);
@@ -851,6 +854,9 @@ static Batch *build_event_batch() {
       body += ",\"name\":" + jsonq(method + " " + path) + ",\"kind\":2,\"startTimeUnixNano\":" + jsonq(ulls(start)) + ",\"endTimeUnixNano\":" + jsonq(ulls(end)) + ",\"attributes\":[";
       body += "{\"key\":\"client.address\",\"value\":{\"stringValue\":" + jsonq(caller) + "}},{\"key\":\"network.peer.address\",\"value\":{\"stringValue\":" + jsonq(peer.empty() ? caller : peer) + "}}";
       if (status) body += ",{\"key\":\"http.response.status_code\",\"value\":{\"intValue\":" + jsonq(ulls(status)) + "}}";
+      if (!user.empty() && user != "-anonymous-") body += ",{\"key\":\"enduser.id\",\"value\":{\"stringValue\":" + jsonq(user) + "}}";
+      if (!wsse_user.empty()) body += ",{\"key\":\"networktracing.wsse.user\",\"value\":{\"stringValue\":" + jsonq(wsse_user) + "}}";
+      if (!basic_user.empty()) body += ",{\"key\":\"networktracing.basic.user\",\"value\":{\"stringValue\":" + jsonq(basic_user) + "}}";
       if (!soap_req.empty()) body += ",{\"key\":\"networktracing.soap.request\",\"value\":{\"stringValue\":" + jsonq(soap_req) + "}}";
       if (!soap_resp.empty()) body += ",{\"key\":\"networktracing.soap.response\",\"value\":{\"stringValue\":" + jsonq(soap_resp) + "}}";
       if (!fault_code.empty()) body += ",{\"key\":\"networktracing.soap.fault.code\",\"value\":{\"stringValue\":" + jsonq(fault_code) + "}}";
